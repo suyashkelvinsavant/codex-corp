@@ -1,0 +1,49 @@
+{
+  "type": "object",
+  "required": ["status", "summary", "data", "artifacts"],
+  "additionalProperties": false,
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["success", "failure", "needs_revision"]
+    },
+    "summary": { "type": "string" },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "payload": { "type": "string" },
+        "criteria": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "string" },
+              "passed": { "type": "boolean" },
+              "evidence": { "type": "string" }
+            },
+            "required": ["id", "passed", "evidence"]
+          }
+        }
+      },
+      "required": ["payload", "criteria"]
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string" },
+          "kind": {
+            "type": "string",
+            "enum": ["code", "document", "json", "image", "link"]
+          },
+          "content": { "type": "string" }
+        },
+        "required": ["name", "kind", "content"]
+      }
+    }
+  }
+}

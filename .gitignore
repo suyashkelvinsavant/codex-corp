@@ -1,0 +1,20 @@
+node_modules/
+dist/
+*.tsbuildinfo
+test-results/*
+!test-results/codex-corp-e2e.png
+playwright-report/
+src-tauri/target/
+release/
+
+# Local agent/runtime state
+.codex/
+.grok-acp/
+
+# Local tool logs and review scratchpads
+firebase-debug.log
+code-review.md
+
+# Pet-generation working files (the runtime uses the final spritesheet at
+# assets/pets/byte-spritesheet.webp)
+assets/pets/byte-run/
