@@ -1,6 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { AlertTriangle, Database, Download, Save, Trash2 } from "lucide-react";
+import {
+  flushDesktopCatalogWrites,
+  resetDesktopCatalogCache,
+} from "./templates";
+import { flushDesktopChatSaves, resetDesktopChatCaches } from "./workflow-chat";
 
 export type AppSettings = {
   retentionMode: "bounded" | "forever";
@@ -139,7 +144,7 @@ export function DataLogSettings() {
     if (!desktop) return;
     if (
       !window.confirm(
-        "Delete every workflow, run, detailed log, approval, artifact record, and workspace? This cannot be undone.",
+        "Delete every workflow, chat, finance entry, dashboard briefing, run, detailed log, approval, artifact, and workspace? This cannot be undone.",
       )
     )
       return;
@@ -147,12 +152,17 @@ export function DataLogSettings() {
       !window.confirm("Final confirmation: clear all Codex Corp company data?")
     )
       return;
+    // Drain queued writes first so an older save cannot repopulate SQLite after
+    // the destructive transaction completes.
+    await Promise.all([flushDesktopCatalogWrites(), flushDesktopChatSaves()]);
     await invoke("clear_all_company_data");
     for (const key of Object.keys(localStorage)) {
       if (key.startsWith("codex-corp")) localStorage.removeItem(key);
     }
-    setMessage("All company data cleared. The workflow catalog is empty.");
-    await refresh();
+    resetDesktopCatalogCache();
+    resetDesktopChatCaches();
+    // Recreate all React/module state from the now-empty native source of truth.
+    window.location.reload();
   };
 
   return (
@@ -162,7 +172,9 @@ export function DataLogSettings() {
           <h3>Data &amp; logs</h3>
           <p>
             Local-only run diagnostics, retention, and Codex process
-            concurrency.
+            concurrency. Closing the window keeps companies and schedules
+            running in the system tray; use the tray’s Quit action to stop the
+            app explicitly.
           </p>
         </div>
         <Database size={19} />

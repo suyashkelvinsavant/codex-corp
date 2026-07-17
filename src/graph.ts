@@ -1,7 +1,11 @@
 import type { FlowEdge, FlowNode, ValidationProblem } from "./model";
 import { isSpecialistKind } from "./model";
 import { validateConditionRule } from "./condition-rules";
-import { isValidCronExpression } from "./cron-trigger";
+import { isValidCronExpression, isValidCronTimezone } from "./cron-trigger";
+import {
+  isWeakSpecialistPrompt,
+  MIN_SPECIALIST_PROMPT_CHARS,
+} from "./specialist-defaults";
 
 const executable = (node: FlowNode) => node.data.kind !== "note";
 
@@ -86,6 +90,14 @@ export function validateWorkflow(
           severity: "error",
           nodeId: node.id,
           message: `${node.data.label} needs a valid five-field cron expression.`,
+        });
+      }
+      if (!isValidCronTimezone(node.data.cronTimezone ?? "UTC")) {
+        problems.push({
+          id: `cron-timezone-${node.id}`,
+          severity: "error",
+          nodeId: node.id,
+          message: `${node.data.label} needs a valid IANA timezone such as UTC or Asia/Kolkata.`,
         });
       }
       const targets = edges
@@ -230,6 +242,24 @@ export function validateWorkflow(
         severity: "error",
         nodeId: node.id,
         message: `${node.data.label} needs instructions.`,
+      });
+    } else if (
+      isSpecialistKind(node.data.kind) &&
+      isWeakSpecialistPrompt(node.data.prompt)
+    ) {
+      problems.push({
+        id: `prompt-quality-${node.id}`,
+        severity: "warning",
+        nodeId: node.id,
+        message: `${node.data.label} should use a detailed system prompt (≥${MIN_SPECIALIST_PROMPT_CHARS} chars, role-specific, not a placeholder).`,
+      });
+    }
+    if (isSpecialistKind(node.data.kind) && !node.data.tools?.length) {
+      problems.push({
+        id: `tools-${node.id}`,
+        severity: "warning",
+        nodeId: node.id,
+        message: `${node.data.label} has no tools configured — Workflow Architect should set least-privilege tools.`,
       });
     }
     if (isSpecialistKind(node.data.kind) && !node.data.model.trim()) {

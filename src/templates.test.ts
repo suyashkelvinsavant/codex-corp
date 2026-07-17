@@ -13,6 +13,10 @@ import {
   removeWorkflowFromTemplates,
   saveCustomWorkflow,
   templateStats,
+  updateWorkflowMetadata,
+  normalizeWorkflowVersion,
+  getTemplate as getCatalogTemplate,
+  planCatalogMigration,
 } from "./templates";
 
 describe("workflow catalog", () => {
@@ -83,5 +87,49 @@ describe("workflow catalog", () => {
     saveCustomWorkflow(workflow);
     deleteWorkflowFromCatalog(workflow.id);
     expect(listWorkflows()).toEqual([]);
+  });
+
+  it("round-trips editable name, description, and version metadata", () => {
+    const workflow = createBlankWorkflowTemplate(99);
+    saveCustomWorkflow(workflow);
+    expect(normalizeWorkflowVersion("1.4")).toBe("v1.4");
+    expect(normalizeWorkflowVersion("v2")).toBe("v2.0");
+
+    const updated = updateWorkflowMetadata(workflow.id, {
+      name: "Launch crew",
+      description: "Validates startup ideas end-to-end",
+      version: "1.2",
+    });
+    expect(updated).toMatchObject({
+      id: workflow.id,
+      name: "Launch crew",
+      description: "Validates startup ideas end-to-end",
+      version: "v1.2",
+    });
+    expect(getCatalogTemplate(workflow.id)).toMatchObject({
+      name: "Launch crew",
+      description: "Validates startup ideas end-to-end",
+      version: "v1.2",
+    });
+    expect(listWorkflows({ includeDrafts: true })[0]?.description).toBe(
+      "Validates startup ideas end-to-end",
+    );
+  });
+
+  it("keeps native records authoritative during one-shot migration", () => {
+    const native = { ...makeTestWorkflow(), id: "same", name: "Native" };
+    const staleBrowser = { ...native, name: "Stale browser" };
+    const browserOnly = { ...native, id: "legacy", name: "Legacy" };
+    const deleted = { ...native, id: "deleted", name: "Deleted" };
+    const result = planCatalogMigration(
+      [native],
+      [staleBrowser, browserOnly, deleted],
+      ["deleted"],
+    );
+    expect(result.items.find((item) => item.id === "same")?.name).toBe(
+      "Native",
+    );
+    expect(result.imports.map((item) => item.id)).toEqual(["legacy"]);
+    expect(result.items.some((item) => item.id === "deleted")).toBe(false);
   });
 });

@@ -37,6 +37,7 @@ import { getTemplate, templateStats } from "./templates";
 import {
   createSession,
   ingestFiles,
+  hydrateChatStore,
   loadChatStore,
   makeMessage,
   APP_WORKSPACE_REQUEST_EVENT,
@@ -275,28 +276,35 @@ export function AgentChatPage({
 
   // Reload store when switching workflows.
   useEffect(() => {
-    let next = loadChatStore(workflowId);
-    if (!next.sessions.length) {
-      const session = createSession(workflowId);
-      next = { sessions: [session], activeSessionId: session.id };
-      saveChatStore(workflowId, next);
-    } else if (
-      !next.activeSessionId ||
-      !next.sessions.some((s) => s.id === next.activeSessionId)
-    ) {
-      next = { ...next, activeSessionId: next.sessions[0].id };
-      saveChatStore(workflowId, next);
-    }
-    setStore(next);
-    setDraft("");
-    const active =
-      next.sessions.find((session) => session.id === next.activeSessionId) ??
-      next.sessions[0];
-    setWorkspaceModalOpen(false);
-    setWorkspaceRequestedByMediator(false);
-    setProjectMode(active?.projectMode ?? "new");
-    setWorkspacePath(active?.workspacePath ?? "Codex Corp workspace");
-    requestAnimationFrame(() => inputRef.current?.focus());
+    let cancelled = false;
+    void hydrateChatStore(workflowId).then((hydrated) => {
+      if (cancelled) return;
+      let next = hydrated;
+      if (!next.sessions.length) {
+        const session = createSession(workflowId);
+        next = { sessions: [session], activeSessionId: session.id };
+        saveChatStore(workflowId, next);
+      } else if (
+        !next.activeSessionId ||
+        !next.sessions.some((s) => s.id === next.activeSessionId)
+      ) {
+        next = { ...next, activeSessionId: next.sessions[0].id };
+        saveChatStore(workflowId, next);
+      }
+      setStore(next);
+      setDraft("");
+      const active =
+        next.sessions.find((session) => session.id === next.activeSessionId) ??
+        next.sessions[0];
+      setWorkspaceModalOpen(false);
+      setWorkspaceRequestedByMediator(false);
+      setProjectMode(active?.projectMode ?? "new");
+      setWorkspacePath(active?.workspacePath ?? "Codex Corp workspace");
+      requestAnimationFrame(() => inputRef.current?.focus());
+    });
+    return () => {
+      cancelled = true;
+    };
     // The host callback is intentionally excluded: it may be recreated by App.
     // Reopening this modal on every render would discard the operator's choice.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -325,7 +333,10 @@ export function AgentChatPage({
     };
     window.addEventListener(APP_WORKSPACE_REQUEST_EVENT, onWorkspaceRequest);
     return () =>
-      window.removeEventListener(APP_WORKSPACE_REQUEST_EVENT, onWorkspaceRequest);
+      window.removeEventListener(
+        APP_WORKSPACE_REQUEST_EVENT,
+        onWorkspaceRequest,
+      );
   }, [activeSession?.workspacePath, onResolveDefaultWorkspace]);
 
   useEffect(() => {
@@ -704,7 +715,7 @@ export function AgentChatPage({
   };
 
   // Refresh chat when host appends lifecycle progress — only if fingerprint changes.
-  // Skip while a Live Codex turn is streaming so localStorage "…" cannot clobber deltas.
+  // Skip while a Live Codex turn is streaming so a persisted "…" cannot clobber deltas.
   useEffect(() => {
     const tick = () => {
       if (sending) return;
@@ -835,8 +846,10 @@ export function AgentChatPage({
               type="button"
               className="agent-chat-workspace"
               onClick={() => {
-                if (activeSession?.projectMode) setProjectMode(activeSession.projectMode);
-                if (activeSession?.workspacePath) setWorkspacePath(activeSession.workspacePath);
+                if (activeSession?.projectMode)
+                  setProjectMode(activeSession.projectMode);
+                if (activeSession?.workspacePath)
+                  setWorkspacePath(activeSession.workspacePath);
                 setWorkspaceRequestedByMediator(false);
                 setWorkspaceModalOpen(true);
               }}
@@ -1017,7 +1030,10 @@ export function AgentChatPage({
           }}
         />
         {workspaceModalOpen ? (
-          <div className="modal-backdrop app-workspace-backdrop" role="presentation">
+          <div
+            className="modal-backdrop app-workspace-backdrop"
+            role="presentation"
+          >
             <section
               className="app-workspace-modal"
               role="dialog"
@@ -1034,7 +1050,11 @@ export function AgentChatPage({
                 </p>
               </header>
 
-              <div className="app-workspace-options" role="radiogroup" aria-label="App intent">
+              <div
+                className="app-workspace-options"
+                role="radiogroup"
+                aria-label="App intent"
+              >
                 <button
                   type="button"
                   role="radio"
@@ -1043,7 +1063,10 @@ export function AgentChatPage({
                   onClick={() => setProjectMode("new")}
                 >
                   <FolderPlus size={22} />
-                  <span><b>Create a new app</b><small>Start in a new or empty project folder.</small></span>
+                  <span>
+                    <b>Create a new app</b>
+                    <small>Start in a new or empty project folder.</small>
+                  </span>
                 </button>
                 <button
                   type="button"
@@ -1053,7 +1076,12 @@ export function AgentChatPage({
                   onClick={() => setProjectMode("existing")}
                 >
                   <FolderOpen size={22} />
-                  <span><b>Modify an existing app</b><small>Open the folder that already contains the app.</small></span>
+                  <span>
+                    <b>Modify an existing app</b>
+                    <small>
+                      Open the folder that already contains the app.
+                    </small>
+                  </span>
                 </button>
               </div>
 
@@ -1062,17 +1090,37 @@ export function AgentChatPage({
                 <div>
                   <Folder size={16} />
                   <span title={workspacePath}>{workspacePath}</span>
-                  <button type="button" onClick={() => void browseWorkspace()} disabled={workspaceBusy}>
+                  <button
+                    type="button"
+                    onClick={() => void browseWorkspace()}
+                    disabled={workspaceBusy}
+                  >
                     {workspaceBusy ? "Opening…" : "Choose folder"}
                   </button>
                 </div>
-                <small>Defaults to the Codex Corp workspace. You can change it anytime from the chat header.</small>
-                {workspaceError ? <p className="app-workspace-error">{workspaceError}</p> : null}
+                <small>
+                  Defaults to the Codex Corp workspace. You can change it
+                  anytime from the chat header.
+                </small>
+                {workspaceError ? (
+                  <p className="app-workspace-error">{workspaceError}</p>
+                ) : null}
               </div>
 
               <footer>
-                <button type="button" className="app-workspace-back" onClick={cancelWorkspace}>Not now</button>
-                <button type="button" className="app-workspace-confirm" onClick={confirmWorkspace} autoFocus>
+                <button
+                  type="button"
+                  className="app-workspace-back"
+                  onClick={cancelWorkspace}
+                >
+                  Not now
+                </button>
+                <button
+                  type="button"
+                  className="app-workspace-confirm"
+                  onClick={confirmWorkspace}
+                  autoFocus
+                >
                   Continue to chat
                 </button>
               </footer>

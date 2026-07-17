@@ -5,6 +5,7 @@ import {
   Cpu,
   Database,
   Home,
+  LayoutDashboard,
   MessageSquare,
   Moon,
   Network,
@@ -37,16 +38,20 @@ import {
 } from "./theme";
 import { DataLogSettings } from "./data-log-settings";
 import { HomePet } from "./home-pet";
+import { DashboardsPage } from "./dashboards-page";
+import type { PortfolioRunSummary } from "./dashboard-finance";
 
 export type OverviewSection =
-  "workflows" | "templates" | "executions" | "settings";
+  "workflows" | "templates" | "executions" | "dashboards" | "settings";
 
-type WorkspaceSection = Exclude<OverviewSection, "settings">;
+type WorkspaceSection = Exclude<OverviewSection, "settings" | "dashboards">;
 
 export type OverviewPageProps = {
   activeWorkflowId: string;
   running: boolean;
   runHistory: RunRecord[];
+  /** Compact lifetime totals for Dashboards (not active-workflow-only). */
+  portfolioRunSummaries?: PortfolioRunSummary[];
   codexInfo: CodexInfo;
   onOpenChat: (id: string) => void;
   onEditWorkflow: (id: string) => void;
@@ -59,6 +64,7 @@ export function OverviewPage({
   activeWorkflowId,
   running,
   runHistory,
+  portfolioRunSummaries,
   codexInfo,
   onOpenChat,
   onEditWorkflow,
@@ -154,6 +160,10 @@ export function OverviewPage({
       h1: "Executions",
       sub: `Run history for the active company (${workflows.find((t) => t.id === activeWorkflowId)?.name ?? activeWorkflowId})`,
     },
+    dashboards: {
+      h1: "Dashboards",
+      sub: "Token burn, estimated input cost, revenue & expenses — with Architect feedback loop",
+    },
     settings: {
       h1: "Settings",
       sub: "Manage appearance, runtime, and local data",
@@ -176,10 +186,16 @@ export function OverviewPage({
         </div>
         <nav className="overview-nav-list">
           <NavBtn
-            active={section !== "settings"}
+            active={section !== "settings" && section !== "dashboards"}
             onClick={() => selectWorkspaceSection(lastWorkspaceSection)}
             icon={Home}
             label="Workspace"
+          />
+          <NavBtn
+            active={section === "dashboards"}
+            onClick={() => setSection("dashboards")}
+            icon={LayoutDashboard}
+            label="Dashboards"
           />
         </nav>
         <nav
@@ -342,9 +358,14 @@ export function OverviewPage({
                             {lastRunLabel(template.id)}
                             <span> · </span>
                             {stats.nodeCount} nodes · {stats.edgeCount} edges ·{" "}
-                            {template.version}
+                            <span className="workflow-version-tag">
+                              {template.version}
+                            </span>
                           </p>
-                          <small>{template.description}</small>
+                          <small>
+                            {template.description ||
+                              "No description yet — edit in the graph editor."}
+                          </small>
                         </div>
                         <div className="workflow-card-actions">
                           <button
@@ -419,6 +440,14 @@ export function OverviewPage({
               ))}
             </ul>
           </section>
+        )}
+
+        {section === "dashboards" && (
+          <DashboardsPage
+            runHistory={runHistory}
+            portfolioRunSummaries={portfolioRunSummaries}
+            onOpenArchitect={onOpenArchitect}
+          />
         )}
 
         {section === "settings" && (

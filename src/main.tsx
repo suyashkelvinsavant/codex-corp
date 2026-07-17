@@ -101,7 +101,6 @@ import {
 } from "./codex-models";
 import { kindPopColor } from "./kind-colors";
 import { autoLayout, upstreamLineage, validateWorkflow } from "./graph";
-import { matchCron } from "./cron-trigger";
 import { resetExecutableNodeForRun } from "./run-lifecycle";
 import { resolveActiveSkill } from "./creative-skills";
 import {
@@ -135,16 +134,25 @@ import {
   getTemplate,
   listWorkflows,
   listTemplates,
+  normalizeWorkflowVersion,
   updateWorkflowMetadata,
   saveCustomWorkflow,
   deleteWorkflowFromCatalog,
+  hydrateWorkflowCatalog,
 } from "./templates";
+import { ensureSpecialistQuality } from "./specialist-defaults";
+import {
+  applyTokenUsageToNode,
+  extractTotalTokensFromPayload,
+  isTokenUsageEventType,
+} from "./token-usage";
 import { resetBrowserWorkspaceOnce } from "./fresh-app-reset";
 import { FeatureBoundary } from "./feature-boundary";
 import { initAppearance } from "./theme";
 import { useUiStore } from "./ui-store";
 import {
   appendMediatorEventToStore,
+  hydrateChatStore,
   requestAppWorkspaceSelection,
   toCodexUserInputs,
   type AppProjectMode,
@@ -160,6 +168,14 @@ import {
 import { appendStreamPreview, isAgentMessageDelta } from "./stream-display";
 import { modelDefault } from "./editor-defaults";
 import { Metric } from "./metric";
+import {
+  PERSISTENCE_ERROR_EVENT,
+  type PersistenceErrorDetail,
+} from "./persistence-events";
+import {
+  summarizePortfolioRuns,
+  type PortfolioRunSummary,
+} from "./dashboard-finance";
 import { CONTROL_KINDS, controlKindLabel, statusText } from "./node-display";
 import {
   buildMediatorContextDigest,
@@ -169,6 +185,7 @@ import {
   type MediatorHostContext,
 } from "./company-mediator-tools";
 import {
+  architectContextExtras,
   buildArchitectContextDigest,
   executeWorkflowArchitectTool,
   workflowArchitectDynamicTools,
@@ -639,14 +656,12 @@ function App() {
   );
   const [workflowId, setWorkflowId] = useState(DEFAULT_TEMPLATE_ID);
   const [workflowName, setWorkflowName] = useState("Untitled workflow");
+  const [workflowDescription, setWorkflowDescription] = useState("");
+  const [workflowVersion, setWorkflowVersion] = useState("v0.1");
   const [catalogRevision, setCatalogRevision] = useState(0);
+  const [catalogReady, setCatalogReady] = useState(() => !isTauri());
   const [architectInitialPrompt, setArchitectInitialPrompt] = useState("");
   const activeChatWorkspaceRef = useRef<string | null>(null);
-
-  useEffect(() => {
-    if (!freshAppNeedsNativeReset || !isTauri()) return;
-    void invoke("clear_all_company_data").catch(() => undefined);
-  }, []);
 
   const {
     appView,
@@ -703,6 +718,10 @@ function App() {
   const [questionSelected, setQuestionSelected] = useState<string[]>([]);
   const [runId, setRunId] = useState<string | null>(null);
   const [runHistory, setRunHistory] = useState<RunRecord[]>([]);
+  /** Compact lifetime totals for Dashboards (not active-workflow-only). */
+  const [portfolioRunSummaries, setPortfolioRunSummaries] = useState<
+    PortfolioRunSummary[]
+  >([]);
   const [compatibilityOpen, setCompatibilityOpen] = useState(false);
   const [compatibilityError, setCompatibilityError] = useState("");
   const [customCodexPath, setCustomCodexPath] = useState("");
@@ -769,10 +788,14 @@ function App() {
       id,
       name,
       graphJson,
+      workspacePath,
+      templateJson,
     }: {
       id: string;
       name: string;
       graphJson: string;
+      workspacePath?: string | null;
+      templateJson?: string;
     }) => {
       localStorage.setItem(ACTIVE_WORKFLOW_KEY, id);
       if (isTauri())
@@ -781,6 +804,8 @@ function App() {
             id,
             name,
             graphJson,
+            workspacePath,
+            templateJson,
           },
         });
       else localStorage.setItem(workflowStorageKey(id), graphJson);
@@ -1112,7 +1137,12 @@ function App() {
     });
     if (isTauri())
       await invoke("save_workflow", {
-        snapshot: { id: template.id, name: template.name, graphJson },
+        snapshot: {
+          id: template.id,
+          name: template.name,
+          graphJson,
+          templateJson: JSON.stringify(template),
+        },
       });
     else localStorage.setItem(workflowStorageKey(template.id), graphJson);
     setCatalogRevision((value) => value + 1);
@@ -1154,7 +1184,6 @@ function App() {
         const result = await executeWorkflowArchitectTool(tool, args, {
           save: persistArchitectWorkflow,
           remove: async (id) => {
-            if (isTauri()) await invoke("delete_workflow", { id });
             deleteWorkflowFromCatalog(id);
             localStorage.removeItem(workflowStorageKey(id));
             setCatalogRevision((value) => value + 1);
@@ -1198,7 +1227,7 @@ function App() {
                   `${m.role === "user" ? "Operator" : "Workflow Architect"}: ${m.text}`,
               )
               .join("\n\n"),
-            contextDigest: buildArchitectContextDigest(),
+            contextDigest: `${buildArchitectContextDigest()}${await architectContextExtras()}`,
             dynamicTools: workflowArchitectDynamicTools(),
             threadId: req.threadId ?? null,
             sessionId: req.sessionId,
@@ -1491,6 +1520,19 @@ function App() {
     const id = `${kind}-${crypto.randomUUID()}`;
     const i = nodes.length;
     const isSpecialist = isSpecialistKind(kind);
+    const label = defaultLabelForKind(kind, role);
+    const nodeRole = defaultRoleForKind(kind, role);
+    const specialist = isSpecialist
+      ? ensureSpecialistQuality({
+          kind,
+          role: nodeRole,
+          label,
+          prompt: "",
+          tools: [],
+          skills: [],
+          description: "",
+        })
+      : null;
     setNodes((ns) => [
       ...ns,
       {
@@ -1501,8 +1543,8 @@ function App() {
           y: 120 + (i % 4) * 150,
         },
         data: {
-          label: defaultLabelForKind(kind, role),
-          role: defaultRoleForKind(kind, role),
+          label,
+          role: nodeRole,
           kind,
           status: kind === "note" ? "draft" : "idle",
           model: isSpecialist
@@ -1513,48 +1555,47 @@ function App() {
                 ? "Collector"
                 : "Control",
           effort: "low",
-          tools:
-            kind === "creative"
+          tools: specialist
+            ? specialist.tools
+            : kind === "creative"
               ? ["Image generation", "Image edit", "Workspace write"]
               : [],
-          skills: isSpecialist ? [] : undefined,
+          skills: specialist ? specialist.skills : undefined,
           connectorTools: isSpecialist ? [] : undefined,
-          prompt:
-            kind === "note"
+          prompt: specialist
+            ? specialist.prompt
+            : kind === "note"
               ? "Use this note to explain a subgraph or design decision. Notes are never executed."
-              : kind === "creative"
-                ? "You are Codex Creative Studio. Produce visual assets for non-technical operators: logos, UI art, heroes, icons, edits, and mockups. Follow the primary skill direction and return image artifacts."
-                : kind === "approval"
-                  ? "Pause until a human approves the reviewed deliverable."
-                  : kind === "input"
-                    ? "Capture the user request and constraints."
-                    : kind === "cron"
-                      ? "Start the workflow on the configured schedule."
-                      : kind === "output"
-                        ? "Collect approved artifacts and execution notes."
-                        : kind === "condition"
-                          ? "Route when the configured branch value matches."
-                          : kind === "merge"
-                            ? "Wait for required upstream branches, then continue."
-                            : "Define this node contract.",
-          description:
-            kind === "note"
-              ? "Documentation only — not part of the executable company graph."
-              : kind === "creative"
-                ? "One studio node · many visual skills (logo, assets, edit, mockups)."
+              : kind === "approval"
+                ? "Pause until a human approves the reviewed deliverable."
                 : kind === "input"
-                  ? "The authorized request entering the company."
+                  ? "Capture the user request and constraints."
                   : kind === "cron"
-                    ? "Schedules a company run and connects into the Mission brief."
+                    ? "Start the workflow on the configured schedule."
                     : kind === "output"
-                      ? "Final auditable project handoff."
-                      : kind === "approval"
-                        ? "Explicit human release decision."
-                        : kind === "condition"
-                          ? "Typed branch control for downstream edges."
-                          : kind === "merge"
-                            ? "Joins parallel specialist tracks."
-                            : "Configure this node in the inspector.",
+                      ? "Collect approved artifacts and execution notes."
+                      : kind === "condition"
+                        ? "Route when the configured branch value matches."
+                        : kind === "merge"
+                          ? "Wait for required upstream branches, then continue."
+                          : "Define this node contract.",
+          description: specialist
+            ? specialist.description
+            : kind === "note"
+              ? "Documentation only — not part of the executable company graph."
+              : kind === "input"
+                ? "The authorized request entering the company."
+                : kind === "cron"
+                  ? "Schedules a company run and connects into the Mission brief."
+                  : kind === "output"
+                    ? "Final auditable project handoff."
+                    : kind === "approval"
+                      ? "Explicit human release decision."
+                      : kind === "condition"
+                        ? "Typed branch control for downstream edges."
+                        : kind === "merge"
+                          ? "Joins parallel specialist tracks."
+                          : "Configure this node in the inspector.",
           duration: "—",
           tokens: 0,
           conditionRule:
@@ -1687,7 +1728,10 @@ function App() {
     label: string,
   ) => {
     setWorkflowId(nextWorkflowId);
-    setWorkflowName(getTemplate(nextWorkflowId).name);
+    const meta = getTemplate(nextWorkflowId);
+    setWorkflowName(meta.name);
+    setWorkflowDescription(meta.description ?? "");
+    setWorkflowVersion(meta.version || "v0.1");
     localStorage.setItem(ACTIVE_WORKFLOW_KEY, nextWorkflowId);
     setNodes(nextNodes);
     setEdges(nextEdges);
@@ -1704,6 +1748,26 @@ function App() {
     setSaved(label);
   };
 
+  const persistWorkflowMetadata = (patch: {
+    name?: string;
+    description?: string;
+    version?: string;
+  }) => {
+    // Explicit metadata edits promote drafts into the catalog so name/description
+    // are visible on Overview without requiring a full graph save first.
+    const updated = updateWorkflowMetadata(workflowId, {
+      ...patch,
+      draft: false,
+    });
+    if (updated) {
+      if (patch.name !== undefined) setWorkflowName(updated.name);
+      if (patch.description !== undefined)
+        setWorkflowDescription(updated.description);
+      if (patch.version !== undefined) setWorkflowVersion(updated.version);
+      setCatalogRevision((value) => value + 1);
+    }
+  };
+
   const save = async (emptyConfirmed = false) => {
     if (!emptyConfirmed && !nodes.length && !edges.length) {
       const confirmed = window.confirm(
@@ -1716,6 +1780,8 @@ function App() {
     saveCustomWorkflow({
       ...template,
       name: workflowName.trim() || "Untitled workflow",
+      description: workflowDescription.trim(),
+      version: normalizeWorkflowVersion(workflowVersion),
       nodes: structuredClone(nodes),
       edges: structuredClone(edges),
       draft: false,
@@ -1724,6 +1790,16 @@ function App() {
       id: workflowId,
       name: workflowName.trim() || "Untitled workflow",
       graphJson,
+      workspacePath: activeChatWorkspaceRef.current,
+      templateJson: JSON.stringify({
+        ...template,
+        name: workflowName.trim() || "Untitled workflow",
+        description: workflowDescription.trim(),
+        version: normalizeWorkflowVersion(workflowVersion),
+        nodes,
+        edges,
+        draft: false,
+      }),
     });
     setCatalogRevision((value) => value + 1);
     setSaved(isTauri() ? "Saved to SQLite" : "Saved locally");
@@ -1810,6 +1886,25 @@ function App() {
     }
   };
 
+  const loadPortfolioRunSummaries = async () => {
+    try {
+      if (isTauri()) {
+        setPortfolioRunSummaries(
+          await invoke<PortfolioRunSummary[]>("list_portfolio_run_summaries"),
+        );
+      } else {
+        setPortfolioRunSummaries(
+          summarizePortfolioRuns(
+            parseRunRecords(localStorage.getItem(RUNS_STORAGE_KEY)),
+          ),
+        );
+      }
+    } catch {
+      // Preserve already-loaded totals; the active history remains available.
+      setPortfolioRunSummaries((previous) => previous);
+    }
+  };
+
   const clearRunUiForTemplateSwitch = (templateName: string) => {
     const baseline = templateSwitchBaselineEvents(templateName);
     eventsRef.current = baseline;
@@ -1855,6 +1950,8 @@ function App() {
           id: leavingId,
           name: leaving.name,
           graphJson,
+          workspacePath: activeChatWorkspaceRef.current,
+          templateJson: JSON.stringify({ ...leaving, nodes, edges }),
         });
         emit(
           `Auto-saved · ${leaving.name} before template switch`,
@@ -2133,46 +2230,6 @@ function App() {
       );
     }
   };
-
-  const cronMinuteKeys = useRef<Record<string, string>>({});
-  useEffect(() => {
-    const checkSchedules = () => {
-      if (running || !isTauri()) return;
-      for (const node of nodes) {
-        if (node.data.kind !== "cron" || node.data.cronEnabled === false)
-          continue;
-        try {
-          const result = matchCron(
-            node.data.cronExpression ?? "",
-            node.data.cronTimezone ?? "UTC",
-          );
-          if (
-            result.matches &&
-            cronMinuteKeys.current[node.id] !== result.minuteKey
-          ) {
-            cronMinuteKeys.current[node.id] = result.minuteKey;
-            emit(
-              `Schedule fired · ${node.data.label}`,
-              "workflow.cron.triggered",
-              node.id,
-            );
-            void run();
-            break;
-          }
-        } catch (error) {
-          emit(
-            `Schedule error · ${node.data.label}: ${String(error)}`,
-            "workflow.cron.failed",
-            node.id,
-            "error",
-          );
-        }
-      }
-    };
-    checkSchedules();
-    const timer = window.setInterval(checkSchedules, 15_000);
-    return () => window.clearInterval(timer);
-  }, [nodes, running, workflowId]);
 
   useEffect(() => {
     const key = (e: KeyboardEvent) => {
@@ -2459,10 +2516,41 @@ function App() {
   useEffect(() => {
     let cancelled = false;
     const bootstrap = async () => {
+      if (freshAppNeedsNativeReset && isTauri()) {
+        try {
+          await invoke("clear_all_company_data");
+        } catch {
+          /* continue booting from the existing native data if reset fails */
+        }
+      }
+      try {
+        await hydrateWorkflowCatalog();
+        await Promise.all(
+          [
+            DEFAULT_TEMPLATE_ID,
+            ...listWorkflows({ includeDrafts: true }).map(({ id }) => id),
+          ].map((id) => hydrateChatStore(id)),
+        );
+        if (!cancelled) setCatalogRevision((value) => value + 1);
+      } catch {
+        /* keep the browser migration cache available */
+      }
       const activeId = readActiveWorkflowId(
         localStorage.getItem(ACTIVE_WORKFLOW_KEY),
         DEFAULT_TEMPLATE_ID,
       );
+      // Keep metadata in lockstep with the graph selected during bootstrap.
+      // Without this, saving an auto-restored graph overwrites its catalog
+      // metadata with the editor's initial placeholder values.
+      if (
+        !cancelled &&
+        shouldApplyAutoloadSnapshot(userMutatedWorkflow.current)
+      ) {
+        const metadata = getTemplate(activeId);
+        setWorkflowName(metadata.name);
+        setWorkflowDescription(metadata.description ?? "");
+        setWorkflowVersion(metadata.version || "v0.1");
+      }
       // 1) Auto-load last saved workflow for the active template when present.
       // Skip if the user already Seeded/edited after first paint (late-load race).
       try {
@@ -2526,11 +2614,44 @@ function App() {
       } catch {
         if (!cancelled) setRunHistory([]);
       }
+
+      // 3) Compact lifetime portfolio totals for Dashboards.
+      try {
+        if (isTauri()) {
+          const summaries = await invoke<PortfolioRunSummary[]>(
+            "list_portfolio_run_summaries",
+          );
+          if (!cancelled) setPortfolioRunSummaries(summaries);
+        } else if (!cancelled) {
+          setPortfolioRunSummaries(
+            summarizePortfolioRuns(
+              parseRunRecords(localStorage.getItem(RUNS_STORAGE_KEY)),
+            ),
+          );
+        }
+      } catch {
+        if (!cancelled) setPortfolioRunSummaries([]);
+      }
+      if (!cancelled) setCatalogReady(true);
     };
     void bootstrap();
     return () => {
       cancelled = true;
     };
+  }, []);
+  useEffect(() => {
+    const onPersistenceError = (event: Event) => {
+      const detail = (event as CustomEvent<PersistenceErrorDetail>).detail;
+      emit(
+        `${detail?.area || "Data"} was not saved: ${detail?.message || "unknown persistence error"}`,
+        "persistence.failed",
+        undefined,
+        "error",
+      );
+    };
+    window.addEventListener(PERSISTENCE_ERROR_EVENT, onPersistenceError);
+    return () =>
+      window.removeEventListener(PERSISTENCE_ERROR_EVENT, onPersistenceError);
   }, []);
   useEffect(() => {
     if (!isTauri()) return;
@@ -2543,33 +2664,45 @@ function App() {
         message: string;
         threadId?: string;
         turnId?: string;
+        tokens?: number;
       }>("codex-agent-event", (event) => {
         if (disposed) return;
         const payload = event.payload;
         const lifecycle = isCodexAgentLifecycleEvent(payload.eventType);
         const streaming = isAgentMessageDelta(payload.eventType);
-        if (!lifecycle && !streaming) return;
+        const tokenEvent =
+          isTokenUsageEventType(payload.eventType) ||
+          typeof payload.tokens === "number";
+        const tokens = Math.max(
+          Number(payload.tokens) || 0,
+          extractTotalTokensFromPayload(payload),
+          extractTotalTokensFromPayload(payload.message),
+        );
+        if (!lifecycle && !streaming && !tokenEvent && tokens <= 0) return;
         setNodes((ns) =>
-          ns.map((n) =>
-            n.id === payload.nodeId
-              ? {
-                  ...n,
-                  data: {
-                    ...n.data,
-                    threadId: payload.threadId ?? n.data.threadId,
-                    streamingPreview: streaming
-                      ? appendStreamPreview(
-                          n.data.streamingPreview,
-                          payload.message,
-                        )
-                      : undefined,
-                    trace: lifecycle
-                      ? [...n.data.trace, payload.message].slice(-80)
-                      : n.data.trace,
-                  },
-                }
-              : n,
-          ),
+          ns.map((n) => {
+            if (n.id !== payload.nodeId) return n;
+            let next = n;
+            if (tokens > 0) next = applyTokenUsageToNode(next, tokens);
+            return {
+              ...next,
+              data: {
+                ...next.data,
+                threadId: payload.threadId ?? next.data.threadId,
+                streamingPreview: streaming
+                  ? appendStreamPreview(
+                      next.data.streamingPreview,
+                      payload.message,
+                    )
+                  : lifecycle
+                    ? undefined
+                    : next.data.streamingPreview,
+                trace: lifecycle
+                  ? [...next.data.trace, payload.message].slice(-80)
+                  : next.data.trace,
+              },
+            };
+          }),
         );
         if (lifecycle)
           emit(
@@ -2707,6 +2840,17 @@ function App() {
         ) {
           setRunning(false);
           void loadRunHistoryFor(workflowId);
+          void loadPortfolioRunSummaries();
+        }
+        const diagTokens = extractTotalTokensFromPayload(payload.diagnostics);
+        if (payload.nodeId && diagTokens > 0) {
+          setNodes((items) =>
+            items.map((node) =>
+              node.id === payload.nodeId
+                ? applyTokenUsageToNode(node, diagTokens)
+                : node,
+            ),
+          );
         }
       }),
     );
@@ -2909,6 +3053,15 @@ function App() {
     </>
   );
 
+  if (!catalogReady) {
+    return (
+      <div className="app-bootstrap" role="status" aria-live="polite">
+        <Sparkles size={22} />
+        <span>Loading native company data…</span>
+      </div>
+    );
+  }
+
   if (appView === "overview") {
     return (
       <>
@@ -2917,6 +3070,7 @@ function App() {
             activeWorkflowId={workflowId}
             running={running}
             runHistory={runHistory}
+            portfolioRunSummaries={portfolioRunSummaries}
             codexInfo={codexInfo}
             onOpenChat={(id) => {
               void switchTemplate(id, "chat");
@@ -2968,7 +3122,6 @@ function App() {
               )
                 return;
               void (async () => {
-                if (isTauri()) await invoke("delete_workflow", { id });
                 deleteWorkflowFromCatalog(id);
                 localStorage.removeItem(workflowStorageKey(id));
                 setCatalogRevision((value) => value + 1);
@@ -3060,14 +3213,47 @@ function App() {
                 onBlur={() => {
                   const name = workflowName.trim() || "Untitled workflow";
                   setWorkflowName(name);
-                  updateWorkflowMetadata(workflowId, { name });
-                  setCatalogRevision((value) => value + 1);
+                  persistWorkflowMetadata({ name });
                 }}
                 aria-label="Workflow name"
               />
-              <small>{activeTemplate.version}</small>
+            </label>
+            <label className="workflow-version-editor">
+              <span>Version</span>
+              <input
+                value={workflowVersion}
+                onChange={(event) => {
+                  setWorkflowVersion(event.target.value);
+                  markDirty();
+                }}
+                onBlur={() => {
+                  const version = normalizeWorkflowVersion(workflowVersion);
+                  setWorkflowVersion(version);
+                  persistWorkflowMetadata({ version });
+                }}
+                aria-label="Workflow version"
+                title="Semantic product version for this company graph (e.g. v0.1, v1.2)"
+              />
             </label>
           </div>
+          <label className="workflow-description-editor">
+            <span>Description</span>
+            <textarea
+              value={workflowDescription}
+              rows={2}
+              placeholder="What this company workflow does…"
+              onChange={(event) => {
+                setWorkflowDescription(event.target.value);
+                markDirty();
+              }}
+              onBlur={() => {
+                persistWorkflowMetadata({
+                  description: workflowDescription.trim(),
+                });
+              }}
+              aria-label="Workflow description"
+            />
+          </label>
           <button
             type="button"
             className={`architect-lock ${activeTemplate.locked ? "locked" : ""}`}

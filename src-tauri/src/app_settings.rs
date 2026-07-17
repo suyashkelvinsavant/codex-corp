@@ -393,7 +393,11 @@ pub(crate) fn clear_all_company_data(database: tauri::State<'_, Database>) -> Re
              DELETE FROM node_attempts;
              DELETE FROM run_checkpoints;
              DELETE FROM run_events;
+             DELETE FROM schedule_firings;
              DELETE FROM runs;
+             DELETE FROM chat_stores;
+             DELETE FROM dashboard_feedback;
+             DELETE FROM finance_entries;
              DELETE FROM workflows;",
         )
         .map_err(|error| error.to_string())?;

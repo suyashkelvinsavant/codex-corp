@@ -11,9 +11,16 @@ use std::{
     sync::{mpsc, Arc, Mutex},
     time::Duration,
 };
+#[cfg(desktop)]
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+};
 use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize};
 
 mod app_settings;
+mod business_data;
+mod chat_data;
 mod workflow_runtime;
 
 fn default_agent_output_schema() -> Value {
@@ -78,6 +85,10 @@ struct WorkflowSnapshot {
     id: String,
     name: String,
     graph_json: String,
+    #[serde(default)]
+    workspace_path: Option<String>,
+    #[serde(default)]
+    template_json: Option<String>,
 }
 
 #[cfg(test)]
@@ -114,6 +125,14 @@ struct RunRecord {
     resumable: bool,
     pinned: bool,
     last_event_sequence: u64,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct PortfolioRunSummary {
+    workflow_id: String,
+    run_count: u64,
+    token_burn: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,6 +174,8 @@ struct GraphNodeData {
     personality: Option<String>,
     #[serde(default)]
     cron_expression: Option<String>,
+    #[serde(default)]
+    cron_timezone: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -336,6 +357,9 @@ struct NormalizedAgentEvent {
     message: String,
     thread_id: Option<String>,
     turn_id: Option<String>,
+    /// Tokens attributable to the latest specialist turn when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -358,6 +382,42 @@ struct AgentResult {
     artifacts: Vec<Value>,
     thread_id: String,
     turn_id: String,
+    /// Peak latest-turn token count observed from token-usage notifications.
+    #[serde(default)]
+    tokens: u64,
+}
+
+fn extract_total_tokens(value: &Value) -> Option<u64> {
+    let candidates = [
+        // `total` is cumulative across a resumed thread. Prefer the latest
+        // turn so separate workflow runs do not repeatedly count old usage.
+        value.pointer("/params/tokenUsage/last/totalTokens"),
+        value.pointer("/params/tokenUsage/last/total_tokens"),
+        value.pointer("/tokenUsage/last/totalTokens"),
+        value.pointer("/tokenUsage/last/total_tokens"),
+        value.pointer("/params/tokenUsage/total/totalTokens"),
+        value.pointer("/params/tokenUsage/total/total_tokens"),
+        value.pointer("/tokenUsage/total/totalTokens"),
+        value.pointer("/params/totalTokens"),
+        value.get("totalTokens"),
+        value.get("tokens"),
+    ];
+    for candidate in candidates {
+        if let Some(n) = candidate.and_then(Value::as_u64) {
+            return Some(n);
+        }
+        if let Some(n) = candidate.and_then(Value::as_f64) {
+            if n.is_finite() && n >= 0.0 {
+                return Some(n as u64);
+            }
+        }
+        if let Some(n) = candidate.and_then(Value::as_i64) {
+            if n >= 0 {
+                return Some(n as u64);
+            }
+        }
+    }
+    None
 }
 
 fn parse_agent_message(message: &str) -> Result<(String, String, Value, Vec<Value>), String> {
@@ -443,6 +503,8 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
             graph_json TEXT NOT NULL,
+            workspace_path TEXT,
+            template_json TEXT,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS runs (
@@ -487,6 +549,13 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
             node_id TEXT NOT NULL,
             metadata_json TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS schedule_firings (
+            workflow_id TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            minute_key TEXT NOT NULL,
+            fired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(workflow_id, node_id, minute_key)
         );",
         )
         .map_err(|error| error.to_string())?;
@@ -500,7 +569,11 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
         [],
     );
     let _ = connection.execute("ALTER TABLE runs ADD COLUMN workspace_path TEXT", []);
+    let _ = connection.execute("ALTER TABLE workflows ADD COLUMN workspace_path TEXT", []);
+    let _ = connection.execute("ALTER TABLE workflows ADD COLUMN template_json TEXT", []);
     app_settings::initialize(connection)?;
+    business_data::initialize(connection)?;
+    chat_data::initialize(connection)?;
     Ok(())
 }
 
@@ -959,6 +1032,24 @@ fn validate_graph(graph: &GraphSnapshot) -> Vec<GraphProblem> {
                 format!("cron-expression-{}", cron.id),
                 format!(
                     "{} needs a valid five-field cron expression.",
+                    cron.data.label
+                ),
+                Some(cron.id.clone()),
+                None,
+            ));
+        }
+        let valid_timezone = cron
+            .data
+            .cron_timezone
+            .as_deref()
+            .unwrap_or("UTC")
+            .parse::<chrono_tz::Tz>()
+            .is_ok();
+        if !valid_timezone {
+            problems.push(problem(
+                format!("cron-timezone-{}", cron.id),
+                format!(
+                    "{} needs a valid IANA timezone such as UTC or Asia/Kolkata.",
                     cron.data.label
                 ),
                 Some(cron.id.clone()),
@@ -1445,11 +1536,78 @@ fn save_workflow(
 ) -> Result<(), String> {
     database.0.lock().map_err(|_| "database lock poisoned".to_string())?
         .execute(
-            "INSERT INTO workflows (id, name, graph_json, updated_at) VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)
-             ON CONFLICT(id) DO UPDATE SET name=excluded.name, graph_json=excluded.graph_json, updated_at=CURRENT_TIMESTAMP",
-            params![snapshot.id, snapshot.name, snapshot.graph_json]
+            "INSERT INTO workflows (id, name, graph_json, workspace_path, template_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP)
+             ON CONFLICT(id) DO UPDATE SET name=excluded.name, graph_json=excluded.graph_json, workspace_path=COALESCE(excluded.workspace_path,workflows.workspace_path), template_json=COALESCE(excluded.template_json,workflows.template_json), updated_at=CURRENT_TIMESTAMP",
+            params![snapshot.id, snapshot.name, snapshot.graph_json, snapshot.workspace_path, snapshot.template_json]
         ).map_err(|error| error.to_string())?;
     Ok(())
+}
+
+#[tauri::command]
+fn list_workflow_catalog(database: tauri::State<'_, Database>) -> Result<Vec<String>, String> {
+    let connection = database
+        .0
+        .lock()
+        .map_err(|_| "database lock poisoned".to_string())?;
+    let mut statement = connection
+        .prepare("SELECT id,name,graph_json,template_json FROM workflows ORDER BY updated_at,id")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            let id: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let graph_json: String = row.get(2)?;
+            let template_json: Option<String> = row.get(3)?;
+            if let Some(template) = template_json {
+                return Ok(template);
+            }
+            let graph: Value = serde_json::from_str(&graph_json).unwrap_or_else(|_| json!({}));
+            Ok(json!({
+                "id": id,
+                "name": name,
+                "description": "",
+                "version": "v0.1",
+                "nodes": graph.get("nodes").cloned().unwrap_or_else(|| json!([])),
+                "edges": graph.get("edges").cloned().unwrap_or_else(|| json!([])),
+            })
+            .to_string())
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn save_workflow_catalog_item(
+    template_json: String,
+    database: tauri::State<'_, Database>,
+) -> Result<(), String> {
+    let template: Value = serde_json::from_str(&template_json)
+        .map_err(|error| format!("invalid workflow template: {error}"))?;
+    let id = template
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("workflow template requires id")?;
+    let name = template
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("workflow template requires name")?;
+    let nodes = template.get("nodes").cloned().unwrap_or_else(|| json!([]));
+    let edges = template.get("edges").cloned().unwrap_or_else(|| json!([]));
+    let graph_json = json!({ "nodes": nodes, "edges": edges }).to_string();
+    database
+        .0
+        .lock()
+        .map_err(|_| "database lock poisoned".to_string())?
+        .execute(
+            "INSERT INTO workflows(id,name,graph_json,template_json,updated_at) VALUES(?1,?2,?3,?4,CURRENT_TIMESTAMP)
+             ON CONFLICT(id) DO UPDATE SET name=excluded.name,graph_json=excluded.graph_json,template_json=excluded.template_json,updated_at=CURRENT_TIMESTAMP",
+            params![id, name, graph_json, template_json],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1624,7 +1782,12 @@ fn list_runs(
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?
     };
-    for record in &mut records {
+    hydrate_run_records(&connection, &mut records)?;
+    Ok(records)
+}
+
+fn hydrate_run_records(connection: &Connection, records: &mut [RunRecord]) -> Result<(), String> {
+    for record in records {
         let mut event_statement = connection.prepare(
             "SELECT payload_json FROM run_events WHERE run_id=?1 ORDER BY COALESCE(sequence,id),id"
         ).map_err(|error| error.to_string())?;
@@ -1636,6 +1799,30 @@ fn list_runs(
             .map_err(|error| error.to_string())?;
         if !event_values.is_empty() {
             record.events_json = format!("[{}]", event_values.join(","));
+        }
+
+        let mut token_totals: HashMap<String, u64> = HashMap::new();
+        let mut attempt_statement = connection
+            .prepare("SELECT node_id,diagnostics_json FROM node_attempts WHERE run_id=?1")
+            .map_err(|error| error.to_string())?;
+        let attempts = attempt_statement
+            .query_map(params![record.id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+        for attempt in attempts {
+            let (node_id, diagnostics) = attempt.map_err(|error| error.to_string())?;
+            let tokens = serde_json::from_str::<Value>(&diagnostics)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("attemptTokens")
+                        .or_else(|| value.get("tokens"))
+                        .and_then(Value::as_u64)
+                })
+                .unwrap_or(0);
+            let total = token_totals.entry(node_id).or_insert(0);
+            *total = total.saturating_add(tokens);
         }
 
         let mut nodes: Value = serde_json::from_str(&record.nodes_json).unwrap_or(Value::Null);
@@ -1676,15 +1863,131 @@ fn list_runs(
                             if let Some(thread_id) = output.get("threadId") {
                                 data.insert("threadId".into(), thread_id.clone());
                             }
+                            if let Some(tokens) = output.get("tokens") {
+                                data.insert("tokens".into(), tokens.clone());
+                            } else if let Some(tokens) = extract_total_tokens(&output) {
+                                data.insert("tokens".into(), Value::Number(tokens.into()));
+                            }
                         }
                     }
+                }
+            }
+            for node in node_list {
+                let Some(node_id) = node.get("id").and_then(Value::as_str).map(str::to_string)
+                else {
+                    continue;
+                };
+                let Some(tokens) = token_totals.get(&node_id).copied() else {
+                    continue;
+                };
+                if let Some(data) = node.get_mut("data").and_then(Value::as_object_mut) {
+                    data.insert("tokens".into(), Value::Number(tokens.into()));
                 }
             }
             record.nodes_json =
                 serde_json::to_string(&nodes).unwrap_or_else(|_| record.nodes_json.clone());
         }
     }
-    Ok(records)
+    Ok(())
+}
+
+fn token_burn_from_nodes_json(raw: &str) -> u64 {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|node| node.get("data").and_then(extract_total_tokens))
+        .fold(0, u64::saturating_add)
+}
+
+fn load_portfolio_run_summaries(
+    connection: &Connection,
+) -> Result<Vec<PortfolioRunSummary>, String> {
+    let runs = {
+        let mut statement = connection
+            .prepare("SELECT id,workflow_id,COALESCE(nodes_json,'') FROM runs")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+
+    // One scan replaces the previous per-run hydration of events, attempts, and
+    // executions. Attempt totals remain authoritative; legacy node snapshots
+    // provide a fallback for runs recorded before attempt diagnostics existed.
+    let mut attempt_totals: HashMap<String, u64> = HashMap::new();
+    {
+        let mut statement = connection
+            .prepare("SELECT run_id,diagnostics_json FROM node_attempts")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            let (run_id, diagnostics) = row.map_err(|error| error.to_string())?;
+            let tokens = serde_json::from_str::<Value>(&diagnostics)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("attemptTokens")
+                        .or_else(|| value.get("tokens"))
+                        .and_then(Value::as_u64)
+                });
+            if let Some(tokens) = tokens {
+                let total = attempt_totals.entry(run_id).or_insert(0);
+                *total = total.saturating_add(tokens);
+            }
+        }
+    }
+
+    let mut by_workflow: HashMap<String, PortfolioRunSummary> = HashMap::new();
+    for (run_id, workflow_id, nodes_json) in runs {
+        let token_burn = attempt_totals
+            .get(&run_id)
+            .copied()
+            .unwrap_or_else(|| token_burn_from_nodes_json(&nodes_json));
+        let summary = by_workflow
+            .entry(workflow_id.clone())
+            .or_insert(PortfolioRunSummary {
+                workflow_id,
+                run_count: 0,
+                token_burn: 0,
+            });
+        summary.run_count = summary.run_count.saturating_add(1);
+        summary.token_burn = summary.token_burn.saturating_add(token_burn);
+    }
+    let mut summaries = by_workflow.into_values().collect::<Vec<_>>();
+    summaries.sort_by(|left, right| {
+        right
+            .token_burn
+            .cmp(&left.token_burn)
+            .then_with(|| left.workflow_id.cmp(&right.workflow_id))
+    });
+    Ok(summaries)
+}
+
+/// Compact lifetime portfolio totals. The dashboard never needs run events,
+/// execution output, or artifact payloads, so do not hydrate full RunRecords.
+#[tauri::command]
+fn list_portfolio_run_summaries(
+    database: tauri::State<'_, Database>,
+) -> Result<Vec<PortfolioRunSummary>, String> {
+    let connection = database
+        .0
+        .lock()
+        .map_err(|_| "database lock poisoned".to_string())?;
+    load_portfolio_run_summaries(&connection)
 }
 
 #[tauri::command]
@@ -2868,6 +3171,7 @@ async fn execute_agent_internal(
     app: tauri::AppHandle,
     broker: ApprovalBroker,
     process_broker: ProcessBroker,
+    token_meter: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<AgentResult, String> {
     agent_trace(&format!("execute_agent ENTER node={}", request.node_id));
     // Outer hard deadline: even if the inner body deadlocks, the invoke returns.
@@ -2963,6 +3267,7 @@ async fn execute_agent_internal(
                                             message: method.into(),
                                             thread_id: None,
                                             turn_id: None,
+                                            tokens: None,
                                         },
                                     );
                                 }
@@ -3056,6 +3361,7 @@ async fn execute_agent_internal(
                         message: "Fresh Codex thread started".into(),
                         thread_id: Some(thread_id.clone()),
                         turn_id: None,
+                        tokens: None,
                     },
                 );
 
@@ -3106,6 +3412,7 @@ async fn execute_agent_internal(
                     .ok_or("turn/start response missing turn id")?
                     .to_string();
                 let mut message = String::new();
+                let mut total_tokens: u64 = 0;
                 // Hard wall-clock kill so a stalled turn always frees the invoke.
                 // Never wait() while holding the mutex — that deadlocks kill paths.
                 let watchdog_child = Arc::clone(&child);
@@ -3128,6 +3435,7 @@ async fn execute_agent_internal(
                                 message: "Turn wall-clock budget exceeded".into(),
                                 thread_id: Some(thread_id.clone()),
                                 turn_id: Some(turn_id.clone()),
+                                tokens: None,
                             },
                         );
                         return Err("Codex turn exceeded the wall-clock budget".into());
@@ -3152,6 +3460,7 @@ async fn execute_agent_internal(
                                     ),
                                     thread_id: Some(thread_id.clone()),
                                     turn_id: Some(turn_id.clone()),
+                                    tokens: None,
                                 },
                             );
                             return Err(format!(
@@ -3170,6 +3479,23 @@ async fn execute_agent_internal(
                         .get("method")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
+                    if let Some(tokens) = extract_total_tokens(&value) {
+                        if tokens > total_tokens {
+                            total_tokens = tokens;
+                            token_meter.fetch_max(tokens, std::sync::atomic::Ordering::SeqCst);
+                            let _ = app.emit(
+                                "codex-agent-event",
+                                NormalizedAgentEvent {
+                                    node_id: request.node_id.clone(),
+                                    event_type: "thread/tokenUsage/updated".into(),
+                                    message: format!("Token usage · {tokens} tok"),
+                                    thread_id: Some(thread_id.clone()),
+                                    turn_id: Some(turn_id.clone()),
+                                    tokens: Some(tokens),
+                                },
+                            );
+                        }
+                    }
                     if method == "item/agentMessage/delta" {
                         if let Some(delta) = value.pointer("/params/delta").and_then(Value::as_str)
                         {
@@ -3187,6 +3513,7 @@ async fn execute_agent_internal(
                                     .into(),
                                 thread_id: Some(thread_id.clone()),
                                 turn_id: Some(turn_id.clone()),
+                                tokens: None,
                             },
                         );
                     } else if method == "item/completed" {
@@ -3210,6 +3537,7 @@ async fn execute_agent_internal(
                                 message: method.into(),
                                 thread_id: Some(thread_id.clone()),
                                 turn_id: Some(turn_id.clone()),
+                                tokens: None,
                             },
                         );
                     } else if method.ends_with("requestApproval") {
@@ -3230,6 +3558,7 @@ async fn execute_agent_internal(
                                         message: "Auto-accepted (approvalPolicy=never)".into(),
                                         thread_id: Some(thread_id.clone()),
                                         turn_id: Some(turn_id.clone()),
+                                        tokens: None,
                                     },
                                 );
                                 "accept".to_string()
@@ -3276,6 +3605,7 @@ async fn execute_agent_internal(
                                         message: error.clone(),
                                         thread_id: Some(thread_id.clone()),
                                         turn_id: Some(turn_id.clone()),
+                                        tokens: None,
                                     },
                                 );
                                 kill_app_server_child(&child);
@@ -3291,6 +3621,7 @@ async fn execute_agent_internal(
                                 message: method.into(),
                                 thread_id: Some(thread_id.clone()),
                                 turn_id: Some(turn_id.clone()),
+                                tokens: None,
                             },
                         );
                     }
@@ -3310,6 +3641,19 @@ async fn execute_agent_internal(
                     }
                 }
                 let (status, summary, data, artifacts) = parse_agent_message(&message)?;
+                if total_tokens > 0 {
+                    let _ = app.emit(
+                        "codex-agent-event",
+                        NormalizedAgentEvent {
+                            node_id: request.node_id.clone(),
+                            event_type: "agent.token_usage".into(),
+                            message: format!("Token usage · {total_tokens} tok"),
+                            thread_id: Some(thread_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            tokens: Some(total_tokens),
+                        },
+                    );
+                }
                 Ok(AgentResult {
                     status,
                     summary,
@@ -3317,6 +3661,7 @@ async fn execute_agent_internal(
                     artifacts,
                     thread_id,
                     turn_id,
+                    tokens: total_tokens,
                 })
             })();
             agent_trace(&format!(
@@ -3408,6 +3753,53 @@ fn place_main_window(window: &tauri::WebviewWindow) {
     let _ = window.unmaximize();
 }
 
+#[cfg(desktop)]
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+#[cfg(desktop)]
+fn install_system_tray(app: &mut tauri::App) -> tauri::Result<()> {
+    let open = MenuItem::with_id(app, "tray-open", "Open Codex Corp", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "tray-quit", "Quit Codex Corp", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&open, &quit])?;
+
+    let mut tray = TrayIconBuilder::with_id("codex-corp-tray")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .tooltip("Codex Corp — running in the background")
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "tray-open" => show_main_window(app),
+            "tray-quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            let should_open = matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } | TrayIconEvent::DoubleClick {
+                    button: MouseButton::Left,
+                    ..
+                }
+            );
+            if should_open {
+                show_main_window(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon().cloned() {
+        tray = tray.icon(icon);
+    }
+    tray.build(app)?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let database = open_database().expect("failed to initialize Codex Corp database");
@@ -3420,11 +3812,21 @@ pub fn run() {
         .manage(workflow_runtime::RunApprovalBroker::default())
         .setup(|app| {
             workflow_runtime::initialize(app.handle());
+            #[cfg(desktop)]
+            install_system_tray(app)?;
             if let Some(window) = app.get_webview_window("main") {
                 place_main_window(&window);
                 let _ = window.set_focus();
             }
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             discover_codex,
@@ -3434,11 +3836,14 @@ pub fn run() {
             list_codex_models,
             list_codex_capabilities,
             save_workflow,
+            list_workflow_catalog,
+            save_workflow_catalog_item,
             delete_workflow,
             load_workflow,
             validate_workflow,
             plan_workflow,
             list_runs,
+            list_portfolio_run_summaries,
             execute_mediator_turn,
             get_default_chat_workspace,
             choose_chat_workspace,
@@ -3452,6 +3857,13 @@ pub fn run() {
             app_settings::pin_run,
             app_settings::export_detailed_logs,
             app_settings::clear_all_company_data,
+            business_data::list_finance_entries,
+            business_data::save_finance_entry,
+            business_data::delete_finance_entry,
+            business_data::list_dashboard_feedback,
+            business_data::save_dashboard_feedback,
+            chat_data::get_chat_store,
+            chat_data::save_chat_store,
             workflow_runtime::start_run,
             workflow_runtime::resume_run,
             workflow_runtime::stop_run,
@@ -3749,5 +4161,100 @@ mod tests {
         assert!(validate_graph(&graph)
             .iter()
             .any(|item| item.id == "standard-cycle"));
+    }
+
+    #[test]
+    fn token_usage_prefers_latest_turn_over_cumulative_thread_total() {
+        let notification = json!({
+            "params": {
+                "tokenUsage": {
+                    "total": { "totalTokens": 4_200 },
+                    "last": { "totalTokens": 99 }
+                }
+            }
+        });
+        assert_eq!(extract_total_tokens(&notification), Some(99));
+    }
+
+    #[test]
+    fn run_hydration_sums_tokens_across_attempts_and_revisions() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_database(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO node_attempts(id,run_id,node_id,attempt,revision,status,diagnostics_json)
+                 VALUES('a1','run','agent',0,0,'failed',?1),
+                       ('a2','run','agent',1,0,'completed',?2),
+                       ('a3','run','agent',0,1,'completed',?3)",
+                params![
+                    json!({"attemptTokens":40}).to_string(),
+                    json!({"attemptTokens":60}).to_string(),
+                    json!({"attemptTokens":25}).to_string()
+                ],
+            )
+            .unwrap();
+        let mut records = vec![RunRecord {
+            id: "run".into(),
+            workflow_id: "workflow".into(),
+            status: "completed".into(),
+            created_at: "2026-07-17T00:00:00Z".into(),
+            events_json: "[]".into(),
+            nodes_json: json!([{"id":"agent","data":{}}]).to_string(),
+            edges_json: "[]".into(),
+            terminal_reason: None,
+            resumable: false,
+            pinned: false,
+            last_event_sequence: 0,
+        }];
+        hydrate_run_records(&connection, &mut records).unwrap();
+        let nodes: Value = serde_json::from_str(&records[0].nodes_json).unwrap();
+        assert_eq!(nodes[0]["data"]["tokens"], 125);
+    }
+
+    #[test]
+    fn portfolio_summaries_aggregate_without_hydrating_run_payloads() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_database(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO runs(id,workflow_id,status,events_json,nodes_json)
+                 VALUES('run-1','workflow-a','completed','[{\"large\":\"event\"}]',?1),
+                       ('run-2','workflow-a','completed','[]',?2),
+                       ('run-3','workflow-b','completed','[]',?3)",
+                params![
+                    json!([{"data":{"tokens":999}}]).to_string(),
+                    json!([{"data":{"tokens":30}}]).to_string(),
+                    json!([{"data":{"tokens":20}}]).to_string()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO node_attempts(id,run_id,node_id,attempt,revision,status,diagnostics_json)
+                 VALUES('p1','run-1','agent',0,0,'failed',?1),
+                       ('p2','run-1','agent',1,0,'completed',?2)",
+                params![
+                    json!({"attemptTokens":40}).to_string(),
+                    json!({"attemptTokens":60}).to_string()
+                ],
+            )
+            .unwrap();
+
+        let summaries = load_portfolio_run_summaries(&connection).unwrap();
+        assert_eq!(
+            summaries,
+            vec![
+                PortfolioRunSummary {
+                    workflow_id: "workflow-a".into(),
+                    run_count: 2,
+                    token_burn: 130,
+                },
+                PortfolioRunSummary {
+                    workflow_id: "workflow-b".into(),
+                    run_count: 1,
+                    token_burn: 20,
+                },
+            ]
+        );
     }
 }

@@ -1,3 +1,5 @@
+use chrono::{Datelike, Timelike, Utc};
+use chrono_tz::Tz;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -162,6 +164,12 @@ struct RuntimeNodeData {
     output_schema: Option<String>,
     #[serde(default)]
     condition_rule: Option<ConditionRule>,
+    #[serde(default)]
+    cron_expression: Option<String>,
+    #[serde(default)]
+    cron_timezone: Option<String>,
+    #[serde(default = "default_true")]
+    cron_enabled: bool,
 }
 
 fn default_effort() -> String {
@@ -294,6 +302,9 @@ struct RuntimeOutput {
     thread_id: Option<String>,
     #[serde(default)]
     turn_id: Option<String>,
+    /// Live Codex total tokens for this node attempt (0 when unknown / non-LLM nodes).
+    #[serde(default)]
+    tokens: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -316,6 +327,7 @@ impl From<AgentResult> for RuntimeOutput {
             artifacts: result.artifacts,
             thread_id: Some(result.thread_id),
             turn_id: Some(result.turn_id),
+            tokens: result.tokens,
         }
     }
 }
@@ -326,6 +338,8 @@ struct RunContext {
     app: tauri::AppHandle,
     graph: RuntimeGraph,
     outputs: Arc<Mutex<HashMap<String, RuntimeOutput>>>,
+    /// Cumulative per-node usage for this run, including failed retries and revisions.
+    node_tokens: Arc<Mutex<HashMap<String, u64>>>,
     stop: Arc<AtomicBool>,
     sequence: Arc<AtomicU64>,
     limiter: Arc<ProcessLimiter>,
@@ -333,6 +347,48 @@ struct RunContext {
     process_broker: ProcessBroker,
     run_approvals: RunApprovalBroker,
     target_workspace: Option<PathBuf>,
+}
+
+fn record_node_tokens(context: &RunContext, node_id: &str, attempt_tokens: u64) -> u64 {
+    context
+        .node_tokens
+        .lock()
+        .map(|mut totals| {
+            let total = totals.entry(node_id.to_string()).or_default();
+            *total = total.saturating_add(attempt_tokens);
+            *total
+        })
+        .unwrap_or(attempt_tokens)
+}
+
+fn load_node_token_totals(
+    connection: &rusqlite::Connection,
+    run_id: &str,
+) -> Result<HashMap<String, u64>, String> {
+    let mut statement = connection
+        .prepare("SELECT node_id,diagnostics_json FROM node_attempts WHERE run_id=?1")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![run_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut totals = HashMap::new();
+    for row in rows {
+        let (node_id, diagnostics) = row.map_err(|error| error.to_string())?;
+        let tokens = serde_json::from_str::<Value>(&diagnostics)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("attemptTokens")
+                    .or_else(|| value.get("tokens"))
+                    .and_then(Value::as_u64)
+            })
+            .unwrap_or(0);
+        let total = totals.entry(node_id).or_insert(0_u64);
+        *total = total.saturating_add(tokens);
+    }
+    Ok(totals)
 }
 
 fn new_run_id() -> String {
@@ -749,11 +805,13 @@ async fn specialist_once(
         tool_boundary: "Tool selections are enforced through the host sandbox and approval policy where supported. CLI-internal tool granularity remains governed by Codex.".into(),
     };
     let started = SystemTime::now();
+    let token_meter = Arc::new(AtomicU64::new(0));
     let result = execute_agent_internal(
         request,
         context.app.clone(),
         context.approval_broker.clone(),
         context.process_broker.clone(),
+        token_meter.clone(),
     )
     .await;
     drop(permit);
@@ -763,7 +821,9 @@ async fn specialist_once(
         .unwrap_or(0);
     match result {
         Ok(result) => {
-            let output: RuntimeOutput = result.into();
+            let mut output: RuntimeOutput = result.into();
+            let attempt_tokens = output.tokens.max(token_meter.load(Ordering::SeqCst));
+            output.tokens = record_node_tokens(context, &node.id, attempt_tokens);
             if output.status == "failure" {
                 let error = if output.summary.trim().is_empty() {
                     "specialist returned failure without a summary".to_string()
@@ -777,12 +837,12 @@ async fn specialist_once(
                     Some(&node.id),
                     Some(&attempt_id),
                     format!("{} reported failure: {error}", node.data.label),
-                    json!({"elapsedMs":elapsed_ms,"status":"failure","threadId":output.thread_id,"turnId":output.turn_id,"attempt":attempt,"revision":revision}),
+                    json!({"elapsedMs":elapsed_ms,"status":"failure","threadId":output.thread_id,"turnId":output.turn_id,"attempt":attempt,"revision":revision,"attemptTokens":attempt_tokens,"tokens":output.tokens}),
                 );
                 if let Ok(connection) = context.app.state::<Database>().0.lock() {
                     let _ = connection.execute(
                         "INSERT OR REPLACE INTO node_attempts(id,run_id,node_id,attempt,revision,status,thread_id,turn_id,diagnostics_json,completed_at) VALUES(?1,?2,?3,?4,?5,'failed',?6,?7,?8,CURRENT_TIMESTAMP)",
-                        params![format!("{}:{}:{}",context.run_id,node.id,attempt_id),context.run_id,node.id,attempt,revision,output.thread_id,output.turn_id,json!({"elapsedMs":elapsed_ms,"reportedFailure":true,"summary":error}).to_string()],
+                        params![format!("{}:{}:{}",context.run_id,node.id,attempt_id),context.run_id,node.id,attempt,revision,output.thread_id,output.turn_id,json!({"elapsedMs":elapsed_ms,"reportedFailure":true,"summary":error,"attemptTokens":attempt_tokens}).to_string()],
                     );
                 }
                 return Err(error);
@@ -794,17 +854,19 @@ async fn specialist_once(
                 Some(&node.id),
                 Some(&attempt_id),
                 format!("{} attempt completed", node.data.label),
-                json!({"elapsedMs":elapsed_ms,"status":output.status,"threadId":output.thread_id,"turnId":output.turn_id}),
+                json!({"elapsedMs":elapsed_ms,"status":output.status,"threadId":output.thread_id,"turnId":output.turn_id,"attemptTokens":attempt_tokens,"tokens":output.tokens}),
             );
             if let Ok(connection) = context.app.state::<Database>().0.lock() {
                 let _ = connection.execute(
                     "INSERT OR REPLACE INTO node_attempts(id,run_id,node_id,attempt,revision,status,thread_id,turn_id,diagnostics_json,completed_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,CURRENT_TIMESTAMP)",
-                    params![format!("{}:{}:{}",context.run_id,node.id,attempt_id),context.run_id,node.id,attempt,revision,output.status,output.thread_id,output.turn_id,json!({"elapsedMs":elapsed_ms}).to_string()],
+                    params![format!("{}:{}:{}",context.run_id,node.id,attempt_id),context.run_id,node.id,attempt,revision,output.status,output.thread_id,output.turn_id,json!({"elapsedMs":elapsed_ms,"attemptTokens":attempt_tokens}).to_string()],
                 );
             }
             Ok(output)
         }
         Err(error) => {
+            let attempt_tokens = token_meter.load(Ordering::SeqCst);
+            let cumulative_tokens = record_node_tokens(context, &node.id, attempt_tokens);
             emit_event(
                 context,
                 "node.attempt.failed",
@@ -812,8 +874,14 @@ async fn specialist_once(
                 Some(&node.id),
                 Some(&attempt_id),
                 format!("{} attempt failed: {error}", node.data.label),
-                json!({"elapsedMs":elapsed_ms,"error":error,"attempt":attempt,"revision":revision}),
+                json!({"elapsedMs":elapsed_ms,"error":error,"attempt":attempt,"revision":revision,"attemptTokens":attempt_tokens,"tokens":cumulative_tokens}),
             );
+            if let Ok(connection) = context.app.state::<Database>().0.lock() {
+                let _ = connection.execute(
+                    "INSERT OR REPLACE INTO node_attempts(id,run_id,node_id,attempt,revision,status,diagnostics_json,completed_at) VALUES(?1,?2,?3,?4,?5,'failed',?6,CURRENT_TIMESTAMP)",
+                    params![format!("{}:{}:{}",context.run_id,node.id,attempt_id),context.run_id,node.id,attempt,revision,json!({"elapsedMs":elapsed_ms,"error":error,"attemptTokens":attempt_tokens}).to_string()],
+                );
+            }
             Err(error)
         }
     }
@@ -1014,6 +1082,7 @@ async fn approval_node(context: &RunContext, node: &RuntimeNode) -> Result<Runti
         artifacts: Vec::new(),
         thread_id: None,
         turn_id: None,
+        tokens: 0,
     })
 }
 
@@ -1056,6 +1125,7 @@ async fn execute_node(context: &RunContext, node: &RuntimeNode) -> Result<Runtim
             artifacts: Vec::new(),
             thread_id: None,
             turn_id: None,
+            tokens: 0,
         }),
         "condition" => {
             let rule = node
@@ -1088,6 +1158,7 @@ async fn execute_node(context: &RunContext, node: &RuntimeNode) -> Result<Runtim
                 artifacts: Vec::new(),
                 thread_id: None,
                 turn_id: None,
+                tokens: 0,
             })
         }
         "output" => {
@@ -1129,6 +1200,7 @@ async fn execute_node(context: &RunContext, node: &RuntimeNode) -> Result<Runtim
                 ],
                 thread_id: None,
                 turn_id: None,
+                tokens: 0,
             })
         }
         _ => Err(format!("unsupported runtime node kind: {}", node.data.kind)),
@@ -1342,6 +1414,7 @@ async fn run_worker(
                     artifacts: Vec::new(),
                     thread_id: None,
                     turn_id: None,
+                    tokens: 0,
                 },
             )
         });
@@ -1652,6 +1725,7 @@ pub(crate) async fn start_run(
         app: app.clone(),
         graph,
         outputs: Arc::new(Mutex::new(HashMap::new())),
+        node_tokens: Arc::new(Mutex::new(HashMap::new())),
         stop: stop.clone(),
         sequence: Arc::new(AtomicU64::new(0)),
         limiter: runtime.limiter.clone(),
@@ -1778,7 +1852,7 @@ pub(crate) async fn resume_run(
     if !record.resumable || record.status != "interrupted" {
         return Err("only interrupted resumable runs can be resumed".into());
     }
-    let (graph, checkpoint, target_workspace) = {
+    let (graph, checkpoint, target_workspace, node_tokens) = {
         let connection = database
             .0
             .lock()
@@ -1800,7 +1874,13 @@ pub(crate) async fn resume_run(
             )
             .unwrap_or(None);
         let graph = parse_graph(&json!({"nodes":serde_json::from_str::<Value>(&record.nodes_json).map_err(|e|e.to_string())?,"edges":serde_json::from_str::<Value>(&record.edges_json).map_err(|e|e.to_string())?}).to_string())?;
-        (graph, checkpoint, workspace_path.map(PathBuf::from))
+        let node_tokens = load_node_token_totals(&connection, &run_id)?;
+        (
+            graph,
+            checkpoint,
+            workspace_path.map(PathBuf::from),
+            node_tokens,
+        )
     };
     let stop = Arc::new(AtomicBool::new(false));
     let context = RunContext {
@@ -1808,6 +1888,7 @@ pub(crate) async fn resume_run(
         app: app.clone(),
         graph,
         outputs: Arc::new(Mutex::new(HashMap::new())),
+        node_tokens: Arc::new(Mutex::new(node_tokens)),
         stop: stop.clone(),
         sequence: Arc::new(AtomicU64::new(record.last_event_sequence)),
         limiter: runtime.limiter.clone(),
@@ -1836,6 +1917,203 @@ pub(crate) async fn resume_run(
     Ok(record)
 }
 
+#[derive(Debug, Clone)]
+struct DueSchedule {
+    workflow_id: String,
+    node_id: String,
+    minute_key: String,
+    workspace_path: Option<String>,
+}
+
+fn cron_field_matches(value: u32, field: &str, min: u32, max: u32) -> bool {
+    field.split(',').any(|part| {
+        let mut stepped = part.split('/');
+        let base = stepped.next().unwrap_or_default();
+        let step = stepped
+            .next()
+            .and_then(|raw| raw.parse::<u32>().ok())
+            .unwrap_or(1);
+        if step == 0 || stepped.next().is_some() {
+            return false;
+        }
+        let (start, end) = if base == "*" {
+            (min, max)
+        } else {
+            let mut range = base.split('-');
+            let Some(start) = range.next().and_then(|raw| raw.parse::<u32>().ok()) else {
+                return false;
+            };
+            let end = match range.next() {
+                Some(raw) => match raw.parse::<u32>() {
+                    Ok(value) => value,
+                    Err(_) => return false,
+                },
+                None => start,
+            };
+            if range.next().is_some() {
+                return false;
+            }
+            (start, end)
+        };
+        start >= min
+            && end <= max
+            && start <= end
+            && value >= start
+            && value <= end
+            && (value - start) % step == 0
+    })
+}
+
+fn cron_matches_at(expression: &str, timezone: &str, now: chrono::DateTime<Utc>) -> Option<String> {
+    let timezone: Tz = timezone.parse().ok()?;
+    let local = now.with_timezone(&timezone);
+    let fields: Vec<_> = expression.split_whitespace().collect();
+    if fields.len() != 5 {
+        return None;
+    }
+    let values = [
+        local.minute(),
+        local.hour(),
+        local.day(),
+        local.month(),
+        local.weekday().num_days_from_sunday(),
+    ];
+    let limits = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 6)];
+    fields
+        .iter()
+        .enumerate()
+        .all(|(index, field)| {
+            let (min, max) = limits[index];
+            cron_field_matches(values[index], field, min, max)
+        })
+        .then(|| local.format("%Y-%m-%dT%H:%M%:z").to_string())
+}
+
+fn due_schedules(app: &tauri::AppHandle) -> Result<Vec<DueSchedule>, String> {
+    let workflows = {
+        let database = app.state::<Database>();
+        let connection = database
+            .0
+            .lock()
+            .map_err(|_| "database lock poisoned".to_string())?;
+        let mut statement = connection
+            .prepare("SELECT id,graph_json,workspace_path FROM workflows ORDER BY id")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+    let now = Utc::now();
+    let mut due = Vec::new();
+    for (workflow_id, graph_json, workspace_path) in workflows {
+        let Ok(graph) = serde_json::from_str::<RuntimeGraph>(&graph_json) else {
+            continue;
+        };
+        for node in graph
+            .nodes
+            .iter()
+            .filter(|node| node.data.kind == "cron" && node.data.cron_enabled)
+        {
+            let expression = node.data.cron_expression.as_deref().unwrap_or_default();
+            let timezone = node.data.cron_timezone.as_deref().unwrap_or("UTC");
+            if let Some(minute_key) = cron_matches_at(expression, timezone, now) {
+                due.push(DueSchedule {
+                    workflow_id: workflow_id.clone(),
+                    node_id: node.id.clone(),
+                    minute_key,
+                    workspace_path: workspace_path.clone(),
+                });
+            }
+        }
+    }
+    Ok(due)
+}
+
+fn reserve_schedule_firing(app: &tauri::AppHandle, schedule: &DueSchedule) -> Result<bool, String> {
+    let database = app.state::<Database>();
+    let connection = database
+        .0
+        .lock()
+        .map_err(|_| "database lock poisoned".to_string())?;
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO schedule_firings(workflow_id,node_id,minute_key) VALUES(?1,?2,?3)",
+            params![schedule.workflow_id, schedule.node_id, schedule.minute_key],
+        )
+        .map(|changed| changed == 1)
+        .map_err(|error| error.to_string())
+}
+
+fn release_schedule_firing(app: &tauri::AppHandle, schedule: &DueSchedule) {
+    if let Ok(connection) = app.state::<Database>().0.lock() {
+        let _ = connection.execute(
+            "DELETE FROM schedule_firings WHERE workflow_id=?1 AND node_id=?2 AND minute_key=?3",
+            params![schedule.workflow_id, schedule.node_id, schedule.minute_key],
+        );
+    }
+}
+
+fn workflow_is_active(app: &tauri::AppHandle, workflow_id: &str) -> bool {
+    app.state::<WorkflowRuntime>()
+        .active
+        .lock()
+        .map(|active| active.values().any(|run| run.workflow_id == workflow_id))
+        .unwrap_or(true)
+}
+
+fn scheduler_tick(app: &tauri::AppHandle) {
+    let Ok(schedules) = due_schedules(app) else {
+        return;
+    };
+    for schedule in schedules {
+        if workflow_is_active(app, &schedule.workflow_id) {
+            continue;
+        }
+        if !reserve_schedule_firing(app, &schedule).unwrap_or(false) {
+            continue;
+        }
+        let result = tauri::async_runtime::block_on(start_run(
+            schedule.workflow_id.clone(),
+            Some(schedule.node_id.clone()),
+            schedule.workspace_path.clone(),
+            app.clone(),
+            app.state::<WorkflowRuntime>(),
+            app.state::<RunApprovalBroker>(),
+            app.state::<ApprovalBroker>(),
+            app.state::<ProcessBroker>(),
+            app.state::<Database>(),
+        ));
+        if let Err(error) = result {
+            release_schedule_firing(app, &schedule);
+            let _ = app.emit(
+                "workflow-schedule-error",
+                json!({
+                    "workflowId": schedule.workflow_id,
+                    "nodeId": schedule.node_id,
+                    "message": error,
+                }),
+            );
+        }
+    }
+}
+
+fn start_scheduler(app: tauri::AppHandle) {
+    let _ = std::thread::Builder::new()
+        .name("codex-corp-scheduler".into())
+        .spawn(move || loop {
+            scheduler_tick(&app);
+            std::thread::sleep(Duration::from_secs(15));
+        });
+}
+
 pub(crate) fn initialize(app: &tauri::AppHandle) {
     if let Ok(mut connection) = app.state::<Database>().0.lock() {
         let _ = connection.execute(
@@ -1849,12 +2127,37 @@ pub(crate) fn initialize(app: &tauri::AppHandle) {
         if let Ok(settings) = app_settings::load(&connection) {
             let _ = app_settings::cleanup(&mut connection, &settings);
         }
+        let _ = connection.execute(
+            "DELETE FROM schedule_firings WHERE fired_at < datetime('now','-90 days')",
+            [],
+        );
     }
+    start_scheduler(app.clone());
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn native_cron_matching_honors_timezone_and_minute_key() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 17, 4, 30, 0).unwrap();
+        assert_eq!(
+            cron_matches_at("0 10 * * 5", "Asia/Kolkata", now),
+            Some("2026-07-17T10:00+05:30".into())
+        );
+        assert!(cron_matches_at("1 10 * * 5", "Asia/Kolkata", now).is_none());
+        assert!(cron_matches_at("0 10 * * 5", "Not/A_Timezone", now).is_none());
+    }
+
+    #[test]
+    fn native_cron_matching_supports_lists_ranges_and_steps() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 17, 10, 30, 0).unwrap();
+        assert!(cron_matches_at("*/15 9-17 * * 1-5", "UTC", now).is_some());
+        assert!(cron_matches_at("0,30 9-17 * * 1-5", "UTC", now).is_some());
+        assert!(cron_matches_at("*/20 9-17 * * 1-5", "UTC", now).is_none());
+    }
 
     #[test]
     fn checkpoints_round_trip_completed_work_and_outputs() {
@@ -1870,6 +2173,7 @@ mod tests {
                     artifacts: Vec::new(),
                     thread_id: Some("thread-1".into()),
                     turn_id: Some("turn-1".into()),
+                    tokens: 99,
                 },
             )]),
         };
@@ -1878,6 +2182,7 @@ mod tests {
         assert!(restored.completed.contains("research"));
         assert!(restored.skipped.contains("discarded-branch"));
         assert_eq!(restored.outputs["research"].summary, "evidence");
+        assert_eq!(restored.outputs["research"].tokens, 99);
     }
 
     #[test]
@@ -1906,6 +2211,9 @@ mod tests {
                 workspace_policy: default_workspace(),
                 output_schema: None,
                 condition_rule: None,
+                cron_expression: None,
+                cron_timezone: None,
+                cron_enabled: true,
             },
         };
         let edge = |id: &str, source: &str, target: &str| RuntimeEdge {
@@ -1962,6 +2270,9 @@ mod tests {
                 workspace_policy: default_workspace(),
                 output_schema: None,
                 condition_rule: None,
+                cron_expression: None,
+                cron_timezone: None,
+                cron_enabled: true,
             },
         };
         assert_eq!(
@@ -2066,6 +2377,7 @@ mod tests {
                 .collect(),
             thread_id: Some("thread".into()),
             turn_id: Some("turn".into()),
+            tokens: 0,
         }
     }
 

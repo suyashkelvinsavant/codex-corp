@@ -9,6 +9,19 @@ import {
 import { AgentOutputSchema } from "./model";
 import type { EdgeKind, FlowEdge, FlowNode, Kind } from "./model";
 
+const detailedPrompt = `You are a test specialist for graph validation.
+
+Mission
+- Execute the assigned unit of work for integration tests with clear structured output.
+
+Process
+1. Read the mission and upstream context.
+2. Perform the smallest complete step.
+3. Return status, summary, and data.
+
+Output contract
+- Always return structured agent output suitable for downstream nodes.`;
+
 const node = (id: string, kind: Kind = "agent"): FlowNode => ({
   id,
   type: "corpNode",
@@ -20,8 +33,9 @@ const node = (id: string, kind: Kind = "agent"): FlowNode => ({
     status: "idle",
     model: "test",
     effort: "low",
-    tools: [],
-    prompt: kind === "agent" ? "Do the work." : "control",
+    tools: kind === "agent" || kind === "creative" ? ["Shell"] : [],
+    prompt:
+      kind === "agent" || kind === "creative" ? detailedPrompt : "control",
     description: "",
     duration: "—",
     tokens: 0,
@@ -110,7 +124,7 @@ describe("workflow graph core", () => {
     agent.data.model = "";
     const creative = node("c", "creative");
     creative.data.model = "   ";
-    creative.data.prompt = "Make art.";
+    creative.data.prompt = detailedPrompt;
     const nodes = [
       node("input", "input"),
       agent,
@@ -132,6 +146,27 @@ describe("workflow graph core", () => {
         [edge("input", "a"), edge("a", "out")],
       ).some((problem) => problem.id.startsWith("model-")),
     ).toBe(false);
+  });
+
+  it("warns for weak legacy prompts but still errors for empty prompts", () => {
+    const agent = node("a");
+    agent.data.prompt = "Define this node contract.";
+    const weak = validateWorkflow(
+      [node("input", "input"), agent, node("out", "output")],
+      [edge("input", "a"), edge("a", "out")],
+    );
+    expect(weak).toContainEqual(
+      expect.objectContaining({ id: "prompt-quality-a", severity: "warning" }),
+    );
+    agent.data.prompt = "";
+    expect(
+      validateWorkflow(
+        [node("input", "input"), agent, node("out", "output")],
+        [edge("input", "a"), edge("a", "out")],
+      ),
+    ).toContainEqual(
+      expect.objectContaining({ id: "prompt-a", severity: "error" }),
+    );
   });
 
   it("schedules independent branches in the same ready batch and joins a merge", () => {

@@ -1,8 +1,31 @@
 import type { FlowNode, Kind } from "./model";
 import type { WorkflowTemplate } from "./templates";
 import { defaultPlatformCriteria } from "./completion-criteria";
+import { ensureSpecialistQuality } from "./specialist-defaults";
+
+const ROLE_BY_ID: Record<string, string> = {
+  research: "Researcher",
+  architect: "Architect",
+  designer: "Designer",
+  creative: "Creative",
+  builder: "Frontend Engineer",
+  reviewer: "Code Reviewer",
+};
 
 function node(id: string, kind: Kind, label: string, index: number): FlowNode {
+  const role =
+    kind === "agent" || kind === "creative"
+      ? ROLE_BY_ID[id] || "Frontend Engineer"
+      : "Control";
+  const quality = ensureSpecialistQuality({
+    kind,
+    role,
+    label,
+    prompt: kind === "agent" ? "You are the SOLE IMPLEMENTER." : "",
+    tools: kind === "agent" ? ["Shell"] : [],
+    skills: [],
+    description: `${label} test fixture`,
+  });
   return {
     id,
     type: "corpNode",
@@ -12,15 +35,18 @@ function node(id: string, kind: Kind, label: string, index: number): FlowNode {
     },
     data: {
       label,
-      role: kind === "agent" ? "Frontend Engineer" : "Control",
+      role,
       kind,
       status: kind === "input" ? "completed" : "idle",
-      model: kind === "agent" ? "" : "Control",
+      model: kind === "agent" || kind === "creative" ? "" : "Control",
       effort: "low",
-      tools: kind === "agent" ? ["Shell"] : [],
-      skills: [],
-      prompt: kind === "agent" ? "You are the SOLE IMPLEMENTER." : "",
-      description: `${label} test fixture`,
+      tools: kind === "agent" || kind === "creative" ? quality.tools : [],
+      skills: kind === "agent" || kind === "creative" ? quality.skills : [],
+      prompt: kind === "agent" || kind === "creative" ? quality.prompt : "",
+      description:
+        kind === "agent" || kind === "creative"
+          ? quality.description
+          : `${label} test fixture`,
       duration: "—",
       tokens: 0,
       trace: ["Test fixture"],

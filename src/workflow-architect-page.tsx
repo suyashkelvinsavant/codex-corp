@@ -22,6 +22,7 @@ import type {
 import { listWorkflows, templateStats } from "./templates";
 import {
   createSession,
+  hydrateChatStore,
   loadChatStore,
   makeMessage,
   saveChatStore,
@@ -128,6 +129,29 @@ export function WorkflowArchitectPage({
     setStore(next);
     saveChatStore(ARCHITECT_CHAT_SCOPE, next);
   };
+
+  useEffect(() => {
+    let cancelled = false;
+    void hydrateChatStore(ARCHITECT_CHAT_SCOPE).then((hydrated) => {
+      if (cancelled) return;
+      let next = hydrated;
+      if (!next.sessions.length) {
+        const session = createSession(ARCHITECT_CHAT_SCOPE);
+        next = { sessions: [session], activeSessionId: session.id };
+        saveChatStore(ARCHITECT_CHAT_SCOPE, next);
+      } else if (
+        !next.activeSessionId ||
+        !next.sessions.some((session) => session.id === next.activeSessionId)
+      ) {
+        next = { ...next, activeSessionId: next.sessions[0].id };
+        saveChatStore(ARCHITECT_CHAT_SCOPE, next);
+      }
+      setStore(next);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (!workflows.some((workflow) => workflow.id === selected))

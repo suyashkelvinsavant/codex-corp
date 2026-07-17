@@ -45,7 +45,14 @@ await writeFile(configPath, JSON.stringify(config, null, 2));
 
 const native = spawnSync(
   cargoCommand,
-  ["build", "--release", "--manifest-path", join(tauriRoot, "Cargo.toml")],
+  [
+    "build",
+    "--release",
+    "--features",
+    "custom-protocol",
+    "--manifest-path",
+    join(tauriRoot, "Cargo.toml"),
+  ],
   {
     cwd: tauriRoot,
     stdio: "inherit",

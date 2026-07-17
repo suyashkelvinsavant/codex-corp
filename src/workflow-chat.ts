@@ -7,10 +7,9 @@
  */
 
 import type { RunEvent } from "./model";
-import {
-  isLifecycleRunEvent,
-  progressLineFromRunEvent,
-} from "./mediator-ui";
+import { invoke, isTauri } from "@tauri-apps/api/core";
+import { isLifecycleRunEvent, progressLineFromRunEvent } from "./mediator-ui";
+import { notifyPersistenceError } from "./persistence-events";
 
 export type ChatRole = "user" | "mediator" | "system";
 export type AppProjectMode = "new" | "existing";
@@ -70,7 +69,7 @@ export type ChatMessage = {
   attachments?: ChatAttachment[];
 };
 
-/** Soft cap so localStorage sessions stay usable. */
+/** Soft cap so chat payloads and rendering remain bounded. */
 export const MAX_CHAT_ATTACHMENT_BYTES = 1_500_000;
 export const MAX_CHAT_ATTACHMENTS_PER_MESSAGE = 6;
 
@@ -99,6 +98,12 @@ export const chatStoreKey = (workflowId: string) =>
 /** Legacy single-thread key (migrated once). */
 const legacyChatKey = (workflowId: string) => `codex-corp-chat:${workflowId}`;
 
+const desktopChatStores = new Map<string, WorkflowChatStore>();
+const hydratedDesktopStores = new Set<string>();
+const desktopHydrations = new Map<string, Promise<WorkflowChatStore>>();
+const pendingDesktopStores = new Map<string, WorkflowChatStore>();
+const desktopSaveChains = new Map<string, Promise<void>>();
+
 export function makeMessage(
   role: ChatRole,
   text: string,
@@ -112,13 +117,21 @@ export function makeMessage(
     at: new Date().toISOString(),
     kind,
     attachments:
-      attachments && attachments.length ? attachments.slice(0, MAX_CHAT_ATTACHMENTS_PER_MESSAGE) : undefined,
+      attachments && attachments.length
+        ? attachments.slice(0, MAX_CHAT_ATTACHMENTS_PER_MESSAGE)
+        : undefined,
   };
 }
 
-export function classifyAttachment(mime: string, name: string): ChatAttachmentKind {
+export function classifyAttachment(
+  mime: string,
+  name: string,
+): ChatAttachmentKind {
   const lower = `${mime} ${name}`.toLowerCase();
-  if (mime.startsWith("image/") || /\.(png|jpe?g|gif|webp|svg|bmp)$/i.test(name)) {
+  if (
+    mime.startsWith("image/") ||
+    /\.(png|jpe?g|gif|webp|svg|bmp)$/i.test(name)
+  ) {
     return "image";
   }
   if (
@@ -204,7 +217,10 @@ export async function ingestFiles(
       );
       continue;
     }
-    const kind = classifyAttachment(file.type || "application/octet-stream", file.name);
+    const kind = classifyAttachment(
+      file.type || "application/octet-stream",
+      file.name,
+    );
     const base: ChatAttachment = {
       id: crypto.randomUUID(),
       name: file.name,
@@ -256,7 +272,7 @@ export function emptyStore(): WorkflowChatStore {
   return { sessions: [], activeSessionId: null };
 }
 
-export function loadChatStore(workflowId: string): WorkflowChatStore {
+function loadBrowserChatStore(workflowId: string): WorkflowChatStore {
   try {
     const raw = localStorage.getItem(chatStoreKey(workflowId));
     if (raw) {
@@ -275,7 +291,8 @@ export function loadChatStore(workflowId: string): WorkflowChatStore {
       if (Array.isArray(messages) && messages.length) {
         const session = createSession(workflowId, "Earlier conversation");
         session.messages = messages;
-        session.updatedAt = messages[messages.length - 1]?.at ?? session.updatedAt;
+        session.updatedAt =
+          messages[messages.length - 1]?.at ?? session.updatedAt;
         const store: WorkflowChatStore = {
           sessions: [session],
           activeSessionId: session.id,
@@ -291,21 +308,156 @@ export function loadChatStore(workflowId: string): WorkflowChatStore {
   return emptyStore();
 }
 
+/** Hydrate the desktop cache from SQLite, migrating browser-era storage once. */
+export async function hydrateChatStore(
+  workflowId: string,
+): Promise<WorkflowChatStore> {
+  if (!isTauri()) return loadBrowserChatStore(workflowId);
+  if (hydratedDesktopStores.has(workflowId)) {
+    return desktopChatStores.get(workflowId) ?? emptyStore();
+  }
+  const existing = desktopHydrations.get(workflowId);
+  if (existing) return existing;
+
+  const hydration = (async () => {
+    const serialized = await invoke<string | null>("get_chat_store", {
+      workflowId,
+    });
+    let store: WorkflowChatStore | null = null;
+    if (serialized) {
+      try {
+        const parsed = JSON.parse(serialized) as WorkflowChatStore;
+        if (parsed && Array.isArray(parsed.sessions)) {
+          store = {
+            sessions: parsed.sessions,
+            activeSessionId: parsed.activeSessionId ?? null,
+          };
+        }
+      } catch {
+        /* invalid native data falls through to the browser-era migration */
+      }
+    }
+    if (!store) store = loadBrowserChatStore(workflowId);
+
+    const pending = pendingDesktopStores.get(workflowId);
+    if (pending) {
+      store = mergeChatStores(store, pending);
+      pendingDesktopStores.delete(workflowId);
+    }
+    store = trimChatStore(store);
+    desktopChatStores.set(workflowId, store);
+    hydratedDesktopStores.add(workflowId);
+    if (store.sessions.length || pending)
+      enqueueDesktopChatSave(workflowId, store);
+    return store;
+  })().finally(() => desktopHydrations.delete(workflowId));
+  desktopHydrations.set(workflowId, hydration);
+  return hydration;
+}
+
+export function loadChatStore(workflowId: string): WorkflowChatStore {
+  if (isTauri() && hydratedDesktopStores.has(workflowId)) {
+    return desktopChatStores.get(workflowId) ?? emptyStore();
+  }
+  return loadBrowserChatStore(workflowId);
+}
+
+function trimChatStore(store: WorkflowChatStore): WorkflowChatStore {
+  return {
+    ...store,
+    sessions: store.sessions.map((session) => ({
+      ...session,
+      messages: session.messages.slice(-120),
+    })),
+  };
+}
+
+export function mergeChatStores(
+  nativeStore: WorkflowChatStore,
+  pendingStore: WorkflowChatStore,
+): WorkflowChatStore {
+  const sessions = new Map(
+    nativeStore.sessions.map((session) => [session.id, session]),
+  );
+  for (const pending of pendingStore.sessions) {
+    const native = sessions.get(pending.id);
+    if (!native) {
+      sessions.set(pending.id, pending);
+      continue;
+    }
+    const messages = new Map(
+      native.messages.map((message) => [message.id, message]),
+    );
+    for (const message of pending.messages) messages.set(message.id, message);
+    sessions.set(pending.id, {
+      ...native,
+      ...pending,
+      messages: [...messages.values()],
+    });
+  }
+  return {
+    sessions: [...sessions.values()],
+    activeSessionId:
+      pendingStore.activeSessionId ?? nativeStore.activeSessionId,
+  };
+}
+
+function enqueueDesktopChatSave(
+  workflowId: string,
+  store: WorkflowChatStore,
+): void {
+  const previous = desktopSaveChains.get(workflowId) ?? Promise.resolve();
+  const next = previous
+    .catch(() => undefined)
+    .then(() =>
+      invoke("save_chat_store", {
+        workflowId,
+        storeJson: JSON.stringify(store),
+      }),
+    )
+    .then(() => undefined)
+    .catch((error) => notifyPersistenceError("chat history", error))
+    .finally(() => {
+      if (desktopSaveChains.get(workflowId) === next) {
+        desktopSaveChains.delete(workflowId);
+      }
+    });
+  desktopSaveChains.set(workflowId, next);
+}
+
+export function resetDesktopChatCaches(): void {
+  desktopChatStores.clear();
+  hydratedDesktopStores.clear();
+  desktopHydrations.clear();
+  pendingDesktopStores.clear();
+  desktopSaveChains.clear();
+}
+
+export async function flushDesktopChatSaves(): Promise<void> {
+  while (desktopSaveChains.size) {
+    await Promise.all([...desktopSaveChains.values()]);
+  }
+}
+
 export function saveChatStore(
   workflowId: string,
   store: WorkflowChatStore,
 ): void {
+  const trimmed = trimChatStore(store);
+  if (isTauri()) {
+    if (hydratedDesktopStores.has(workflowId)) {
+      desktopChatStores.set(workflowId, trimmed);
+      enqueueDesktopChatSave(workflowId, trimmed);
+    } else {
+      pendingDesktopStores.set(workflowId, trimmed);
+      void hydrateChatStore(workflowId).catch((error) =>
+        notifyPersistenceError("chat history", error),
+      );
+    }
+    return;
+  }
   try {
-    localStorage.setItem(
-      chatStoreKey(workflowId),
-      JSON.stringify({
-        ...store,
-        sessions: store.sessions.map((s) => ({
-          ...s,
-          messages: s.messages.slice(-120),
-        })),
-      }),
-    );
+    localStorage.setItem(chatStoreKey(workflowId), JSON.stringify(trimmed));
   } catch {
     /* quota */
   }

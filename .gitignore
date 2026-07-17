@@ -10,10 +10,22 @@ release/
 # Local agent/runtime state
 .codex/
 .grok-acp/
+.agents/
+AGENTS.md
+USER_FLOW.md
+
+# graphify knowledge-graph outputs (generated locally; do not commit)
+graphify-out/
+**/graphify-out/
+.graphify_python
+.graphify_root
+.graphify_labels.json
+.graphify_labels.json.sig
 
 # Local tool logs and review scratchpads
 firebase-debug.log
 code-review.md
+report.md
 
 # Pet-generation working files (the runtime uses the final spritesheet at
 # assets/pets/byte-spritesheet.webp)

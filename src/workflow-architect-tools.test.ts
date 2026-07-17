@@ -64,11 +64,11 @@ describe("workflow architect tools", () => {
     expect(saved?.description).toBe("Updated by the architect");
     expect(saved?.version).toBe("v0.7");
     expect(
-      saved?.nodes.find((node) => node.id === "builder")?.data.prompt,
-    ).toMatch(/SOLE IMPLEMENTER/);
+      saved?.nodes.find((node) => node.id === "builder")?.data.prompt.length,
+    ).toBeGreaterThan(100);
     expect(
-      saved?.nodes.find((node) => node.id === "builder")?.data.tools,
-    ).toContain("Shell");
+      saved?.nodes.find((node) => node.id === "builder")?.data.tools.length,
+    ).toBeGreaterThan(0);
     expect(
       saved?.edges.find((edge) => edge.id === "e-reviewer-builder")?.data
         ?.edgeType,
@@ -77,13 +77,25 @@ describe("workflow architect tools", () => {
 
   it("patches one specialist without replacing its other configuration", async () => {
     let saved: WorkflowTemplate | undefined;
+    const detailed = `You are the Frontend Engineer builder for this company.
+
+Mission
+- Implement only the approved file plan from upstream design and architecture.
+
+Process
+1. Read the approved plan and mission constraints.
+2. Apply the smallest code change set that satisfies acceptance criteria.
+3. Report residual risks without inventing scope.
+
+Output contract
+- Structured status, summary, data, and code artifacts for the reviewer.`;
     const result = await executeWorkflowArchitectTool(
       "workflow_patch_node",
       {
         id: "software-company",
         nodeId: "builder",
         patch: {
-          prompt: "Implement only the approved file plan.",
+          prompt: detailed,
           skills: ["frontend-design"],
         },
       },
@@ -98,10 +110,38 @@ describe("workflow architect tools", () => {
 
     expect(result.success).toBe(true);
     const builder = saved?.nodes.find((node) => node.id === "builder");
-    expect(builder?.data.prompt).toBe("Implement only the approved file plan.");
+    expect(builder?.data.prompt).toBe(detailed);
     expect(builder?.data.skills).toEqual(["frontend-design"]);
-    expect(builder?.data.tools).toContain("Shell");
+    expect(builder?.data.tools.length).toBeGreaterThan(0);
     expect(builder?.data.role).toBe("Frontend Engineer");
+  });
+
+  it("normalizes weak specialist patches via ensureSpecialistQuality", async () => {
+    let saved: WorkflowTemplate | undefined;
+    const result = await executeWorkflowArchitectTool(
+      "workflow_patch_node",
+      {
+        id: "software-company",
+        nodeId: "builder",
+        patch: {
+          prompt: "todo",
+          tools: [],
+          skills: [],
+        },
+      },
+      {
+        save: (workflow) => {
+          saved = workflow;
+        },
+        remove: vi.fn(),
+        open: vi.fn(),
+      },
+    );
+    expect(result.success).toBe(true);
+    const builder = saved?.nodes.find((node) => node.id === "builder");
+    expect(builder?.data.prompt.length).toBeGreaterThan(120);
+    expect(builder?.data.tools.length).toBeGreaterThan(0);
+    expect(builder?.data.prompt.toLowerCase()).not.toBe("todo");
   });
 
   it("requires confirmation before deleting a workflow or node", async () => {

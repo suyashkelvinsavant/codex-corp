@@ -19,10 +19,12 @@ describe("fresh app reset", () => {
 
   afterEach(() => vi.unstubAllGlobals());
 
-  it("removes workflow and chat data once while retaining preferences", () => {
+  it("removes company data once while retaining preferences", () => {
     values.set("codex-corp-workflow:alpha", "graph");
     values.set("codex-corp-chat-sessions:alpha", "chat");
     values.set("codex-corp-chat-sessions:__workflow-architect__", "architect");
+    values.set("codex-corp-finance-entries", "ledger");
+    values.set("codex-corp-dashboard-feedback", "feedback");
     values.set("codex-corp-appearance", "preference");
 
     expect(resetBrowserWorkspaceOnce()).toBe(true);
@@ -31,6 +33,8 @@ describe("fresh app reset", () => {
     expect(values.has("codex-corp-chat-sessions:__workflow-architect__")).toBe(
       false,
     );
+    expect(values.has("codex-corp-finance-entries")).toBe(false);
+    expect(values.has("codex-corp-dashboard-feedback")).toBe(false);
     expect(values.get("codex-corp-appearance")).toBe("preference");
     expect(resetBrowserWorkspaceOnce()).toBe(false);
   });

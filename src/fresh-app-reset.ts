@@ -6,6 +6,8 @@ const WORKSPACE_KEYS = new Set([
   "codex-corp-runs",
   "codex-corp-custom-workflows",
   "codex-corp-deleted-workflows",
+  "codex-corp-finance-entries",
+  "codex-corp-dashboard-feedback",
 ]);
 
 /** One-time destructive migration for the empty-catalog release. */

@@ -3,7 +3,18 @@ import { defaultPlatformCriteria } from "./completion-criteria";
 import { validateWorkflow } from "./graph";
 import { kindPopColor } from "./kind-colors";
 import type { FlowEdge, FlowNode, Kind } from "./model";
-import { getTemplate, listWorkflows, type WorkflowTemplate } from "./templates";
+import { isSpecialistKind } from "./model";
+import {
+  bumpWorkflowVersion,
+  getTemplate,
+  listWorkflows,
+  type WorkflowTemplate,
+} from "./templates";
+import {
+  ensureSpecialistQuality,
+  isWeakSpecialistPrompt,
+} from "./specialist-defaults";
+import { latestArchitectDashboardDigestPersisted } from "./dashboard-finance";
 import type {
   DynamicToolSpecJson,
   ToolExecResult,
@@ -12,6 +23,15 @@ import type {
 export const WORKFLOW_ARCHITECT_SYSTEM_PROMPT = `You are the Workflow Architect, the top-level Codex Corp agent. You own the company workflow catalog, not a single company run.
 
 Your job is to turn company requirements into robust multi-agent graphs and maintain them over time. Gather requirements before creating a graph: objective, inputs, outputs, constraints, approvals, tools, skills, and definition of done. Use tools for every catalog fact or mutation; never claim a workflow changed unless the tool succeeds.
+
+## Specialist quality (mandatory)
+You are responsible for every agent and creative node working at its best. For each specialist you create or patch:
+- Write an extremely detailed system prompt (multi-section: mission, process, output contract, constraints) — never leave specialist prompts empty or one-line stubs.
+- Customize tools (least-privilege) and skills per node for the role (e.g. Researcher: web search; Builder: shell + patch; Creative: image tools).
+- Set a clear role label and description so operators understand the node.
+- Prefer ≥120 characters of substantive prompt text; validation rejects weak placeholders.
+
+If a DASHBOARD_FEEDBACK digest is present in context, use it to prefer lower-burn graphs, tighten high-cost specialists, and align designs with profitable workflows.
 
 You have CRUD access to unlocked workflows. A locked workflow is programmatically read-only: never attempt to update, patch, repair, add/remove nodes or edges, or delete it. You may inspect, validate, open, or duplicate a locked workflow and edit the duplicate. If the operator insists on changing the original, ask them to disable its Architect lock in the workflow editor; never ask for or claim an override. For destructive deletion, explain the target and ask for explicit confirmation first. Prefer focused specialist nodes with precise prompts, least-privilege tools/skills, typed handoffs, human gates for irreversible actions, and a final output node. After every mutation sequence, call workflow_validate. Do not describe a workflow as ready while validation errors remain. Summarize exactly what changed and flag remaining risks. Do not run company workflows or implement product code.`;
 
@@ -263,8 +283,28 @@ function slug(value: unknown) {
 }
 function makeNodes(rawNodes: any[]): FlowNode[] {
   return rawNodes.map((raw, index) => {
-    if (raw?.data?.kind && raw?.position)
-      return structuredClone(raw) as FlowNode;
+    if (raw?.data?.kind && raw?.position) {
+      const cloned = structuredClone(raw) as FlowNode;
+      if (isSpecialistKind(cloned.data.kind)) {
+        const quality = ensureSpecialistQuality({
+          kind: cloned.data.kind,
+          role: cloned.data.role,
+          label: cloned.data.label,
+          prompt: cloned.data.prompt,
+          tools: cloned.data.tools,
+          skills: cloned.data.skills,
+          description: cloned.data.description,
+        });
+        cloned.data = {
+          ...cloned.data,
+          prompt: quality.prompt,
+          tools: quality.tools,
+          skills: quality.skills,
+          description: quality.description,
+        };
+      }
+      return cloned;
+    }
     const kind = (
       [
         "agent",
@@ -280,6 +320,17 @@ function makeNodes(rawNodes: any[]): FlowNode[] {
         ? raw.kind
         : "agent"
     ) as Kind;
+    const role = raw.role || (kind === "creative" ? "Creative" : "Specialist");
+    const label = raw.label || `Node ${index + 1}`;
+    const quality = ensureSpecialistQuality({
+      kind,
+      role,
+      label,
+      prompt: raw.prompt || "",
+      tools: raw.tools || [],
+      skills: raw.skills || [],
+      description: raw.description || "",
+    });
     return {
       id: slug(raw.id) || `node-${index + 1}`,
       type: "corpNode",
@@ -288,16 +339,18 @@ function makeNodes(rawNodes: any[]): FlowNode[] {
         y: 120 + Math.floor(index / 4) * 230,
       },
       data: {
-        label: raw.label || `Node ${index + 1}`,
-        role: raw.role || "Specialist",
+        label,
+        role,
         kind,
         status: kind === "input" ? "completed" : "idle",
         model: raw.model || "",
         effort: raw.effort || "low",
-        tools: raw.tools || [],
-        skills: raw.skills || [],
-        prompt: raw.prompt || "",
-        description: raw.description || "",
+        tools: isSpecialistKind(kind) ? quality.tools : raw.tools || [],
+        skills: isSpecialistKind(kind) ? quality.skills : raw.skills || [],
+        prompt: isSpecialistKind(kind) ? quality.prompt : raw.prompt || "",
+        description: isSpecialistKind(kind)
+          ? quality.description
+          : raw.description || "",
         inputSchema: raw.inputSchema,
         outputSchema: raw.outputSchema,
         conditionRule: raw.conditionRule,
@@ -348,16 +401,20 @@ function makeGraph(
 ): { nodes: FlowNode[]; edges: FlowEdge[] } {
   return { nodes: makeNodes(rawNodes), edges: makeEdges(rawEdges) };
 }
-function bumpVersion(version: string): string {
-  const match = /^v(\d+)\.(\d+)$/.exec(version);
-  return match ? `v${match[1]}.${Number(match[2]) + 1}` : "v0.1";
-}
 function workflowProblems(workflow: WorkflowTemplate): string[] {
   const ids = new Set<string>();
   const problems: string[] = [];
   workflow.nodes.forEach((node) => {
     if (ids.has(node.id)) problems.push(`Duplicate node id: ${node.id}`);
     ids.add(node.id);
+    if (
+      isSpecialistKind(node.data.kind) &&
+      isWeakSpecialistPrompt(node.data.prompt)
+    ) {
+      problems.push(
+        `${node.id}: specialist needs a detailed system prompt (not empty/placeholder)`,
+      );
+    }
   });
   const edgeKeys = new Set<string>();
   workflow.edges.forEach((edge) => {
@@ -380,9 +437,18 @@ function introducedWorkflowProblems(
   return workflowProblems(after).filter((problem) => !existing.has(problem));
 }
 async function saveNext(actions: ArchitectActions, workflow: WorkflowTemplate) {
-  const next = { ...workflow, version: bumpVersion(workflow.version) };
+  const next = {
+    ...workflow,
+    version: bumpWorkflowVersion(workflow.version),
+  };
   await actions.save(next);
   return next;
+}
+
+/** Optional dashboard digest for architect turns (host may append). */
+export async function architectContextExtras(): Promise<string> {
+  const digest = await latestArchitectDashboardDigestPersisted();
+  return digest ? `\n\n${digest}` : "";
 }
 const ok = (value: unknown): ToolExecResult => ({
   success: true,
@@ -528,13 +594,43 @@ export async function executeWorkflowArchitectTool(
         ),
       );
       const nodes = structuredClone(exists.nodes);
-      const nextKind = patch.kind as Kind | undefined;
+      const nextKind =
+        (patch.kind as Kind | undefined) ?? nodes[nodeIndex].data.kind;
+      const mergedData = {
+        ...nodes[nodeIndex].data,
+        ...patch,
+        kind: nextKind,
+        ...(patch.kind ? { color: kindPopColor(nextKind) } : {}),
+      };
+      const quality = isSpecialistKind(nextKind)
+        ? ensureSpecialistQuality({
+            kind: nextKind,
+            role: String(mergedData.role ?? nodes[nodeIndex].data.role),
+            label: String(mergedData.label ?? nodes[nodeIndex].data.label),
+            prompt: String(mergedData.prompt ?? ""),
+            tools: Array.isArray(mergedData.tools)
+              ? (mergedData.tools as string[])
+              : nodes[nodeIndex].data.tools,
+            skills: Array.isArray(mergedData.skills)
+              ? (mergedData.skills as string[])
+              : nodes[nodeIndex].data.skills,
+            description: String(
+              mergedData.description ?? nodes[nodeIndex].data.description ?? "",
+            ),
+          })
+        : null;
       nodes[nodeIndex] = {
         ...nodes[nodeIndex],
         data: {
-          ...nodes[nodeIndex].data,
-          ...patch,
-          ...(nextKind ? { color: kindPopColor(nextKind) } : {}),
+          ...mergedData,
+          ...(quality
+            ? {
+                prompt: quality.prompt,
+                tools: quality.tools,
+                skills: quality.skills,
+                description: quality.description,
+              }
+            : {}),
         },
       };
       const candidate = { ...exists, nodes };

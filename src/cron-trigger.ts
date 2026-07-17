@@ -3,6 +3,15 @@ export type CronMatch = {
   minuteKey: string;
 };
 
+export function isValidCronTimezone(timezone: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: timezone || "UTC" }).format();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function matchesField(value: number, field: string, min: number, max: number) {
   return field.split(",").some((part) => {
     const [base, stepRaw] = part.split("/");

@@ -2866,6 +2866,285 @@ select:focus-visible {
     monospace;
 }
 
+.editor-workflow-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 10px 14px;
+  min-width: 0;
+  flex: 1;
+}
+
+.workflow-version-editor {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 4px;
+}
+
+.workflow-version-editor span {
+  color: var(--muted);
+  font:
+    600 9px/1 "IBM Plex Mono",
+    monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.workflow-version-editor input {
+  width: 4.5rem;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--panel-2);
+  color: var(--text);
+  font:
+    600 12px/1 "IBM Plex Mono",
+    monospace;
+  padding: 5px 7px;
+}
+
+.workflow-version-editor input:focus {
+  outline: none;
+  border-color: var(--accent-soft-border, var(--border-strong));
+}
+
+.workflow-description-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: min(42vw, 320px);
+  flex: 1 1 220px;
+}
+
+.workflow-description-editor span {
+  color: var(--muted);
+  font:
+    600 9px/1 "IBM Plex Mono",
+    monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.workflow-description-editor textarea {
+  width: 100%;
+  min-height: 44px;
+  max-height: 72px;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--text);
+  font:
+    500 12px/1.35 "Instrument Sans",
+    sans-serif;
+  padding: 6px 8px;
+}
+
+.workflow-description-editor textarea:focus {
+  outline: none;
+  border-color: var(--accent-soft-border, var(--border-strong));
+}
+
+.workflow-version-tag {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 11px;
+  color: var(--accent, #55d6be);
+}
+
+.dashboards-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 0 4px 32px;
+}
+
+.dashboards-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+  gap: 16px;
+}
+
+.dashboards-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 14px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.dashboards-card header {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+}
+
+.dashboards-card header h3 {
+  margin: 0;
+  font:
+    650 15px/1.25 "Instrument Sans",
+    sans-serif;
+}
+
+.dashboards-card header p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.dashboards-feedback {
+  grid-column: 1 / -1;
+}
+
+.dashboards-table-wrap {
+  overflow: auto;
+  max-height: 360px;
+}
+
+.dashboards-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.dashboards-table th,
+.dashboards-table td {
+  text-align: left;
+  padding: 8px 6px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.dashboards-table th {
+  color: var(--muted);
+  font:
+    600 10px/1 "IBM Plex Mono",
+    monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.dashboards-table td b {
+  display: block;
+}
+
+.dashboards-table td small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.dashboards-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.dashboards-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.dashboards-form select,
+.dashboards-form input {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--text);
+  padding: 7px 8px;
+  font: inherit;
+}
+
+.dashboards-form .dashboards-note {
+  grid-column: 1 / -1;
+}
+
+.dashboards-form .overview-create {
+  grid-column: 1 / -1;
+  justify-self: start;
+}
+
+.dashboards-finance-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.dashboards-finance-list li {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 8px;
+  border-radius: 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+}
+
+.dashboards-finance-list .fin-kind {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font:
+    600 10px/1 "IBM Plex Mono",
+    monospace;
+  text-transform: uppercase;
+  min-width: 72px;
+}
+
+.dashboards-finance-list .fin-kind.revenue {
+  color: var(--accent, #55d6be);
+}
+
+.dashboards-finance-list .fin-kind.expense {
+  color: #f0a070;
+}
+
+.dashboards-finance-list b {
+  display: block;
+  font-size: 12px;
+}
+
+.dashboards-finance-list small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.dashboards-feedback-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.dashboards-briefing {
+  margin: 0;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  white-space: pre-wrap;
+  font:
+    500 12px/1.45 "Instrument Sans",
+    sans-serif;
+  max-height: 320px;
+  overflow: auto;
+}
+
+@media (max-width: 960px) {
+  .dashboards-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 .architect-lock {
   height: 30px;
   display: inline-flex;
@@ -7639,4 +7918,14 @@ select:focus-visible {
   .settings-actions button.danger {
     margin-left: 0;
   }
+}
+/* Native catalog hydration gate: prevents creating/editing against stale browser data. */
+.app-bootstrap {
+  min-height: 100vh;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 12px;
+  color: var(--text-secondary);
+  background: var(--app-bg);
 }
