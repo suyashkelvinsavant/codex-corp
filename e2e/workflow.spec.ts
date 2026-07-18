@@ -175,6 +175,59 @@ test("creates a blank workflow manually from the home screen", async ({
   });
 });
 
+test("builtin template + role catalog pack instantiate non-weak instructions", async ({
+  page,
+}) => {
+  test.setTimeout(60_000);
+  await page.goto("/");
+  await page.evaluate(() => localStorage.clear());
+  await page.reload();
+
+  // Load pack-wired builtin template into the editor (B0 template path).
+  await page.getByRole("tab", { name: "Templates", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Templates" })).toBeVisible();
+  await expect(page.getByText("Software company")).toBeVisible();
+  await page
+    .locator(".template-card")
+    .filter({ hasText: "Software company" })
+    .getByRole("button", { name: "View / Edit" })
+    .click();
+  await expect(page.getByRole("button", { name: "Seed" })).toBeVisible({
+    timeout: 15_000,
+  });
+  await expect(page.getByText("Product Manager").first()).toBeVisible();
+  await expect(page.getByText("Architect").first()).toBeVisible();
+  await expect(page.getByText("QA Engineer").first()).toBeVisible();
+
+  // Place generic Agent → role catalog (B0 agent-drop path).
+  await page.locator(".library-item").filter({ hasText: /^Agent/ }).click();
+  const catalog = page.getByRole("dialog", { name: "Choose specialist role" });
+  await expect(catalog).toBeVisible({ timeout: 10_000 });
+  // Empty pack is last in the catalog (menuOrder).
+  await expect(
+    catalog.getByRole("button", { name: /^Empty/i }),
+  ).toBeVisible();
+  await expect(catalog.locator(".role-catalog-item").last()).toContainText(
+    "Empty",
+  );
+
+  await catalog.getByRole("button", { name: /^Backend Engineer/i }).click();
+  await expect(catalog).toHaveCount(0);
+
+  await page
+    .locator(".inspector-tabs")
+    .getByRole("button", { name: /instructions/i })
+    .click();
+  await expect(page.getByText("Instruction surfaces").first()).toBeVisible({
+    timeout: 10_000,
+  });
+  const textareas = page.locator(".prompt-editor-textarea");
+  await expect(textareas).toHaveCount(2, { timeout: 10_000 });
+  const developerText = await textareas.nth(1).inputValue();
+  expect(developerText.trim().length).toBeGreaterThan(120);
+  expect(developerText.toLowerCase()).toMatch(/backend|implement|mission/);
+});
+
 test("keeps workflow and template toolbars aligned and themes template actions", async ({
   page,
 }) => {
@@ -302,7 +355,7 @@ test("Workflow Architect chat history persists in the left sidebar", async ({
   );
 });
 
-test("company chat opens app context only when the mediator requests it", async ({
+test("company chat opens app context only when Byte requests it", async ({
   page,
 }) => {
   await freshWorkspace(page);
@@ -311,7 +364,7 @@ test("company chat opens app context only when the mediator requests it", async 
 
   const modal = page.getByRole("dialog", { name: "What are we working on?" });
   await expect(modal).toBeHidden();
-  await expect(page.getByPlaceholder(/Message the mediator/i)).toBeVisible();
+  await expect(page.getByPlaceholder(/Message Byte/i)).toBeVisible();
 
   await page.evaluate(() => {
     window.dispatchEvent(

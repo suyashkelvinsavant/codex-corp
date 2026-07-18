@@ -1,4 +1,4 @@
-import { useMemo, useState, type CSSProperties } from "react";
+import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import {
   CheckCircle2,
   ChevronDown,
@@ -6,9 +6,9 @@ import {
   Database,
   Home,
   LayoutDashboard,
+  Lock,
   MessageSquare,
   Moon,
-  Network,
   Palette,
   Pencil,
   Plus,
@@ -18,6 +18,7 @@ import {
   Sparkles,
   Sun,
   Trash2,
+  Unlock,
 } from "lucide-react";
 import type { CodexInfo, RunRecord } from "./model";
 import {
@@ -26,8 +27,10 @@ import {
   listTemplates,
   removeWorkflowFromTemplates,
   templateStats,
+  updateWorkflowMetadata,
   type WorkflowTemplate,
 } from "./templates";
+import { workflowIconComponent } from "./workflow-icons";
 import {
   ACCENT_PRESETS,
   applyAppearance,
@@ -55,6 +58,10 @@ export type OverviewPageProps = {
   codexInfo: CodexInfo;
   onOpenChat: (id: string) => void;
   onEditWorkflow: (id: string) => void;
+  /** Instantiate a template as a new user workflow and open the editor. */
+  onUseTemplate: (id: string) => void;
+  /** Delete a saved workflow from the catalog (parent handles storage cleanup). */
+  onDeleteWorkflow: (id: string) => void;
   onOpenCodexHealth: () => void;
   onCreateWorkflow: () => void;
   onOpenArchitect: (initialPrompt?: string) => void;
@@ -68,6 +75,8 @@ export function OverviewPage({
   codexInfo,
   onOpenChat,
   onEditWorkflow,
+  onUseTemplate,
+  onDeleteWorkflow,
   onOpenCodexHealth,
   onCreateWorkflow,
   onOpenArchitect,
@@ -77,6 +86,10 @@ export function OverviewPage({
   const templates = useMemo(() => listTemplates(), [catalogRevision]);
   const [templatePickerOpen, setTemplatePickerOpen] = useState(false);
   const [templateSelection, setTemplateSelection] = useState<string[]>([]);
+  const [deleteTarget, setDeleteTarget] = useState<{
+    id: string;
+    name: string;
+  } | null>(null);
   const [section, setSection] = useState<OverviewSection>("workflows");
   const [lastWorkspaceSection, setLastWorkspaceSection] =
     useState<WorkspaceSection>("workflows");
@@ -125,6 +138,29 @@ export function OverviewPage({
     removeWorkflowFromTemplates(id);
     setCatalogRevision((value) => value + 1);
   };
+  const toggleWorkflowLock = (id: string, locked: boolean) => {
+    updateWorkflowMetadata(id, { locked: !locked });
+    setCatalogRevision((value) => value + 1);
+  };
+  const requestDeleteWorkflow = (id: string, name: string) => {
+    setDeleteTarget({ id, name });
+  };
+  const closeDeleteDialog = () => setDeleteTarget(null);
+  const confirmDeleteWorkflow = () => {
+    if (!deleteTarget) return;
+    onDeleteWorkflow(deleteTarget.id);
+    setCatalogRevision((value) => value + 1);
+    setDeleteTarget(null);
+  };
+
+  useEffect(() => {
+    if (!deleteTarget) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeDeleteDialog();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [deleteTarget]);
 
   const failedRuns = runHistory.filter(
     (r) => r.status === "failed" || r.status === "interrupted",
@@ -150,7 +186,7 @@ export function OverviewPage({
   const titles: Record<OverviewSection, { h1: string; sub: string }> = {
     workflows: {
       h1: "Workflows",
-      sub: "Open a company mediator chat, or edit the specialist graph",
+      sub: "Open a Byte chat, or edit the specialist graph",
     },
     templates: {
       h1: "Templates",
@@ -162,7 +198,7 @@ export function OverviewPage({
     },
     dashboards: {
       h1: "Dashboards",
-      sub: "Token burn, estimated input cost, revenue & expenses — with Architect feedback loop",
+      sub: "Token burn, estimated input cost, revenue & expenses — with Byte feedback loop",
     },
     settings: {
       h1: "Settings",
@@ -196,6 +232,9 @@ export function OverviewPage({
             onClick={() => setSection("dashboards")}
             icon={LayoutDashboard}
             label="Dashboards"
+            badge="Alpha"
+            badgeTone="alpha"
+            title="Dashboards are alpha — metrics not fully verified"
           />
         </nav>
         <nav
@@ -225,11 +264,13 @@ export function OverviewPage({
                 type="button"
                 className="overview-architect-launch"
                 onClick={() => onOpenArchitect()}
+                title="Open Byte, your workflow architect"
+                aria-label="Talk to Byte, your workflow architect"
               >
                 <Sparkles size={15} />
                 <span>
-                  <b>Workflow Architect</b>
-                  <small>Create with AI guidance</small>
+                  <b>Talk to Byte</b>
+                  <small>Your workflow architect</small>
                 </span>
               </button>
             </div>
@@ -277,8 +318,16 @@ export function OverviewPage({
                 <input
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
-                  placeholder="Search workflows"
-                  aria-label="Search workflows"
+                  placeholder={
+                    section === "templates"
+                      ? "Search templates"
+                      : "Search workflows"
+                  }
+                  aria-label={
+                    section === "templates"
+                      ? "Search templates"
+                      : "Search workflows"
+                  }
                 />
               </label>
               {section === "workflows" && (
@@ -316,6 +365,7 @@ export function OverviewPage({
                     lastRun={lastRunLabel(template.id)}
                     onOpenChat={() => onOpenChat(template.id)}
                     onEdit={() => onEditWorkflow(template.id)}
+                    onUse={() => onUseTemplate(template.id)}
                     onRemove={
                       template.templateOrigin === "user"
                         ? () => removeUserTemplate(template.id)
@@ -327,7 +377,7 @@ export function OverviewPage({
                   <div className="workflow-empty">
                     {query.trim()
                       ? "No templates match your search."
-                      : "No templates installed. Build your first workflow with Workflow Architect."}
+                      : "No templates installed. Build your first workflow with Byte."}
                   </div>
                 )}
               </div>
@@ -349,36 +399,119 @@ export function OverviewPage({
                           }
                         }}
                       >
-                        <div className="workflow-card-icon">
-                          <Network size={18} />
+                        <div className="workflow-card-icon" aria-hidden>
+                          {(() => {
+                            const CardIcon = workflowIconComponent(
+                              template.icon,
+                            );
+                            return <CardIcon size={18} />;
+                          })()}
                         </div>
                         <div className="workflow-card-body">
-                          <h3>{template.name}</h3>
-                          <p>
-                            {lastRunLabel(template.id)}
-                            <span> · </span>
-                            {stats.nodeCount} nodes · {stats.edgeCount} edges ·{" "}
-                            <span className="workflow-version-tag">
-                              {template.version}
+                          <div className="workflow-card-title-row">
+                            <h3>{template.name}</h3>
+                            <div className="workflow-card-title-tags">
+                              <span
+                                className="workflow-version-tag"
+                                title="Workflow version"
+                              >
+                                {template.version}
+                              </span>
+                              {template.locked ? (
+                                <span
+                                  className="workflow-lock-badge"
+                                  title="Byte cannot modify this workflow"
+                                >
+                                  <Lock size={11} aria-hidden />
+                                  Locked
+                                </span>
+                              ) : null}
+                            </div>
+                          </div>
+                          <div className="workflow-card-meta" aria-label="Workflow stats">
+                            <span className="workflow-card-stat">
+                              <strong>{stats.nodeCount}</strong> nodes
                             </span>
+                            <span className="workflow-card-meta-sep" aria-hidden>
+                              ·
+                            </span>
+                            <span className="workflow-card-stat">
+                              <strong>{stats.edgeCount}</strong> edges
+                            </span>
+                          </div>
+                          <p className="workflow-card-run">
+                            {lastRunLabel(template.id)}
                           </p>
-                          <small>
+                          <p className="workflow-card-desc">
                             {template.description ||
                               "No description yet — edit in the graph editor."}
-                          </small>
+                          </p>
                         </div>
-                        <div className="workflow-card-actions">
+                        <div
+                          className="workflow-card-actions"
+                          onClick={(e) => e.stopPropagation()}
+                          onKeyDown={(e) => e.stopPropagation()}
+                        >
                           <button
                             type="button"
-                            className="workflow-edit"
+                            className="workflow-edit workflow-card-primary"
                             onClick={(e) => {
                               e.stopPropagation();
                               onEditWorkflow(template.id);
                             }}
                           >
-                            <Pencil size={14} />
-                            View / Edit workflow
+                            <Pencil size={14} aria-hidden />
+                            Edit
                           </button>
+                          <div
+                            className="workflow-card-tools"
+                            role="group"
+                            aria-label={`Tools for ${template.name}`}
+                          >
+                            <button
+                              type="button"
+                              className={`architect-lock workflow-card-icon-btn ${template.locked ? "locked" : ""}`}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                toggleWorkflowLock(
+                                  template.id,
+                                  Boolean(template.locked),
+                                );
+                              }}
+                              title={
+                                template.locked
+                                  ? "Byte cannot modify this workflow"
+                                  : "Allow Byte to modify this workflow"
+                              }
+                              aria-label={
+                                template.locked
+                                  ? `Unlock ${template.name} for Byte`
+                                  : `Lock ${template.name} from Byte`
+                              }
+                              aria-pressed={Boolean(template.locked)}
+                            >
+                              {template.locked ? (
+                                <Lock size={14} aria-hidden />
+                              ) : (
+                                <Unlock size={14} aria-hidden />
+                              )}
+                            </button>
+                            <button
+                              type="button"
+                              className="template-remove workflow-delete workflow-card-icon-btn"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                requestDeleteWorkflow(
+                                  template.id,
+                                  template.name,
+                                );
+                              }}
+                              title="Delete this workflow from the catalog"
+                              aria-label={`Delete ${template.name}`}
+                            >
+                              <Trash2 size={14} aria-hidden />
+                            </button>
+                          </div>
                         </div>
                       </article>
                     </li>
@@ -388,7 +521,7 @@ export function OverviewPage({
                   <li className="workflow-empty">
                     {query.trim()
                       ? "No companies match your search."
-                      : "No workflows yet. Open Workflow Architect to design your first company."}
+                      : "No workflows yet. Open Byte to design your first company."}
                   </li>
                 )}
               </ul>
@@ -396,7 +529,7 @@ export function OverviewPage({
             <footer className="overview-list-foot">
               Total {filtered.length} ·{" "}
               {filtered.length
-                ? "Click a company to open its mediator"
+                ? "Click a company to open Byte chat"
                 : "Your catalog is ready for its first workflow"}
             </footer>
           </section>
@@ -747,6 +880,63 @@ export function OverviewPage({
         runHistory={runHistory}
         onOpenArchitect={onOpenArchitect}
       />
+      {deleteTarget && (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onMouseDown={closeDeleteDialog}
+        >
+          <section
+            className="confirm-delete-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="confirm-delete-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <header className="confirm-delete-header">
+              <div className="confirm-delete-icon" aria-hidden>
+                <Trash2 size={18} />
+              </div>
+              <div className="confirm-delete-copy">
+                <span className="confirm-delete-eyebrow">Delete workflow</span>
+                <h2 id="confirm-delete-title">
+                  Delete “{deleteTarget.name}”?
+                </h2>
+                <p>
+                  This removes the workflow from the catalog permanently. It
+                  cannot be undone.
+                </p>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                aria-label="Close delete confirmation"
+                onClick={closeDeleteDialog}
+              >
+                ×
+              </button>
+            </header>
+            <footer className="confirm-delete-footer">
+              <button
+                type="button"
+                className="confirm-delete-cancel"
+                onClick={closeDeleteDialog}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="confirm-delete-confirm"
+                onClick={confirmDeleteWorkflow}
+                autoFocus
+              >
+                <Trash2 size={14} aria-hidden />
+                Delete workflow
+              </button>
+            </footer>
+          </section>
+        </div>
+      )}
       {templatePickerOpen && (
         <div
           className="modal-backdrop"
@@ -835,11 +1025,17 @@ function NavBtn({
   onClick,
   icon: Icon,
   label,
+  badge,
+  badgeTone,
+  title,
 }: {
   active: boolean;
   onClick: () => void;
   icon: typeof Home;
   label: string;
+  badge?: string;
+  badgeTone?: "alpha";
+  title?: string;
 }) {
   return (
     <button
@@ -847,9 +1043,20 @@ function NavBtn({
       className={`overview-nav-item ${active ? "active" : ""}`}
       onClick={onClick}
       aria-current={active ? "page" : undefined}
+      title={title}
+      aria-label={badge ? `${label} (${badge})` : undefined}
     >
       <Icon size={16} />
-      {label}
+      <span className="overview-nav-item-label">
+        {label}
+        {badge ? (
+          <span
+            className={`overview-nav-badge${badgeTone ? ` tone-${badgeTone}` : ""}`}
+          >
+            ({badge})
+          </span>
+        ) : null}
+      </span>
     </button>
   );
 }
@@ -888,46 +1095,105 @@ function TemplateCard({
   lastRun,
   onOpenChat,
   onEdit,
+  onUse,
   onRemove,
 }: {
   template: WorkflowTemplate;
   lastRun: string;
   onOpenChat: () => void;
   onEdit: () => void;
+  onUse: () => void;
   onRemove?: () => void;
 }) {
   const stats = templateStats(template);
+  const isBuiltin = template.templateOrigin === "built-in";
   return (
-    <article className="template-card">
-      <header>
-        <span>{template.version}</span>
-        <h3>{template.name}</h3>
-        <p>{template.description}</p>
-      </header>
-      <div className="template-card-meta">
-        {stats.nodeCount} nodes · {stats.edgeCount} edges
-        <em>{lastRun}</em>
+    <article className={`template-card ${isBuiltin ? "is-builtin" : "is-user"}`}>
+      <div className="template-card-top">
+        <div className="template-card-icon" aria-hidden>
+          {isBuiltin ? (
+            <Sparkles size={18} />
+          ) : (
+            (() => {
+              const CardIcon = workflowIconComponent(template.icon);
+              return <CardIcon size={18} />;
+            })()
+          )}
+        </div>
+        <div className="template-card-body">
+          <div className="template-card-title-row">
+            <h3>{template.name}</h3>
+            <div className="template-card-title-tags">
+              <span className="workflow-version-tag" title="Template version">
+                {template.version}
+              </span>
+              <span
+                className={`template-origin-badge ${isBuiltin ? "builtin" : "user"}`}
+              >
+                {isBuiltin ? "Built-in" : "Custom"}
+              </span>
+            </div>
+          </div>
+          <div className="template-card-meta" aria-label="Template stats">
+            <span className="template-card-stat">
+              <strong>{stats.nodeCount}</strong> nodes
+            </span>
+            <span className="template-card-meta-sep" aria-hidden>
+              ·
+            </span>
+            <span className="template-card-stat">
+              <strong>{stats.edgeCount}</strong> edges
+            </span>
+          </div>
+          <p className="template-card-run">{lastRun}</p>
+          <p className="template-card-desc">
+            {template.description ||
+              "No description yet — open the canvas to inspect this template."}
+          </p>
+        </div>
       </div>
-      <footer>
-        <button type="button" className="overview-create" onClick={onOpenChat}>
-          <MessageSquare size={14} />
-          Open chat
-        </button>
-        <button type="button" className="workflow-edit" onClick={onEdit}>
-          <Pencil size={14} />
-          View / Edit
-        </button>
-        {onRemove && (
+      <footer className="template-card-actions">
+        <div className="template-card-action-row">
           <button
             type="button"
-            className="template-remove"
+            className="template-card-btn template-card-btn-secondary"
+            onClick={onOpenChat}
+          >
+            <MessageSquare size={14} aria-hidden />
+            Open chat
+          </button>
+          {isBuiltin ? (
+            <button
+              type="button"
+              className="template-card-btn template-card-btn-primary"
+              onClick={onUse}
+              title="Create a copy under Workflows and open it in the editor"
+            >
+              <Pencil size={14} aria-hidden />
+              Use Template
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="template-card-btn template-card-btn-primary"
+              onClick={onEdit}
+            >
+              <Pencil size={14} aria-hidden />
+              Edit
+            </button>
+          )}
+        </div>
+        {onRemove ? (
+          <button
+            type="button"
+            className="template-card-btn template-card-btn-danger"
             onClick={onRemove}
             title="Keep the workflow and remove only this template"
           >
-            <Trash2 size={14} />
+            <Trash2 size={14} aria-hidden />
             Remove template
           </button>
-        )}
+        ) : null}
       </footer>
     </article>
   );

@@ -12,6 +12,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
 
 use crate::app_settings;
+use crate::verifier::{
+    architecture_policy_failed, artifact_exists_failed, artifact_hash_set_key, attempt_fingerprint,
+    collect_upstream_artifacts, command_failed, delivery_pair_compare, freeze_approval_snapshot,
+    is_plateau, materialize_artifacts, ApprovedArtifact, DeliveryCompareResult,
+    ProcessCommandRunner,
+};
 use crate::{
     execute_agent_internal, AgentRequest, AgentResult, ApprovalBroker, Database, ProcessBroker,
 };
@@ -34,6 +40,40 @@ impl Default for WorkflowRuntime {
     }
 }
 
+impl WorkflowRuntime {
+    /// Active runs for MCP / headless status tools.
+    pub(crate) fn list_active(&self, workflow_id: Option<&str>) -> Result<Vec<Value>, String> {
+        let active = self
+            .active
+            .lock()
+            .map_err(|_| "runtime registry lock poisoned".to_string())?;
+        Ok(active
+            .iter()
+            .filter(|(_, run)| workflow_id.map(|id| run.workflow_id == id).unwrap_or(true))
+            .map(|(run_id, run)| {
+                json!({"runId":run_id,"workflowId":run.workflow_id,"status":run.status})
+            })
+            .collect())
+    }
+
+    pub(crate) fn stop_run_internal(
+        &self,
+        run_id: &str,
+        process_broker: &ProcessBroker,
+    ) -> Result<(), String> {
+        let active = self
+            .active
+            .lock()
+            .map_err(|_| "runtime registry lock poisoned".to_string())?
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| "run is not active".to_string())?;
+        active.stop.store(true, Ordering::SeqCst);
+        kill_run_processes(process_broker, run_id);
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 struct ActiveRun {
     workflow_id: String,
@@ -42,7 +82,7 @@ struct ActiveRun {
 }
 
 #[derive(Clone)]
-pub(crate) struct RunApprovalBroker(Arc<Mutex<HashMap<String, mpsc::Sender<bool>>>>);
+pub(crate) struct RunApprovalBroker(pub(crate) Arc<Mutex<HashMap<String, mpsc::Sender<bool>>>>);
 
 impl Default for RunApprovalBroker {
     fn default() -> Self {
@@ -148,6 +188,12 @@ struct RuntimeNodeData {
     personality: Option<String>,
     #[serde(default)]
     prompt: String,
+    /// Authored harness-like base; empty = omit baseInstructions (native opt-in).
+    #[serde(default)]
+    base_instructions: String,
+    /// Role/developer contract. Falls back to legacy `prompt` when empty.
+    #[serde(default)]
+    developer_instructions: String,
     #[serde(default)]
     output: Option<String>,
     #[serde(default)]
@@ -193,6 +239,7 @@ fn default_workspace() -> String {
 struct RuntimeCriterion {
     id: String,
     label: String,
+    #[serde(deserialize_with = "deserialize_criterion_kind")]
     kind: String,
     #[serde(default = "default_true")]
     enabled: bool,
@@ -202,6 +249,27 @@ struct RuntimeCriterion {
     enforcement: String,
     #[serde(default)]
     instruction: Option<String>,
+    /// command verifier: allowlisted template id (npm_test, cargo_test, …)
+    #[serde(default)]
+    template_id: Option<String>,
+    /// artifact_exists: expected artifact name (or path fragment)
+    #[serde(default)]
+    artifact_name: Option<String>,
+    /// artifact_exists alternate path field
+    #[serde(default)]
+    artifact_path: Option<String>,
+    /// architecture_policy policy id (default native_runtime_ownership_v1)
+    #[serde(default)]
+    policy_id: Option<String>,
+}
+
+fn deserialize_criterion_kind<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    // Single SSOT with lib::deserialize_graph_criterion_kind (trim + custom→claim).
+    Ok(crate::verifier::normalize_kind(&raw))
 }
 
 fn default_true() -> bool {
@@ -335,7 +403,10 @@ impl From<AgentResult> for RuntimeOutput {
 #[derive(Clone)]
 struct RunContext {
     run_id: String,
-    app: tauri::AppHandle,
+    /// Present for desktop UI event fan-out; `None` in headless / MCP-only runs.
+    app: Option<tauri::AppHandle>,
+    /// Shared SQLite handle (always available; does not require AppHandle).
+    database: Database,
     graph: RuntimeGraph,
     outputs: Arc<Mutex<HashMap<String, RuntimeOutput>>>,
     /// Cumulative per-node usage for this run, including failed retries and revisions.
@@ -427,7 +498,7 @@ fn emit_event(
         message: message.into(),
         diagnostics: crate::redact_sensitive(diagnostics),
     };
-    if let Ok(connection) = context.app.state::<Database>().0.lock() {
+    if let Ok(connection) = context.database.0.lock() {
         let event_json = serde_json::to_string(&event).unwrap_or_else(|_| "{}".into());
         let _ = connection.execute(
             "INSERT INTO run_events(run_id,node_id,attempt_id,event_type,level,sequence,payload_json) VALUES(?1,?2,?3,?4,?5,?6,?7)",
@@ -438,7 +509,9 @@ fn emit_event(
             params![context.run_id, sequence],
         );
     }
-    let _ = context.app.emit("workflow-run-event", event);
+    if let Some(app) = &context.app {
+        let _ = app.emit("workflow-run-event", event);
+    }
 }
 
 fn parse_graph(raw: &str) -> Result<RuntimeGraph, String> {
@@ -588,63 +661,291 @@ fn criteria_instructions(criteria: &[RuntimeCriterion]) -> String {
         String::new()
     } else {
         format!(
-            "\n\nCOMPLETION CRITERIA:\n{}\nFor every criterion, return a data.criteria entry with its exact id, passed boolean, and concise evidence. Never claim passed without evidence.",
+            "\n\nCOMPLETION CRITERIA:\n{}\nFor claim criteria, return data.criteria[] entries with exact id, claim (satisfied|not_satisfied|unknown), evidence text, and optional evidencePaths. Your claim is not final — runtime verifiers own the pass bit. Do not treat passed:true as completion authority.",
             rows.join("\n")
         )
     }
 }
 
+/// Look up a precomputed verification.results row (plan III.4 SSOT).
+/// Returns (passed, detail) when a matching id is present.
+fn verification_result_row(output: &RuntimeOutput, criterion_id: &str) -> Option<(bool, String)> {
+    let results = output
+        .data
+        .get("verification")
+        .and_then(|v| v.get("results"))
+        .and_then(Value::as_array)?;
+    let row = results
+        .iter()
+        .find(|r| r.get("id").and_then(Value::as_str) == Some(criterion_id))?;
+    let passed = row.get("passed").and_then(Value::as_bool)?;
+    let detail = row
+        .get("detail")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Some((passed, detail))
+}
+
 fn required_criteria_failure(
     criteria: &[RuntimeCriterion],
     output: &RuntimeOutput,
+    context: &RunContext,
 ) -> Option<String> {
     for criterion in criteria {
         let required = criterion.platform || criterion.enforcement == "required";
         if !required || (!criterion.enabled && !criterion.platform) {
             continue;
         }
-        if criterion_failed(criterion, output) {
+        // Prefer precomputed verification.results (plan III.4) — do not re-run
+        // expensive host verifiers (command / architecture_policy).
+        if let Some((passed, detail)) = verification_result_row(output, &criterion.id) {
+            if !passed {
+                return Some(format!(
+                    "required completion criterion failed: {} — {}",
+                    criterion.label, detail
+                ));
+            }
+            continue;
+        }
+        // Fallback only when no verification row exists (legacy / non-specialist).
+        let eval = evaluate_criterion(criterion, output, context);
+        if eval.failed {
             return Some(format!(
-                "required completion criterion failed: {}",
-                criterion.label
+                "required completion criterion failed: {} — {}",
+                criterion.label, eval.detail
             ));
         }
     }
     None
 }
 
-fn criterion_failed(criterion: &RuntimeCriterion, output: &RuntimeOutput) -> bool {
+/// Host evaluation of one criterion with operator-facing detail (N1/SSOT chips).
+#[derive(Debug, Clone)]
+struct CriterionEval {
+    failed: bool,
+    detail: String,
+    /// Specific method string (kind or template/policy id).
+    method: String,
+    residual_risks: Vec<String>,
+}
+
+fn evaluate_structured_json(output: &RuntimeOutput) -> CriterionEval {
+    let status = output.status.trim();
+    let summary_ok = !output.summary.trim().is_empty();
+    let status_ok = matches!(status, "success" | "failure" | "needs_revision");
+    let failed = !summary_ok || !status_ok;
+    CriterionEval {
+        failed,
+        detail: if failed {
+            "missing status and/or summary in structured result".into()
+        } else {
+            format!("status={status}; summary present")
+        },
+        method: "structured_json".into(),
+        residual_risks: Vec::new(),
+    }
+}
+
+fn evaluate_claim_criterion(
+    criterion: &RuntimeCriterion,
+    output: &RuntimeOutput,
+    required: bool,
+) -> CriterionEval {
+    if required {
+        return CriterionEval {
+            failed: true,
+            detail: "required claim cannot own the pass bit".into(),
+            method: "claim".into(),
+            residual_risks: Vec::new(),
+        };
+    }
+    let entry = output
+        .data
+        .get("criteria")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("id").and_then(Value::as_str) == Some(criterion.id.as_str()))
+        });
+    let text = entry
+        .and_then(|item| {
+            item.get("evidence")
+                .and_then(Value::as_str)
+                .or_else(|| item.get("note").and_then(Value::as_str))
+        })
+        .unwrap_or("")
+        .trim();
+    let claim = entry
+        .and_then(|item| item.get("claim").and_then(Value::as_str))
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let passed_false = entry
+        .and_then(|item| item.get("passed"))
+        .and_then(Value::as_bool)
+        == Some(false);
+    // Ignore producer passed:true as sole authority. Fail on empty
+    // evidence, explicit negative claim, or passed:false.
+    let failed =
+        text.is_empty() || passed_false || matches!(claim.as_str(), "not_satisfied" | "unknown");
+    CriterionEval {
+        failed,
+        detail: if text.is_empty() {
+            "no claim evidence text".into()
+        } else if failed {
+            format!("claim={claim} (advisory evidence present but not satisfied)")
+        } else {
+            text.to_string()
+        },
+        method: "claim".into(),
+        residual_risks: Vec::new(),
+    }
+}
+
+fn evaluate_criterion(
+    criterion: &RuntimeCriterion,
+    output: &RuntimeOutput,
+    context: &RunContext,
+) -> CriterionEval {
     let lower = format!("{}\n{}", output.summary, output.data).to_ascii_lowercase();
-    match criterion.kind.as_str() {
-        "structured_json" => output.summary.trim().is_empty(),
+    // Shared alias: custom → claim (also applied at deserialize).
+    let kind = crate::verifier::normalize_kind(&criterion.kind);
+    let required = criterion.platform || criterion.enforcement == "required";
+    match kind.as_str() {
+        // Text/JSON criteria remain runtime-local (not host I/O).
+        "structured_json" => evaluate_structured_json(output),
         "concise_summary" => {
             let words = output.summary.split_whitespace().count();
-            !(3..=600).contains(&words)
+            let failed = !(3..=600).contains(&words);
+            CriterionEval {
+                failed,
+                detail: if failed {
+                    if words < 3 {
+                        "summary too short".into()
+                    } else {
+                        "summary exceeds concise limit (~600 words)".into()
+                    }
+                } else {
+                    format!("{words} words")
+                },
+                method: "concise_summary".into(),
+                residual_risks: Vec::new(),
+            }
         }
-        "no_hidden_reasoning" => [
-            "chain-of-thought",
-            "chain of thought",
-            "internal monologue",
-            "hidden reasoning",
-            "scratchpad:",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker)),
-        "custom" => {
-            output
-                .data
-                .get("criteria")
-                .and_then(Value::as_array)
-                .and_then(|items| {
-                    items.iter().find(|item| {
-                        item.get("id").and_then(Value::as_str) == Some(criterion.id.as_str())
-                    })
-                })
-                .and_then(|item| item.get("passed"))
-                .and_then(Value::as_bool)
-                != Some(true)
+        "no_hidden_reasoning" => {
+            let leaked = [
+                "chain-of-thought",
+                "chain of thought",
+                "internal monologue",
+                "hidden reasoning",
+                "scratchpad:",
+            ]
+            .iter()
+            .any(|marker| lower.contains(marker));
+            CriterionEval {
+                failed: leaked,
+                detail: if leaked {
+                    "possible hidden-reasoning markers in summary/data".into()
+                } else {
+                    "no hidden-reasoning markers detected".into()
+                },
+                method: "no_hidden_reasoning".into(),
+                residual_risks: Vec::new(),
+            }
         }
-        _ => false,
+        // Claim never owns required pass bit. Required claim always fails;
+        // advisory claim needs evidence and non-negative claim enum.
+        // Ignore producer passed:true as sole authority.
+        // Still runtime-local (text evidence in data.criteria).
+        "claim" => evaluate_claim_criterion(criterion, output, required),
+        // Host I/O kinds: verifier/* only, explicit workspace (no CWD fallback).
+        "artifact_exists" => {
+            let failed = artifact_exists_failed(
+                criterion.artifact_name.as_deref(),
+                criterion.artifact_path.as_deref(),
+                &output.artifacts,
+            );
+            let needle = criterion
+                .artifact_name
+                .as_deref()
+                .or(criterion.artifact_path.as_deref())
+                .unwrap_or("(any artifact)");
+            CriterionEval {
+                failed,
+                detail: if failed {
+                    format!("missing artifact matching {needle}")
+                } else {
+                    format!("artifact present matching {needle}")
+                },
+                method: "artifact_exists".into(),
+                residual_risks: Vec::new(),
+            }
+        }
+        "command" => {
+            // Fail closed: never fall back to process CWD (install dir / monorepo root).
+            let Some(cwd) = context.target_workspace.as_ref() else {
+                return CriterionEval {
+                    failed: true,
+                    detail: "workspacePath is required for command criteria".into(),
+                    method: "command".into(),
+                    residual_risks: Vec::new(),
+                };
+            };
+            let runner = ProcessCommandRunner::default();
+            let template = criterion.template_id.as_deref().unwrap_or("");
+            let (failed, detail) = command_failed(
+                &runner,
+                criterion.template_id.as_deref(),
+                criterion.instruction.as_deref(),
+                cwd,
+                &context.stop,
+            );
+            CriterionEval {
+                failed,
+                detail,
+                method: if template.is_empty() {
+                    "command".into()
+                } else {
+                    format!("command:{template}")
+                },
+                residual_risks: Vec::new(),
+            }
+        }
+        "architecture_policy" => {
+            // Fail closed: never fall back to process CWD (install dir / monorepo root).
+            let Some(cwd) = context.target_workspace.as_ref() else {
+                return CriterionEval {
+                    failed: true,
+                    detail: "workspacePath is required for architecture_policy criteria".into(),
+                    method: "architecture_policy".into(),
+                    residual_risks: Vec::new(),
+                };
+            };
+            let policy = criterion
+                .policy_id
+                .as_deref()
+                .unwrap_or("native_runtime_ownership_v1");
+            let arch = architecture_policy_failed(criterion.policy_id.as_deref(), cwd);
+            CriterionEval {
+                failed: arch.failed,
+                detail: arch.detail,
+                method: format!("architecture_policy:{policy}"),
+                residual_risks: arch.residual_risks,
+            }
+        }
+        // Fail-closed: unknown/unimplemented required kinds must never pass.
+        other => CriterionEval {
+            failed: required,
+            detail: if required {
+                format!("unknown required criterion kind: {other}")
+            } else {
+                format!("unknown advisory criterion kind: {other}")
+            },
+            method: other.into(),
+            residual_risks: Vec::new(),
+        },
     }
 }
 
@@ -652,7 +953,15 @@ fn emit_advisory_failures(context: &RunContext, node: &RuntimeNode, output: &Run
     for criterion in node.data.completion_criteria.iter().filter(|criterion| {
         criterion.enabled && !criterion.platform && criterion.enforcement == "advisory"
     }) {
-        if criterion_failed(criterion, output) {
+        // Prefer verification.results SSOT so advisory command/architecture do not re-run.
+        let (failed, detail, method) =
+            if let Some((passed, detail)) = verification_result_row(output, &criterion.id) {
+                (!passed, detail, "verification.results".to_string())
+            } else {
+                let eval = evaluate_criterion(criterion, output, context);
+                (eval.failed, eval.detail, eval.method)
+            };
+        if failed {
             emit_event(
                 context,
                 "criterion.advisory_failed",
@@ -660,9 +969,49 @@ fn emit_advisory_failures(context: &RunContext, node: &RuntimeNode, output: &Run
                 Some(&node.id),
                 None,
                 format!("Advisory criterion not satisfied: {}", criterion.label),
-                json!({"criterionId":criterion.id}),
+                json!({"criterionId":criterion.id,"detail":detail,"method":method}),
             );
         }
+    }
+}
+
+/// Collect host verification blocks from specialist outputs (delivery SSOT).
+fn collect_verification_summary(outputs: &HashMap<String, RuntimeOutput>) -> Vec<Value> {
+    outputs
+        .values()
+        .filter_map(|o| o.data.get("verification").cloned())
+        .collect()
+}
+
+/// Plan III.12: every completed specialist/creative output must carry a host verification block.
+/// Missing block → fail closed at delivery (prevents silent skip of runtime SSOT).
+fn require_specialist_verification_blocks(
+    graph: &RuntimeGraph,
+    outputs: &HashMap<String, RuntimeOutput>,
+) -> Result<(), String> {
+    for node in &graph.nodes {
+        if node.data.kind != "agent" && node.data.kind != "creative" {
+            continue;
+        }
+        let Some(output) = outputs.get(&node.id) else {
+            continue;
+        };
+        if output.data.get("verification").is_none() {
+            return Err(format!(
+                "delivery rejected: specialist {} ({}) missing data.verification block",
+                node.id, node.data.label
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve content_hash for an artifact row: prefer stored value; recompute when NULL/empty.
+/// Used so resume/load of pre-migration rows does not treat missing hash as a match token.
+fn resolve_artifact_content_hash(stored: Option<&str>, content: &str) -> String {
+    match stored.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(hash) => hash.to_string(),
+        None => crate::verifier::types::content_hash_for(content),
     }
 }
 
@@ -774,6 +1123,33 @@ async fn specialist_once(
         .output_schema
         .as_deref()
         .and_then(|raw| serde_json::from_str(raw).ok());
+    // Composition split (plan I.1.2): base | developer+connector+criteria | user_input+extra
+    let base_instructions = node.data.base_instructions.trim().to_string();
+    let developer_core = if !node.data.developer_instructions.trim().is_empty() {
+        node.data.developer_instructions.trim().to_string()
+    } else {
+        // Legacy graphs: single prompt blob routes to developer, not base.
+        node.data.prompt.trim().to_string()
+    };
+    let mut developer_parts = vec![developer_core];
+    let connector = connector_capability_instructions(node);
+    if !connector.trim().is_empty() {
+        developer_parts.push(connector.trim().to_string());
+    }
+    let criteria = criteria_instructions(&node.data.completion_criteria);
+    if !criteria.trim().is_empty() {
+        developer_parts.push(criteria.trim().to_string());
+    }
+    let developer_instructions = developer_parts
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let user_input = if extra_instruction.trim().is_empty() {
+        mission.clone()
+    } else {
+        format!("{mission}\n\n{extra_instruction}")
+    };
     let request = AgentRequest {
         node_id: node.id.clone(),
         run_id: Some(context.run_id.clone()),
@@ -781,14 +1157,9 @@ async fn specialist_once(
         role: node.data.role.clone(),
         model: node.data.model.clone(),
         effort: node.data.effort.clone(),
-        system_prompt: format!(
-            "{}{}{}{}",
-            node.data.prompt,
-            connector_capability_instructions(node),
-            criteria_instructions(&node.data.completion_criteria),
-            extra_instruction
-        ),
-        user_input: mission,
+        base_instructions,
+        developer_instructions,
+        user_input,
         upstream_outputs: upstream,
         approval_policy,
         sandbox_profile,
@@ -822,6 +1193,96 @@ async fn specialist_once(
     match result {
         Ok(result) => {
             let mut output: RuntimeOutput = result.into();
+            // Host materialize: assign hostOrdinal + artifactKey + contentHash
+            let previous = context
+                .outputs
+                .lock()
+                .ok()
+                .and_then(|guard| guard.get(&node.id).map(|o| o.artifacts.clone()));
+            let (materialized, refs) =
+                materialize_artifacts(&node.id, &output.artifacts, previous.as_deref());
+            output.artifacts = materialized;
+            // Verification SSOT block (platform criteria + host refs)
+            let mut verification_results = Vec::new();
+            let mut required_failed: Vec<String> = Vec::new();
+            let mut residual_risks: Vec<String> = Vec::new();
+            for criterion in &node.data.completion_criteria {
+                if !criterion.enabled && !criterion.platform {
+                    continue;
+                }
+                // Host I/O verifiers block (process poll / git). Run them on the
+                // blocking pool so parallel specialists do not stall the async runtime.
+                let kind = if criterion.kind == "custom" {
+                    "claim"
+                } else {
+                    criterion.kind.as_str()
+                };
+                let eval = if matches!(kind, "command" | "architecture_policy") {
+                    let criterion_c = criterion.clone();
+                    let output_c = output.clone();
+                    let context_c = context.clone();
+                    match tauri::async_runtime::spawn_blocking(move || {
+                        evaluate_criterion(&criterion_c, &output_c, &context_c)
+                    })
+                    .await
+                    {
+                        Ok(eval) => eval,
+                        Err(e) => CriterionEval {
+                            failed: true,
+                            detail: format!("verifier join failed: {e}"),
+                            method: kind.into(),
+                            residual_risks: Vec::new(),
+                        },
+                    }
+                } else {
+                    evaluate_criterion(criterion, &output, context)
+                };
+                let enforcement = if criterion.platform || criterion.enforcement == "required" {
+                    "required"
+                } else {
+                    "advisory"
+                };
+                if eval.failed && enforcement == "required" {
+                    required_failed.push(criterion.id.clone());
+                }
+                for risk in eval.residual_risks {
+                    if !residual_risks.contains(&risk) {
+                        residual_risks.push(risk);
+                    }
+                }
+                verification_results.push(json!({
+                    "id": criterion.id,
+                    "label": criterion.label,
+                    "kind": criterion.kind,
+                    "passed": !eval.failed,
+                    "enforcement": enforcement,
+                    "detail": eval.detail,
+                    "method": eval.method,
+                    "source": "runtime"
+                }));
+            }
+            let fingerprint = attempt_fingerprint(
+                &node.data.role,
+                &mission,
+                &format!("{extra_instruction}|{}", output.summary),
+            );
+            // Always materialize a data object so verification SSOT is written.
+            if !output.data.is_object() {
+                output.data = json!({ "payload": output.data });
+            }
+            if let Some(obj) = output.data.as_object_mut() {
+                obj.insert(
+                    "verification".into(),
+                    json!({
+                        "results": verification_results,
+                        "requiredFailed": required_failed,
+                        "fingerprint": fingerprint,
+                        "artifactRefs": refs,
+                        "residualRisks": residual_risks,
+                        "passBitOwner": "runtime"
+                    }),
+                );
+            }
             let attempt_tokens = output.tokens.max(token_meter.load(Ordering::SeqCst));
             output.tokens = record_node_tokens(context, &node.id, attempt_tokens);
             if output.status == "failure" {
@@ -837,15 +1298,28 @@ async fn specialist_once(
                     Some(&node.id),
                     Some(&attempt_id),
                     format!("{} reported failure: {error}", node.data.label),
-                    json!({"elapsedMs":elapsed_ms,"status":"failure","threadId":output.thread_id,"turnId":output.turn_id,"attempt":attempt,"revision":revision,"attemptTokens":attempt_tokens,"tokens":output.tokens}),
+                    json!({
+                        "elapsedMs": elapsed_ms,
+                        "status": "failure",
+                        "threadId": output.thread_id,
+                        "turnId": output.turn_id,
+                        "attempt": attempt,
+                        "revision": revision,
+                        "attemptTokens": attempt_tokens,
+                        "tokens": output.tokens,
+                        // Slim meta only — full content stays on RuntimeOutput for the retry adapter.
+                        "artifactMeta": slim_artifact_meta(&output.artifacts),
+                    }),
                 );
-                if let Ok(connection) = context.app.state::<Database>().0.lock() {
+                if let Ok(connection) = context.database.0.lock() {
                     let _ = connection.execute(
                         "INSERT OR REPLACE INTO node_attempts(id,run_id,node_id,attempt,revision,status,thread_id,turn_id,diagnostics_json,completed_at) VALUES(?1,?2,?3,?4,?5,'failed',?6,?7,?8,CURRENT_TIMESTAMP)",
                         params![format!("{}:{}:{}",context.run_id,node.id,attempt_id),context.run_id,node.id,attempt,revision,output.thread_id,output.turn_id,json!({"elapsedMs":elapsed_ms,"reportedFailure":true,"summary":error,"attemptTokens":attempt_tokens}).to_string()],
                     );
                 }
-                return Err(error);
+                // Return Ok with status=failure so the retry adapter can record artifact
+                // hash-sets for plateau detection (Err(String) would drop them).
+                return Ok(output);
             }
             emit_event(
                 context,
@@ -854,9 +1328,11 @@ async fn specialist_once(
                 Some(&node.id),
                 Some(&attempt_id),
                 format!("{} attempt completed", node.data.label),
-                json!({"elapsedMs":elapsed_ms,"status":output.status,"threadId":output.thread_id,"turnId":output.turn_id,"attemptTokens":attempt_tokens,"tokens":output.tokens}),
+                // Slim diagnostics for live chips (verification + summary + artifact meta).
+                // Full artifact content remains in node_executions via persist, not the event bus.
+                slim_attempt_completed_diagnostics(elapsed_ms, attempt_tokens, &output),
             );
-            if let Ok(connection) = context.app.state::<Database>().0.lock() {
+            if let Ok(connection) = context.database.0.lock() {
                 let _ = connection.execute(
                     "INSERT OR REPLACE INTO node_attempts(id,run_id,node_id,attempt,revision,status,thread_id,turn_id,diagnostics_json,completed_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,CURRENT_TIMESTAMP)",
                     params![format!("{}:{}:{}",context.run_id,node.id,attempt_id),context.run_id,node.id,attempt,revision,output.status,output.thread_id,output.turn_id,json!({"elapsedMs":elapsed_ms,"attemptTokens":attempt_tokens}).to_string()],
@@ -876,7 +1352,7 @@ async fn specialist_once(
                 format!("{} attempt failed: {error}", node.data.label),
                 json!({"elapsedMs":elapsed_ms,"error":error,"attempt":attempt,"revision":revision,"attemptTokens":attempt_tokens,"tokens":cumulative_tokens}),
             );
-            if let Ok(connection) = context.app.state::<Database>().0.lock() {
+            if let Ok(connection) = context.database.0.lock() {
                 let _ = connection.execute(
                     "INSERT OR REPLACE INTO node_attempts(id,run_id,node_id,attempt,revision,status,diagnostics_json,completed_at) VALUES(?1,?2,?3,?4,?5,'failed',?6,CURRENT_TIMESTAMP)",
                     params![format!("{}:{}:{}",context.run_id,node.id,attempt_id),context.run_id,node.id,attempt,revision,json!({"elapsedMs":elapsed_ms,"error":error,"attemptTokens":attempt_tokens}).to_string()],
@@ -887,6 +1363,230 @@ async fn specialist_once(
     }
 }
 
+/// Classification of specialist_once Err strings for retry policy (G7).
+/// Verification failures return Ok and are never retried here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryErrorClass {
+    Transient,
+    Contract,
+    Fatal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryStopReason {
+    Plateau,
+    Fatal,
+    ContractExhausted,
+    MaxRetries,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RetryAction {
+    Stop(RetryStopReason),
+    RetryTransient { backoff_ms: u64 },
+    RetryContractRepair { new_extra: String },
+}
+
+fn classify_retry_error(error: &str) -> RetryErrorClass {
+    let lower = error.to_ascii_lowercase();
+    // Prefer specific phrases over bare substrings (avoid "json"/"429"/"connection" false positives).
+    if lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("rate limit")
+        || lower.contains("rate-limit")
+        || lower.contains("ratelimit")
+        || lower.contains("too many requests")
+        || lower.contains("status 429")
+        || lower.contains("http 429")
+        || lower.contains("error 429")
+        || lower.contains("connection reset")
+        || lower.contains("connection refused")
+        || lower.contains("connection timed")
+        || lower.contains("econnreset")
+        || lower.contains("econnrefused")
+        || lower.contains("broken pipe")
+        || lower.contains("temporarily unavailable")
+        || lower.contains("network unreachable")
+        || lower.contains("network error")
+    {
+        return RetryErrorClass::Transient;
+    }
+    if lower.contains("failed to parse")
+        || lower.contains("parse error")
+        || lower.contains("error parsing json")
+        || lower.contains("invalid json")
+        || lower.contains("json parse")
+        || lower.contains("schema validation")
+        || lower.contains("output schema")
+        || lower.contains("output_schema")
+        || lower.contains("deserialize")
+        || lower.contains("structured output")
+        || lower.contains("invalid response")
+        || lower.contains("validation failed")
+    {
+        return RetryErrorClass::Contract;
+    }
+    RetryErrorClass::Fatal
+}
+
+/// Content hashes from materialized artifacts (for plateau hash-set keys).
+fn content_hashes_from_artifacts(artifacts: &[Value]) -> Vec<String> {
+    artifacts
+        .iter()
+        .filter_map(|art| {
+            art.get("contentHash")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|s| !s.is_empty())
+        })
+        .collect()
+}
+
+/// Hash-set key for this attempt: prefer this attempt's artifacts; else carry last known.
+fn attempt_artifact_hash_set(
+    attempt_artifacts: Option<&[Value]>,
+    last_known_hash_set: &str,
+) -> String {
+    if let Some(arts) = attempt_artifacts {
+        let hashes = content_hashes_from_artifacts(arts);
+        if !hashes.is_empty() {
+            return artifact_hash_set_key(&hashes);
+        }
+    }
+    if !last_known_hash_set.is_empty() {
+        return last_known_hash_set.to_string();
+    }
+    artifact_hash_set_key(&[])
+}
+
+/// Slim artifact rows for event bus (no file `content` bodies).
+fn slim_artifact_meta(artifacts: &[Value]) -> Vec<Value> {
+    artifacts
+        .iter()
+        .map(|art| {
+            json!({
+                "name": art.get("name").cloned().unwrap_or(Value::Null),
+                "contentHash": art.get("contentHash").cloned().unwrap_or(Value::Null),
+                "artifactKey": art.get("artifactKey").cloned().unwrap_or(Value::Null),
+                "hostOrdinal": art.get("hostOrdinal").cloned().unwrap_or(Value::Null),
+                "kind": art.get("kind").cloned().unwrap_or(Value::Null),
+                "id": art.get("id").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect()
+}
+
+/// Live-canvas diagnostics: summary + verification SSOT + artifact meta (no full content).
+fn slim_attempt_completed_diagnostics(
+    elapsed_ms: u128,
+    attempt_tokens: u64,
+    output: &RuntimeOutput,
+) -> Value {
+    let verification = output.data.get("verification").cloned();
+    // Keep residualRisks if present for operator honesty without shipping full data blob.
+    let residual = output.data.get("residualRisks").cloned();
+    let mut slim_data = serde_json::Map::new();
+    if let Some(v) = verification {
+        slim_data.insert("verification".into(), v);
+    }
+    if let Some(r) = residual {
+        slim_data.insert("residualRisks".into(), r);
+    }
+    json!({
+        "elapsedMs": elapsed_ms,
+        "status": output.status,
+        "threadId": output.thread_id,
+        "turnId": output.turn_id,
+        "attemptTokens": attempt_tokens,
+        "tokens": output.tokens,
+        "summary": output.summary,
+        "data": Value::Object(slim_data),
+        "artifacts": slim_artifact_meta(&output.artifacts),
+    })
+}
+
+/// Pure retry state machine (G7). Unit-tested independently of specialist_once.
+///
+/// Plateau is **not** applied for transient errors: environmental flakiness keeps the
+/// same inputs by definition and must keep backoff up to max_retries.
+///
+/// For non-transient errors, plateau fires when ≥2 identical fingerprints are observed
+/// with a stable artifact hash-set (including empty→empty when no artifacts were ever
+/// produced). That path is reachable after a prior retryable attempt (e.g. transient
+/// then fatal with same inputs, or two reported failures with the same artifact set).
+fn next_retry_action(
+    error: &str,
+    attempt: u32,
+    max_retries: u32,
+    fingerprints: &[String],
+    hash_sets: &[String],
+    contract_repair_used: bool,
+    original_extra: &str,
+) -> RetryAction {
+    if attempt >= max_retries {
+        return RetryAction::Stop(RetryStopReason::MaxRetries);
+    }
+    let class = classify_retry_error(error);
+
+    // Transient: backoff up to max_retries; never plateau (same inputs are expected).
+    if class == RetryErrorClass::Transient {
+        let backoff_ms = 200u64.saturating_mul(1u64 << attempt.min(4));
+        return RetryAction::RetryTransient { backoff_ms };
+    }
+
+    // Non-transient: no-progress stop when inputs + artifact hash-set are stable.
+    // Empty hash-sets are allowed here (unlike transient) so plateau is reachable
+    // when agents fail twice without producing artifacts.
+    if is_plateau(fingerprints, hash_sets) {
+        return RetryAction::Stop(RetryStopReason::Plateau);
+    }
+
+    match class {
+        RetryErrorClass::Transient => {
+            // Already handled above; keep exhaustive.
+            let backoff_ms = 200u64.saturating_mul(1u64 << attempt.min(4));
+            RetryAction::RetryTransient { backoff_ms }
+        }
+        RetryErrorClass::Contract if !contract_repair_used => RetryAction::RetryContractRepair {
+            new_extra: format!(
+                "{original_extra}\n\nCONTRACT REPAIR: previous attempt failed schema/parse validation:\n{error}\nReturn valid structured JSON matching the required output schema. Do not omit required fields."
+            ),
+        },
+        RetryErrorClass::Contract => RetryAction::Stop(RetryStopReason::ContractExhausted),
+        RetryErrorClass::Fatal => RetryAction::Stop(RetryStopReason::Fatal),
+    }
+}
+
+fn format_retry_stop_error(
+    label: &str,
+    max_retries: u32,
+    attempts_used: u32,
+    last_error: &str,
+    reason: Option<RetryStopReason>,
+) -> String {
+    match reason {
+        Some(RetryStopReason::Plateau) => format!(
+            "{label} stopped after plateau (attempt {attempts_used}/{}): {last_error}",
+            max_retries + 1
+        ),
+        Some(RetryStopReason::Fatal) => format!(
+            "{label} stopped on non-retryable error (attempt {attempts_used}/{}): {last_error}",
+            max_retries + 1
+        ),
+        Some(RetryStopReason::ContractExhausted) => format!(
+            "{label} stopped after contract repair exhausted (attempt {attempts_used}/{}): {last_error}",
+            max_retries + 1
+        ),
+        Some(RetryStopReason::Interrupted) => {
+            format!("{label} interrupted during retries: {last_error}")
+        }
+        Some(RetryStopReason::MaxRetries) | None => format!(
+            "{label} exhausted {max_retries} retries after {attempts_used} attempt(s): {last_error}"
+        ),
+    }
+}
+
 async fn specialist_with_retries(
     context: &RunContext,
     node: &RuntimeNode,
@@ -894,21 +1594,216 @@ async fn specialist_with_retries(
     extra_instruction: &str,
 ) -> Result<RuntimeOutput, String> {
     let mut last_error = String::new();
+    let mut fingerprints: Vec<String> = Vec::new();
+    let mut hash_sets: Vec<String> = Vec::new();
+    let mut contract_repair_used = false;
+    let mut effective_extra = extra_instruction.to_string();
+    let mut stop_reason: Option<RetryStopReason> = None;
+    let mut attempts_used: u32 = 0;
+    // Seed from any prior node output (e.g. previous revision) so plateau can compare
+    // against last known artifact identity when the next attempt fails.
+    let mut last_known_hash_set = context
+        .outputs
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(&node.id).cloned())
+        .map(|prior| attempt_artifact_hash_set(Some(&prior.artifacts), ""))
+        .unwrap_or_default();
+    let mission = context
+        .graph
+        .nodes
+        .iter()
+        .find(|candidate| candidate.data.kind == "input")
+        .and_then(|candidate| candidate.data.output.clone())
+        .unwrap_or_default();
+
     for attempt in 0..=node.data.max_retries {
-        match specialist_once(context, node, attempt, revision, extra_instruction).await {
+        if context.stop.load(Ordering::SeqCst) {
+            stop_reason = Some(RetryStopReason::Interrupted);
+            break;
+        }
+
+        let fingerprint = attempt_fingerprint(&node.data.role, &mission, &effective_extra);
+        attempts_used = attempt + 1;
+
+        match specialist_once(context, node, attempt, revision, &effective_extra).await {
+            // status=failure is returned as Ok so we can record artifact hash-sets for plateau.
+            Ok(output) if output.status == "failure" => {
+                let error = if output.summary.trim().is_empty() {
+                    "specialist returned failure without a summary".to_string()
+                } else {
+                    output.summary.clone()
+                };
+                last_error = error.clone();
+                let hash_key =
+                    attempt_artifact_hash_set(Some(&output.artifacts), &last_known_hash_set);
+                if !content_hashes_from_artifacts(&output.artifacts).is_empty() {
+                    last_known_hash_set = hash_key.clone();
+                }
+                fingerprints.push(fingerprint);
+                hash_sets.push(hash_key);
+
+                if context.stop.load(Ordering::SeqCst) {
+                    stop_reason = Some(RetryStopReason::Interrupted);
+                    break;
+                }
+                let action = next_retry_action(
+                    &error,
+                    attempt,
+                    node.data.max_retries,
+                    &fingerprints,
+                    &hash_sets,
+                    contract_repair_used,
+                    extra_instruction,
+                );
+                if apply_retry_action(
+                    context,
+                    node,
+                    action,
+                    attempt,
+                    &error,
+                    &fingerprints,
+                    &mut contract_repair_used,
+                    &mut effective_extra,
+                    &mut stop_reason,
+                )
+                .await
+                {
+                    break;
+                }
+            }
+            // Ok includes verification-failed success outputs — revision owns that path.
+            // Future specialist_with_retries calls seed last_known from context.outputs after persist.
             Ok(output) => return Ok(output),
             Err(error) => {
-                last_error = error;
+                last_error = error.clone();
+                // Pre-materialize failures: carry last known artifact set (if any).
+                let hash_key = attempt_artifact_hash_set(None, &last_known_hash_set);
+                fingerprints.push(fingerprint);
+                hash_sets.push(hash_key);
+
                 if context.stop.load(Ordering::SeqCst) {
+                    stop_reason = Some(RetryStopReason::Interrupted);
+                    break;
+                }
+
+                let action = next_retry_action(
+                    &error,
+                    attempt,
+                    node.data.max_retries,
+                    &fingerprints,
+                    &hash_sets,
+                    contract_repair_used,
+                    extra_instruction,
+                );
+                if apply_retry_action(
+                    context,
+                    node,
+                    action,
+                    attempt,
+                    &error,
+                    &fingerprints,
+                    &mut contract_repair_used,
+                    &mut effective_extra,
+                    &mut stop_reason,
+                )
+                .await
+                {
                     break;
                 }
             }
         }
     }
-    Err(format!(
-        "{} exhausted {} retries: {last_error}",
-        node.data.label, node.data.max_retries
+    Err(format_retry_stop_error(
+        &node.data.label,
+        node.data.max_retries,
+        attempts_used,
+        &last_error,
+        stop_reason,
     ))
+}
+
+/// Apply a retry decision; returns true when the retry loop should break.
+#[allow(clippy::too_many_arguments)]
+async fn apply_retry_action(
+    context: &RunContext,
+    node: &RuntimeNode,
+    action: RetryAction,
+    attempt: u32,
+    error: &str,
+    fingerprints: &[String],
+    contract_repair_used: &mut bool,
+    effective_extra: &mut String,
+    stop_reason: &mut Option<RetryStopReason>,
+) -> bool {
+    match action {
+        RetryAction::Stop(reason) => {
+            *stop_reason = Some(reason);
+            let event_type = match reason {
+                RetryStopReason::Plateau => "retry.plateau",
+                RetryStopReason::MaxRetries => "retry.exhausted",
+                _ => "retry.stopped",
+            };
+            emit_event(
+                context,
+                event_type,
+                "warning",
+                Some(&node.id),
+                None,
+                format!(
+                    "{} retry stop ({reason:?}) after attempt {attempt}",
+                    node.data.label
+                ),
+                json!({
+                    "attempt": attempt,
+                    "error": error,
+                    "reason": format!("{reason:?}"),
+                    "fingerprints": fingerprints,
+                }),
+            );
+            true
+        }
+        RetryAction::RetryTransient { backoff_ms } => {
+            emit_event(
+                context,
+                "retry.transient",
+                "warning",
+                Some(&node.id),
+                None,
+                format!(
+                    "{} transient error; backoff {backoff_ms}ms then retry",
+                    node.data.label
+                ),
+                json!({
+                    "attempt": attempt,
+                    "error": error,
+                    "backoffMs": backoff_ms,
+                }),
+            );
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                std::thread::sleep(Duration::from_millis(backoff_ms));
+            })
+            .await;
+            false
+        }
+        RetryAction::RetryContractRepair { new_extra } => {
+            *contract_repair_used = true;
+            *effective_extra = new_extra;
+            emit_event(
+                context,
+                "retry.contract_repair",
+                "warning",
+                Some(&node.id),
+                None,
+                format!(
+                    "{} contract/schema failure; one repair retry",
+                    node.data.label
+                ),
+                json!({ "attempt": attempt, "error": error }),
+            );
+            false
+        }
+    }
 }
 
 async fn execute_specialist_with_revision(
@@ -927,7 +1822,7 @@ async fn execute_specialist_with_revision(
     let mut reason = if output.status == "needs_revision" {
         Some(output.summary.clone())
     } else {
-        required_criteria_failure(&node.data.completion_criteria, &output)
+        required_criteria_failure(&node.data.completion_criteria, &output, context)
     };
     let Some(edge) = revision_edge else {
         if let Some(reason) = reason {
@@ -988,7 +1883,7 @@ async fn execute_specialist_with_revision(
         reason = if output.status == "needs_revision" {
             Some(output.summary.clone())
         } else {
-            required_criteria_failure(&node.data.completion_criteria, &output)
+            required_criteria_failure(&node.data.completion_criteria, &output, context)
         };
     }
     Err(format!(
@@ -1007,16 +1902,24 @@ async fn approval_node(context: &RunContext, node: &RuntimeNode) -> Result<Runti
         .lock()
         .map_err(|_| "run approval broker lock poisoned".to_string())?
         .insert(request_id.clone(), sender);
-    let _ = context.app.emit(
-        "workflow-run-approval",
-        RunApprovalEvent {
-            run_id: context.run_id.clone(),
-            request_id: request_id.clone(),
-            node_id: node.id.clone(),
-            title: node.data.label.clone(),
-            detail: "Review the completed required work before releasing delivery.".into(),
-        },
-    );
+    if let Some(app) = &context.app {
+        let _ = app.emit(
+            "workflow-run-approval",
+            RunApprovalEvent {
+                run_id: context.run_id.clone(),
+                request_id: request_id.clone(),
+                node_id: node.id.clone(),
+                title: node.data.label.clone(),
+                detail: "Review the completed required work before releasing delivery.".into(),
+            },
+        );
+    } else {
+        // Headless / MCP: no UI event bus — surface requestId for operators and tools.
+        eprintln!(
+            "[codex-corp] run approval pending requestId={} runId={} nodeId={} (list_pending_run_approvals / respond_run_approval)",
+            request_id, context.run_id, node.id
+        );
+    }
     emit_event(
         context,
         "approval.requested",
@@ -1027,13 +1930,13 @@ async fn approval_node(context: &RunContext, node: &RuntimeNode) -> Result<Runti
         json!({"requestId":request_id}),
     );
     update_run_status(
-        &context.app,
+        &context.database,
         &context.run_id,
         "waiting_approval",
         None,
         true,
     );
-    if let Ok(connection) = context.app.state::<Database>().0.lock() {
+    if let Ok(connection) = context.database.0.lock() {
         let _ = connection.execute(
             "INSERT OR REPLACE INTO approvals(id,run_id,node_id,request_json,decision) VALUES(?1,?2,?3,?4,NULL)",
             params![request_id,context.run_id,node.id,json!({"title":node.data.label,"detail":"Review required work before release"}).to_string()],
@@ -1059,9 +1962,9 @@ async fn approval_node(context: &RunContext, node: &RuntimeNode) -> Result<Runti
         .ok()
         .and_then(|mut pending| pending.remove(&request_id));
     let decision = decision_result?;
-    update_run_status(&context.app, &context.run_id, "running", None, true);
+    update_run_status(&context.database, &context.run_id, "running", None, true);
     if !decision {
-        if let Ok(connection) = context.app.state::<Database>().0.lock() {
+        if let Ok(connection) = context.database.0.lock() {
             let _ = connection.execute(
                 "UPDATE approvals SET decision='declined' WHERE id=?1",
                 params![request_id],
@@ -1069,16 +1972,34 @@ async fn approval_node(context: &RunContext, node: &RuntimeNode) -> Result<Runti
         }
         return Err("operator declined the approval gate".into());
     }
-    if let Ok(connection) = context.app.state::<Database>().0.lock() {
+    if let Ok(connection) = context.database.0.lock() {
         let _ = connection.execute(
             "UPDATE approvals SET decision='approved' WHERE id=?1",
             params![request_id],
         );
     }
+    // Freeze approved artifact (key,hash) pairs onto approval output only.
+    // Cannot re-derive from artifacts table after revision DELETE+reinsert.
+    let outputs_snapshot = context
+        .outputs
+        .lock()
+        .map_err(|_| "outputs lock poisoned".to_string())?;
+    let mut kind_artifacts: HashMap<String, (String, Vec<Value>)> = HashMap::new();
+    for node_ref in &context.graph.nodes {
+        if let Some(out) = outputs_snapshot.get(&node_ref.id) {
+            kind_artifacts.insert(
+                node_ref.id.clone(),
+                (node_ref.data.kind.clone(), out.artifacts.clone()),
+            );
+        }
+    }
+    let refs = collect_upstream_artifacts(&kind_artifacts);
+    let approved_at = chrono_like_now_iso();
+    let freeze = freeze_approval_snapshot(&request_id, &approved_at, &refs);
     Ok(RuntimeOutput {
         status: "success".into(),
         summary: "Human release approval recorded.".into(),
-        data: json!({"decision":"approved","explicitHuman":true}),
+        data: freeze,
         artifacts: Vec::new(),
         thread_id: None,
         turn_id: None,
@@ -1109,6 +2030,67 @@ fn wait_for_approval(
             }
         }
     }
+}
+
+fn chrono_like_now_iso() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("unix={secs}")
+}
+
+/// Conditional residual risks (plan III.12 / invariant #9) — only emit when applicable.
+fn collect_residual_risks(
+    graph: &RuntimeGraph,
+    outputs: &HashMap<String, RuntimeOutput>,
+    approved: &[ApprovedArtifact],
+) -> Vec<String> {
+    let mut risks = Vec::new();
+    let mut used_authored_base = false;
+    let mut had_claim_criterion = false;
+    for node in &graph.nodes {
+        if node.data.kind != "agent" && node.data.kind != "creative" {
+            continue;
+        }
+        if !node.data.base_instructions.trim().is_empty() {
+            used_authored_base = true;
+        }
+        if node
+            .data
+            .completion_criteria
+            .iter()
+            .any(|c| c.kind == "claim" || c.kind == "custom")
+        {
+            had_claim_criterion = true;
+        }
+    }
+    if used_authored_base {
+        risks.push("authored_base_not_native_codex_base".into());
+    }
+    if had_claim_criterion {
+        risks.push("claim_criteria_are_advisory_only".into());
+    }
+    if approved.is_empty() {
+        risks.push("empty_approval_artifact_set".into());
+    }
+    // Surface architecture residual risks from verification payloads when present.
+    for output in outputs.values() {
+        if let Some(arr) = output
+            .data
+            .pointer("/verification/residualRisks")
+            .and_then(Value::as_array)
+        {
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    if !risks.iter().any(|r| r == s) {
+                        risks.push(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    risks
 }
 
 async fn execute_node(context: &RunContext, node: &RuntimeNode) -> Result<RuntimeOutput, String> {
@@ -1166,11 +2148,37 @@ async fn execute_node(context: &RunContext, node: &RuntimeNode) -> Result<Runtim
                 .outputs
                 .lock()
                 .map_err(|_| "outputs lock poisoned".to_string())?;
-            let approved = outputs.values().any(|output| {
+            let approval_output = outputs.values().find(|output| {
                 output.data.get("decision").and_then(Value::as_str) == Some("approved")
             });
-            if !approved {
-                return Err("delivery requires an explicit approved gate".into());
+            let approval_output = match approval_output {
+                Some(output) => output,
+                None => return Err("delivery requires an explicit approved gate".into()),
+            };
+            // Fail closed if any completed specialist lacks host verification SSOT.
+            require_specialist_verification_blocks(&context.graph, &outputs)?;
+            // Frozen snapshot only — never rebuild from artifacts table.
+            let approved_artifacts: Vec<ApprovedArtifact> = approval_output
+                .data
+                .get("approvedArtifacts")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default();
+            let mut kind_artifacts: HashMap<String, (String, Vec<Value>)> = HashMap::new();
+            for node_ref in &context.graph.nodes {
+                if let Some(out) = outputs.get(&node_ref.id) {
+                    kind_artifacts.insert(
+                        node_ref.id.clone(),
+                        (node_ref.data.kind.clone(), out.artifacts.clone()),
+                    );
+                }
+            }
+            let live_refs = collect_upstream_artifacts(&kind_artifacts);
+            match delivery_pair_compare(&approved_artifacts, &live_refs) {
+                DeliveryCompareResult::Pass => {}
+                DeliveryCompareResult::Fail(reason) => {
+                    return Err(format!("delivery pair-compare failed: {reason}"));
+                }
             }
             let handoffs: Vec<Value> = outputs
                 .iter()
@@ -1182,18 +2190,32 @@ async fn execute_node(context: &RunContext, node: &RuntimeNode) -> Result<Runtim
                 .values()
                 .find_map(|output| output.data.get("verdict").and_then(Value::as_str))
                 .unwrap_or("unknown");
-            let bundle = json!({
-                "schemaVersion":"codex-corp.delivery.v2",
+            let verification_summary = collect_verification_summary(&outputs);
+            let residual_risks =
+                collect_residual_risks(&context.graph, &outputs, &approved_artifacts);
+            let mut bundle = json!({
+                "schemaVersion":"codex-corp.delivery.v3",
                 "mode":"live",
                 "status":"success",
                 "review":{"outcome":review},
                 "specialistHandoffs":handoffs,
-                "safety":{"approval":"explicit-human","chainOfThought":"not-exposed"}
+                "approvedArtifacts": approved_artifacts,
+                "liveArtifactRefs": live_refs,
+                "verificationSummary": verification_summary,
+                "residualRisks": residual_risks,
+                "safety":{"approval":"explicit-human","chainOfThought":"not-exposed","passBitOwner":"runtime"}
             });
+            // Canonical self-hash of the bundle without the self-hash field.
+            let canonical = serde_json::to_string(&bundle).unwrap_or_default();
+            if let Some(obj) = bundle.as_object_mut() {
+                obj.insert(
+                    "bundleHash".into(),
+                    json!(crate::verifier::types::content_hash_for(&canonical)),
+                );
+            }
             Ok(RuntimeOutput {
                 status: "success".into(),
-                summary: "Approved delivery bundle assembled from completed specialist handoffs."
-                    .into(),
+                summary: "Approved delivery bundle assembled with pair-verified artifacts.".into(),
                 data: bundle.clone(),
                 artifacts: vec![
                     json!({"id":"delivery-bundle","name":"delivery-bundle.json","kind":"json","content":serde_json::to_string_pretty(&bundle).unwrap_or_default()}),
@@ -1212,7 +2234,7 @@ fn persist_node_output(
     node_id: &str,
     output: &RuntimeOutput,
 ) -> Result<(), String> {
-    let database = context.app.state::<Database>();
+    let database = &context.database;
     let mut connection = database
         .0
         .lock()
@@ -1250,14 +2272,28 @@ fn persist_node_output_to_connection(
             .get("id")
             .and_then(Value::as_str)
             .unwrap_or("artifact");
+        let content = artifact
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let content_hash = resolve_artifact_content_hash(
+            artifact.get("contentHash").and_then(Value::as_str),
+            content,
+        );
+        let byte_length = content.len() as i64;
+        // v1: artifacts remain inline in metadata_json; storage_path reserved for on-disk.
+        let storage_path: Option<String> = None;
         transaction
             .execute(
-                "INSERT INTO artifacts(id,run_id,node_id,metadata_json) VALUES(?1,?2,?3,?4)",
+                "INSERT INTO artifacts(id,run_id,node_id,metadata_json,content_hash,byte_length,storage_path) VALUES(?1,?2,?3,?4,?5,?6,?7)",
                 params![
                     format!("{run_id}:{node_id}:{index}:{raw_id}"),
                     run_id,
                     node_id,
-                    artifact.to_string()
+                    artifact.to_string(),
+                    content_hash,
+                    byte_length,
+                    storage_path
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -1355,7 +2391,7 @@ async fn run_worker(
     resume_checkpoint: Option<RunCheckpoint>,
     runtime: WorkflowRuntime,
 ) {
-    update_run_status(&context.app, &context.run_id, "running", None, false);
+    update_run_status(&context.database, &context.run_id, "running", None, false);
     emit_event(
         &context,
         "run.started",
@@ -1559,14 +2595,14 @@ async fn run_worker(
         ("completed", None, false)
     };
     update_run_status(
-        &context.app,
+        &context.database,
         &context.run_id,
         status,
         reason.as_deref(),
         resumable,
     );
     if status != "completed" {
-        if let Ok(connection) = context.app.state::<Database>().0.lock() {
+        if let Ok(connection) = context.database.0.lock() {
             let _ = connection.execute(
                 "DELETE FROM artifacts WHERE run_id=?1 AND json_extract(metadata_json,'$.name')='delivery-bundle.json'",
                 params![context.run_id],
@@ -1595,7 +2631,7 @@ async fn run_worker(
     if let Ok(mut active) = runtime.active.lock() {
         active.remove(&context.run_id);
     }
-    if let Ok(mut connection) = context.app.state::<Database>().0.lock() {
+    if let Ok(mut connection) = context.database.0.lock() {
         if let Ok(settings) = app_settings::load(&connection) {
             let _ = app_settings::cleanup(&mut connection, &settings);
         }
@@ -1615,7 +2651,7 @@ fn checkpoint(context: &RunContext, completed: &HashSet<String>, skipped: &HashS
         outputs,
     })
     .unwrap_or_else(|_| "{}".into());
-    if let Ok(connection) = context.app.state::<Database>().0.lock() {
+    if let Ok(connection) = context.database.0.lock() {
         let _ = connection.execute(
             "INSERT INTO run_checkpoints(run_id,checkpoint_json,resumable,updated_at) VALUES(?1,?2,1,CURRENT_TIMESTAMP)
              ON CONFLICT(run_id) DO UPDATE SET checkpoint_json=excluded.checkpoint_json,resumable=1,updated_at=CURRENT_TIMESTAMP",
@@ -1625,13 +2661,13 @@ fn checkpoint(context: &RunContext, completed: &HashSet<String>, skipped: &HashS
 }
 
 fn update_run_status(
-    app: &tauri::AppHandle,
+    database: &Database,
     run_id: &str,
     status: &str,
     reason: Option<&str>,
     resumable: bool,
 ) {
-    if let Ok(connection) = app.state::<Database>().0.lock() {
+    if let Ok(connection) = database.0.lock() {
         let _ = connection.execute(
             "UPDATE runs SET status=?2,terminal_reason=?3,resumable=?4 WHERE id=?1",
             params![run_id, status, reason, resumable as i32],
@@ -1657,18 +2693,27 @@ fn kill_run_processes(process_broker: &ProcessBroker, run_id: &str) {
     }
 }
 
-#[tauri::command]
-#[allow(clippy::too_many_arguments)] // Tauri injects command state as individual parameters.
-pub(crate) async fn start_run(
+/// True when any enabled criterion would perform host filesystem / process I/O.
+fn graph_has_enabled_host_io_criteria(graph: &RuntimeGraph) -> bool {
+    graph.nodes.iter().any(|node| {
+        node.data.completion_criteria.iter().any(|criterion| {
+            criterion.enabled && crate::verifier::kind_requires_workspace(criterion.kind.as_str())
+        })
+    })
+}
+
+/// Shared start path for desktop (Some(app)) and headless/MCP (None).
+#[allow(clippy::too_many_arguments)]
+async fn start_run_core(
     workflow_id: String,
     start_node_id: Option<String>,
     workspace_path: Option<String>,
-    app: tauri::AppHandle,
-    runtime: tauri::State<'_, WorkflowRuntime>,
-    run_approvals: tauri::State<'_, RunApprovalBroker>,
-    approval_broker: tauri::State<'_, ApprovalBroker>,
-    process_broker: tauri::State<'_, ProcessBroker>,
-    database: tauri::State<'_, Database>,
+    app: Option<tauri::AppHandle>,
+    database: Database,
+    runtime: WorkflowRuntime,
+    run_approvals: RunApprovalBroker,
+    approval_broker: ApprovalBroker,
+    process_broker: ProcessBroker,
 ) -> Result<NativeRunRecord, String> {
     let graph_json: String = {
         let connection = database
@@ -1699,6 +2744,12 @@ pub(crate) async fn start_run(
             return Err("Selected app workspace is not a folder".into());
         }
     }
+    if target_workspace.is_none() && graph_has_enabled_host_io_criteria(&graph) {
+        return Err(
+            "workspacePath is required when the workflow has enabled command or architecture_policy criteria"
+                .into(),
+        );
+    }
     if let Some(start) = &start_node_id {
         if !graph.nodes.iter().any(|node| &node.id == start) {
             return Err("start node does not exist".into());
@@ -1722,16 +2773,17 @@ pub(crate) async fn start_run(
     let stop = Arc::new(AtomicBool::new(false));
     let context = RunContext {
         run_id: run_id.clone(),
-        app: app.clone(),
+        app,
+        database: database.clone(),
         graph,
         outputs: Arc::new(Mutex::new(HashMap::new())),
         node_tokens: Arc::new(Mutex::new(HashMap::new())),
         stop: stop.clone(),
         sequence: Arc::new(AtomicU64::new(0)),
         limiter: runtime.limiter.clone(),
-        approval_broker: approval_broker.inner().clone(),
-        process_broker: process_broker.inner().clone(),
-        run_approvals: run_approvals.inner().clone(),
+        approval_broker,
+        process_broker,
+        run_approvals,
         target_workspace,
     };
     runtime
@@ -1746,12 +2798,92 @@ pub(crate) async fn start_run(
                 stop,
             },
         );
-    let runtime_owned = runtime.inner().clone();
+    let runtime_owned = runtime.clone();
     let workflow_owned = workflow_id.clone();
     tauri::async_runtime::spawn(async move {
         run_worker(context, workflow_owned, start_node_id, None, runtime_owned).await;
     });
-    get_run(run_id, database)
+    get_run_record(&database, &run_id)
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri injects command state as individual parameters.
+pub(crate) async fn start_run(
+    workflow_id: String,
+    start_node_id: Option<String>,
+    workspace_path: Option<String>,
+    app: tauri::AppHandle,
+    runtime: tauri::State<'_, WorkflowRuntime>,
+    run_approvals: tauri::State<'_, RunApprovalBroker>,
+    approval_broker: tauri::State<'_, ApprovalBroker>,
+    process_broker: tauri::State<'_, ProcessBroker>,
+    database: tauri::State<'_, Database>,
+) -> Result<NativeRunRecord, String> {
+    start_run_core(
+        workflow_id,
+        start_node_id,
+        workspace_path,
+        Some(app),
+        database.inner().clone(),
+        runtime.inner().clone(),
+        run_approvals.inner().clone(),
+        approval_broker.inner().clone(),
+        process_broker.inner().clone(),
+    )
+    .await
+}
+
+/// Headless / MCP entry: same workflow runtime without a desktop AppHandle.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn start_run_headless(
+    workflow_id: String,
+    start_node_id: Option<String>,
+    workspace_path: Option<String>,
+    database: Database,
+    runtime: WorkflowRuntime,
+    run_approvals: RunApprovalBroker,
+    approval_broker: ApprovalBroker,
+    process_broker: ProcessBroker,
+) -> Result<NativeRunRecord, String> {
+    start_run_core(
+        workflow_id,
+        start_node_id,
+        workspace_path,
+        None,
+        database,
+        runtime,
+        run_approvals,
+        approval_broker,
+        process_broker,
+    )
+    .await
+}
+
+fn get_run_record(database: &Database, run_id: &str) -> Result<NativeRunRecord, String> {
+    let connection = database
+        .0
+        .lock()
+        .map_err(|_| "database lock poisoned".to_string())?;
+    connection
+        .query_row(
+            "SELECT id,workflow_id,status,created_at,terminal_reason,resumable,pinned,last_event_seq,nodes_json,edges_json FROM runs WHERE id=?1",
+            params![run_id],
+            |row| {
+                Ok(NativeRunRecord {
+                    id: row.get(0)?,
+                    workflow_id: row.get(1)?,
+                    status: row.get(2)?,
+                    created_at: row.get(3)?,
+                    terminal_reason: row.get(4)?,
+                    resumable: row.get::<_, i64>(5)? != 0,
+                    pinned: row.get::<_, i64>(6)? != 0,
+                    last_event_sequence: row.get::<_, i64>(7)? as u64,
+                    nodes_json: row.get(8)?,
+                    edges_json: row.get(9)?,
+                })
+            },
+        )
+        .map_err(|_| "run not found".into())
 }
 
 #[tauri::command]
@@ -1885,7 +3017,8 @@ pub(crate) async fn resume_run(
     let stop = Arc::new(AtomicBool::new(false));
     let context = RunContext {
         run_id: run_id.clone(),
-        app: app.clone(),
+        app: Some(app.clone()),
+        database: database.inner().clone(),
         graph,
         outputs: Arc::new(Mutex::new(HashMap::new())),
         node_tokens: Arc::new(Mutex::new(node_tokens)),
@@ -1960,7 +3093,7 @@ fn cron_field_matches(value: u32, field: &str, min: u32, max: u32) -> bool {
             && start <= end
             && value >= start
             && value <= end
-            && (value - start) % step == 0
+            && (value - start).is_multiple_of(step)
     })
 }
 
@@ -2114,24 +3247,33 @@ fn start_scheduler(app: tauri::AppHandle) {
         });
 }
 
-pub(crate) fn initialize(app: &tauri::AppHandle) {
-    if let Ok(mut connection) = app.state::<Database>().0.lock() {
-        let _ = connection.execute(
-            "UPDATE runs SET status='interrupted',resumable=1,terminal_reason='application restarted during run' WHERE status IN ('queued','running','waiting_approval')",
-            [],
-        );
-        let _ = connection.execute(
-            "UPDATE node_attempts SET status='interrupted',completed_at=CURRENT_TIMESTAMP WHERE status IN ('queued','running','waiting_approval')",
-            [],
-        );
-        if let Ok(settings) = app_settings::load(&connection) {
-            let _ = app_settings::cleanup(&mut connection, &settings);
-        }
-        let _ = connection.execute(
-            "DELETE FROM schedule_firings WHERE fired_at < datetime('now','-90 days')",
-            [],
-        );
+/// Mark in-flight runs as interrupted and apply retention cleanup.
+/// Shared by desktop `initialize` and headless `McpHost::headless` (no cron).
+pub(crate) fn recover_interrupted_runs(database: &Database) -> Result<(), String> {
+    let mut connection = database
+        .0
+        .lock()
+        .map_err(|_| "database lock poisoned".to_string())?;
+    let _ = connection.execute(
+        "UPDATE runs SET status='interrupted',resumable=1,terminal_reason='application restarted during run' WHERE status IN ('queued','running','waiting_approval')",
+        [],
+    );
+    let _ = connection.execute(
+        "UPDATE node_attempts SET status='interrupted',completed_at=CURRENT_TIMESTAMP WHERE status IN ('queued','running','waiting_approval')",
+        [],
+    );
+    if let Ok(settings) = app_settings::load(&connection) {
+        let _ = app_settings::cleanup(&mut connection, &settings);
     }
+    let _ = connection.execute(
+        "DELETE FROM schedule_firings WHERE fired_at < datetime('now','-90 days')",
+        [],
+    );
+    Ok(())
+}
+
+pub(crate) fn initialize(app: &tauri::AppHandle) {
+    let _ = recover_interrupted_runs(app.state::<Database>().inner());
     start_scheduler(app.clone());
 }
 
@@ -2203,6 +3345,8 @@ mod tests {
                 collaboration_mode: None,
                 personality: None,
                 prompt: String::new(),
+                base_instructions: String::new(),
+                developer_instructions: String::new(),
                 output: None,
                 completion_criteria: Vec::new(),
                 max_retries: 0,
@@ -2261,6 +3405,8 @@ mod tests {
                 collaboration_mode: Some("default".into()),
                 personality: Some("pragmatic".into()),
                 prompt: String::new(),
+                base_instructions: String::new(),
+                developer_instructions: String::new(),
                 output: None,
                 completion_criteria: Vec::new(),
                 max_retries: 0,
@@ -2282,6 +3428,754 @@ mod tests {
         let prompt = connector_capability_instructions(&node);
         assert!(prompt.contains("imagegen"));
         assert!(prompt.contains("figma.generate_asset"));
+    }
+
+    #[test]
+    fn legacy_custom_kind_loads_as_claim() {
+        let raw =
+            r#"{"id":"c1","label":"Old","kind":"custom","enabled":true,"enforcement":"advisory"}"#;
+        let criterion: RuntimeCriterion = serde_json::from_str(raw).unwrap();
+        assert_eq!(criterion.kind, "claim");
+        // Shared normalize_kind also trims aliases.
+        let padded = r#"{"id":"c2","label":"Pad","kind":"  custom  ","enabled":true,"enforcement":"advisory"}"#;
+        let criterion: RuntimeCriterion = serde_json::from_str(padded).unwrap();
+        assert_eq!(criterion.kind, "claim");
+    }
+
+    fn sample_claim_criterion(enforcement: &str) -> RuntimeCriterion {
+        RuntimeCriterion {
+            id: "c1".into(),
+            label: "Claim".into(),
+            kind: "claim".into(),
+            enabled: true,
+            platform: false,
+            enforcement: enforcement.into(),
+            instruction: None,
+            template_id: None,
+            artifact_name: None,
+            artifact_path: None,
+            policy_id: None,
+        }
+    }
+
+    fn sample_output(status: &str, summary: &str, data: Value) -> RuntimeOutput {
+        RuntimeOutput {
+            status: status.into(),
+            summary: summary.into(),
+            data,
+            artifacts: Vec::new(),
+            thread_id: None,
+            turn_id: None,
+            tokens: 0,
+        }
+    }
+
+    #[test]
+    fn producer_passed_true_ignored_for_claim() {
+        let criterion = sample_claim_criterion("advisory");
+        let output = sample_output(
+            "success",
+            "done with enough words for summary",
+            json!({"criteria":[{"id":"c1","passed":true}]}),
+        );
+        // Real evaluation path: passed:true without evidence text still fails.
+        let eval = evaluate_claim_criterion(&criterion, &output, false);
+        assert!(eval.failed, "{}", eval.detail);
+        assert!(eval.detail.contains("no claim evidence"));
+    }
+
+    #[test]
+    fn advisory_claim_fails_on_not_satisfied() {
+        let criterion = sample_claim_criterion("advisory");
+        let output = sample_output(
+            "success",
+            "done with enough words for summary",
+            json!({"criteria":[{"id":"c1","claim":"not_satisfied","evidence":"still broken"}]}),
+        );
+        let eval = evaluate_claim_criterion(&criterion, &output, false);
+        assert!(eval.failed, "{}", eval.detail);
+    }
+
+    #[test]
+    fn advisory_claim_passes_with_evidence_and_satisfied() {
+        let criterion = sample_claim_criterion("advisory");
+        let output = sample_output(
+            "success",
+            "done with enough words for summary",
+            json!({"criteria":[{"id":"c1","claim":"satisfied","evidence":"screenshots attached"}]}),
+        );
+        let eval = evaluate_claim_criterion(&criterion, &output, false);
+        assert!(!eval.failed, "{}", eval.detail);
+    }
+
+    #[test]
+    fn required_claim_always_fails() {
+        let criterion = sample_claim_criterion("required");
+        let output = sample_output(
+            "success",
+            "done with enough words for summary",
+            json!({"criteria":[{"id":"c1","claim":"satisfied","evidence":"ok"}]}),
+        );
+        let eval = evaluate_claim_criterion(&criterion, &output, true);
+        assert!(eval.failed);
+    }
+
+    #[test]
+    fn structured_json_requires_status_enum() {
+        let ok = sample_output("success", "shipped feature", json!({}));
+        assert!(!evaluate_structured_json(&ok).failed);
+
+        let empty_status = sample_output("", "shipped feature", json!({}));
+        assert!(evaluate_structured_json(&empty_status).failed);
+
+        let bad_status = sample_output("done", "shipped feature", json!({}));
+        assert!(evaluate_structured_json(&bad_status).failed);
+
+        let empty_summary = sample_output("success", "  ", json!({}));
+        assert!(evaluate_structured_json(&empty_summary).failed);
+    }
+
+    #[test]
+    fn delivery_accepts_matching_pairs() {
+        use crate::verifier::{
+            delivery_pair_compare, ApprovedArtifact, ArtifactRef, DeliveryCompareResult,
+        };
+        let approved = vec![ApprovedArtifact {
+            artifact_key: "builder::0::a.ts".into(),
+            content_hash: "h1".into(),
+            source_node_id: "builder".into(),
+            name: "a.ts".into(),
+            host_ordinal: 0,
+        }];
+        let live = vec![ArtifactRef {
+            artifact_key: "builder::0::a.ts".into(),
+            content_hash: "h1".into(),
+            source_node_id: "builder".into(),
+            name: "a.ts".into(),
+            host_ordinal: 0,
+        }];
+        assert_eq!(
+            delivery_pair_compare(&approved, &live),
+            DeliveryCompareResult::Pass
+        );
+    }
+
+    #[test]
+    fn retry_error_classifies_transient_contract_fatal() {
+        assert_eq!(
+            classify_retry_error("connection reset by peer"),
+            RetryErrorClass::Transient
+        );
+        assert_eq!(
+            classify_retry_error("request timed out after 120s"),
+            RetryErrorClass::Transient
+        );
+        assert_eq!(
+            classify_retry_error("rate limit exceeded"),
+            RetryErrorClass::Transient
+        );
+        assert_eq!(
+            classify_retry_error("HTTP 429 from upstream"),
+            RetryErrorClass::Transient
+        );
+        assert_eq!(
+            classify_retry_error("failed to parse structured output JSON"),
+            RetryErrorClass::Contract
+        );
+        assert_eq!(
+            classify_retry_error("schema validation failed: missing field"),
+            RetryErrorClass::Contract
+        );
+        assert_eq!(
+            classify_retry_error("operator declined the approval gate"),
+            RetryErrorClass::Fatal
+        );
+        // Broad false-positive guards: bare substrings no longer match.
+        assert_eq!(
+            classify_retry_error("returned business json payload ok"),
+            RetryErrorClass::Fatal
+        );
+        assert_eq!(
+            classify_retry_error("ticket id 42901 closed"),
+            RetryErrorClass::Fatal
+        );
+    }
+
+    #[test]
+    fn next_retry_action_transient_does_not_plateau_on_empty_hash_sets() {
+        // Two identical timeout Errs with empty artifact sets must keep retrying
+        // (max_retries=2 → attempt 0 and 1 retry; attempt 2 is last).
+        let empty = artifact_hash_set_key(&[]);
+        let fps = vec!["fp-same".into(), "fp-same".into()];
+        let arts = vec![empty.clone(), empty.clone()];
+        // After attempt 1 with room to retry: still transient, not plateau.
+        let action =
+            next_retry_action("request timed out after 120s", 1, 2, &fps, &arts, false, "");
+        match action {
+            RetryAction::RetryTransient { backoff_ms } => assert!(backoff_ms >= 200),
+            other => panic!("expected RetryTransient, got {other:?}"),
+        }
+        // Attempt at max: stop with MaxRetries.
+        assert_eq!(
+            next_retry_action("request timed out", 2, 2, &fps, &arts, false, ""),
+            RetryAction::Stop(RetryStopReason::MaxRetries)
+        );
+    }
+
+    #[test]
+    fn next_retry_action_contract_repair_once_then_stop() {
+        let empty = artifact_hash_set_key(&[]);
+        let fps = vec!["fp0".into()];
+        let arts = vec![empty];
+        let first = next_retry_action(
+            "failed to parse structured output JSON",
+            0,
+            2,
+            &fps,
+            &arts,
+            false,
+            "base",
+        );
+        match first {
+            RetryAction::RetryContractRepair { new_extra } => {
+                assert!(new_extra.contains("CONTRACT REPAIR"));
+                assert!(new_extra.contains("base"));
+            }
+            other => panic!("expected contract repair, got {other:?}"),
+        }
+        let second = next_retry_action(
+            "failed to parse structured output JSON",
+            1,
+            2,
+            &["fp0".into(), "fp1".into()],
+            &[artifact_hash_set_key(&[]), artifact_hash_set_key(&[])],
+            true,
+            "base",
+        );
+        assert_eq!(
+            second,
+            RetryAction::Stop(RetryStopReason::ContractExhausted)
+        );
+    }
+
+    #[test]
+    fn next_retry_action_fatal_stops_immediately() {
+        assert_eq!(
+            next_retry_action(
+                "operator declined the approval gate",
+                0,
+                3,
+                &[],
+                &[],
+                false,
+                ""
+            ),
+            RetryAction::Stop(RetryStopReason::Fatal)
+        );
+    }
+
+    #[test]
+    fn next_retry_action_plateau_for_non_transient_including_empty_sets() {
+        // Transient still never plateaus even with identical empty sets.
+        let empty = artifact_hash_set_key(&[]);
+        assert!(matches!(
+            next_retry_action(
+                "request timed out after 120s",
+                1,
+                3,
+                &["a".into(), "a".into()],
+                &[empty.clone(), empty.clone()],
+                false,
+                ""
+            ),
+            RetryAction::RetryTransient { .. }
+        ));
+        // Non-transient + identical fingerprints + stable hash-set (empty ok) → plateau.
+        assert_eq!(
+            next_retry_action(
+                "operator declined",
+                1,
+                3,
+                &["a".into(), "a".into()],
+                &[empty.clone(), empty],
+                false,
+                ""
+            ),
+            RetryAction::Stop(RetryStopReason::Plateau)
+        );
+        // Non-empty stable artifact sets also plateau for non-transient.
+        let arts = vec![
+            artifact_hash_set_key(&["h1".into()]),
+            artifact_hash_set_key(&["h1".into()]),
+        ];
+        assert_eq!(
+            next_retry_action(
+                "operator declined",
+                1,
+                3,
+                &["a".into(), "a".into()],
+                &arts,
+                false,
+                ""
+            ),
+            RetryAction::Stop(RetryStopReason::Plateau)
+        );
+    }
+
+    #[test]
+    fn attempt_artifact_hash_set_prefers_attempt_then_last_known() {
+        let arts = vec![json!({"name":"a.ts","contentHash":"sha256:abc"})];
+        let from_attempt = attempt_artifact_hash_set(Some(&arts), "stale");
+        assert_eq!(from_attempt, artifact_hash_set_key(&["sha256:abc".into()]));
+        // No attempt artifacts → carry last known.
+        assert_eq!(attempt_artifact_hash_set(None, "prior-key"), "prior-key");
+        // Nothing known → empty key.
+        assert_eq!(
+            attempt_artifact_hash_set(None, ""),
+            artifact_hash_set_key(&[])
+        );
+    }
+
+    #[test]
+    fn slim_attempt_diagnostics_omit_artifact_content() {
+        let output = RuntimeOutput {
+            status: "success".into(),
+            summary: "done".into(),
+            data: json!({
+                "verification": {"results": [{"id": "c1", "passed": true, "detail": "ok"}]},
+                "noise": "drop-me"
+            }),
+            artifacts: vec![json!({
+                "name": "src/app.ts",
+                "contentHash": "sha256:dead",
+                "content": "export const huge = true;".repeat(100),
+                "artifactKey": "b::0::src/app.ts",
+                "hostOrdinal": 0
+            })],
+            thread_id: None,
+            turn_id: None,
+            tokens: 1,
+        };
+        let diag = slim_attempt_completed_diagnostics(10, 1, &output);
+        assert_eq!(diag.get("summary").and_then(Value::as_str), Some("done"));
+        assert!(diag.pointer("/data/verification/results").is_some());
+        assert!(diag.pointer("/data/noise").is_none());
+        let arts = diag.get("artifacts").and_then(Value::as_array).unwrap();
+        assert_eq!(arts.len(), 1);
+        assert!(arts[0].get("content").is_none());
+        assert_eq!(
+            arts[0].get("contentHash").and_then(Value::as_str),
+            Some("sha256:dead")
+        );
+        assert_eq!(
+            arts[0].get("name").and_then(Value::as_str),
+            Some("src/app.ts")
+        );
+    }
+
+    #[test]
+    fn format_retry_stop_error_names_reason() {
+        let msg =
+            format_retry_stop_error("Builder", 2, 2, "timed out", Some(RetryStopReason::Plateau));
+        assert!(msg.contains("plateau"), "{msg}");
+        assert!(!msg.contains("exhausted 2 retries: timed out"));
+        let exhausted = format_retry_stop_error(
+            "Builder",
+            2,
+            3,
+            "timed out",
+            Some(RetryStopReason::MaxRetries),
+        );
+        assert!(exhausted.contains("exhausted 2 retries"), "{exhausted}");
+    }
+
+    #[test]
+    fn collect_verification_summary_excludes_absent_blocks() {
+        // Production helper used by delivery assembly (III.12).
+        let mut outputs = HashMap::new();
+        outputs.insert(
+            "builder".into(),
+            RuntimeOutput {
+                status: "success".into(),
+                summary: "built".into(),
+                data: json!({
+                    "verification": {
+                        "results": [{"id": "structured_json", "passed": true, "detail": "ok"}],
+                        "requiredFailed": [],
+                        "passBitOwner": "runtime"
+                    }
+                }),
+                artifacts: Vec::new(),
+                thread_id: None,
+                turn_id: None,
+                tokens: 0,
+            },
+        );
+        outputs.insert(
+            "qa".into(),
+            RuntimeOutput {
+                status: "success".into(),
+                summary: "checked".into(),
+                data: json!({"note": "no verification"}),
+                artifacts: Vec::new(),
+                thread_id: None,
+                turn_id: None,
+                tokens: 0,
+            },
+        );
+        let summary = collect_verification_summary(&outputs);
+        assert_eq!(summary.len(), 1);
+        assert_eq!(
+            summary[0].get("passBitOwner").and_then(Value::as_str),
+            Some("runtime")
+        );
+    }
+
+    fn sample_run_context(target_workspace: Option<PathBuf>) -> RunContext {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        RunContext {
+            run_id: "run-test".into(),
+            app: None,
+            database: Database(Arc::new(Mutex::new(connection))),
+            graph: RuntimeGraph {
+                nodes: vec![],
+                edges: vec![],
+            },
+            outputs: Arc::new(Mutex::new(HashMap::new())),
+            node_tokens: Arc::new(Mutex::new(HashMap::new())),
+            stop: Arc::new(AtomicBool::new(false)),
+            sequence: Arc::new(AtomicU64::new(0)),
+            limiter: Arc::new(ProcessLimiter::new(1)),
+            approval_broker: ApprovalBroker(Arc::new(Mutex::new(HashMap::new()))),
+            process_broker: ProcessBroker(Arc::new(Mutex::new(HashMap::new()))),
+            run_approvals: RunApprovalBroker::default(),
+            target_workspace,
+        }
+    }
+
+    #[test]
+    fn evaluate_host_io_criteria_fail_closed_without_workspace() {
+        // Belt-and-suspenders: evaluate path never falls back to process CWD.
+        // Command runner must not spawn when workspace is missing.
+        let context = sample_run_context(None);
+        let output = sample_output(
+            "success",
+            "agent claims tests passed with enough words",
+            json!({}),
+        );
+        let command = RuntimeCriterion {
+            id: "npm_test".into(),
+            label: "Unit tests".into(),
+            kind: "command".into(),
+            enabled: true,
+            platform: false,
+            enforcement: "required".into(),
+            instruction: None,
+            template_id: Some("npm_test".into()),
+            artifact_name: None,
+            artifact_path: None,
+            policy_id: None,
+        };
+        let eval = evaluate_criterion(&command, &output, &context);
+        assert!(eval.failed, "{}", eval.detail);
+        assert!(
+            eval.detail.contains("workspacePath is required"),
+            "detail={}",
+            eval.detail
+        );
+        assert_eq!(eval.method, "command");
+
+        let arch = RuntimeCriterion {
+            id: "arch".into(),
+            label: "Native runtime".into(),
+            kind: "architecture_policy".into(),
+            enabled: true,
+            platform: false,
+            enforcement: "required".into(),
+            instruction: None,
+            template_id: None,
+            artifact_name: None,
+            artifact_path: None,
+            policy_id: Some("native_runtime_ownership_v1".into()),
+        };
+        let eval = evaluate_criterion(&arch, &output, &context);
+        assert!(eval.failed, "{}", eval.detail);
+        assert!(
+            eval.detail.contains("workspacePath is required"),
+            "detail={}",
+            eval.detail
+        );
+        assert!(
+            eval.method.starts_with("architecture_policy"),
+            "method={}",
+            eval.method
+        );
+    }
+
+    #[test]
+    fn host_io_criteria_require_workspace_helpers() {
+        assert!(crate::verifier::kind_requires_workspace("command"));
+        assert!(crate::verifier::kind_requires_workspace(
+            "architecture_policy"
+        ));
+        assert!(!crate::verifier::kind_requires_workspace("claim"));
+        assert!(!crate::verifier::kind_requires_workspace("structured_json"));
+
+        let node = |criteria: Vec<RuntimeCriterion>| RuntimeNode {
+            id: "n1".into(),
+            data: RuntimeNodeData {
+                label: "n1".into(),
+                role: "agent".into(),
+                kind: "agent".into(),
+                model: String::new(),
+                effort: default_effort(),
+                tools: Vec::new(),
+                connector_tools: Vec::new(),
+                skills: Vec::new(),
+                active_skill: None,
+                permission_profile: None,
+                collaboration_mode: None,
+                personality: None,
+                prompt: String::new(),
+                base_instructions: String::new(),
+                developer_instructions: String::new(),
+                output: None,
+                completion_criteria: criteria,
+                max_retries: 0,
+                approval_policy: default_approval(),
+                sandbox_profile: default_sandbox(),
+                workspace_policy: default_workspace(),
+                output_schema: None,
+                condition_rule: None,
+                cron_expression: None,
+                cron_timezone: None,
+                cron_enabled: true,
+            },
+        };
+        let command_criterion = RuntimeCriterion {
+            id: "npm_test".into(),
+            label: "Unit tests".into(),
+            kind: "command".into(),
+            enabled: true,
+            platform: false,
+            enforcement: "required".into(),
+            instruction: None,
+            template_id: Some("npm_test".into()),
+            artifact_name: None,
+            artifact_path: None,
+            policy_id: None,
+        };
+        let disabled = RuntimeCriterion {
+            enabled: false,
+            ..command_criterion.clone()
+        };
+        let with_enabled = RuntimeGraph {
+            nodes: vec![node(vec![command_criterion])],
+            edges: vec![],
+        };
+        let with_disabled = RuntimeGraph {
+            nodes: vec![node(vec![disabled])],
+            edges: vec![],
+        };
+        assert!(graph_has_enabled_host_io_criteria(&with_enabled));
+        assert!(!graph_has_enabled_host_io_criteria(&with_disabled));
+    }
+
+    #[test]
+    fn required_criteria_failure_prefers_verification_ssot_without_reeval() {
+        // Gate must use precomputed verification.results (plan III.4) so expensive
+        // command/architecture verifiers are not re-run after the block is built.
+        let criteria = vec![RuntimeCriterion {
+            id: "npm_test".into(),
+            label: "Unit tests".into(),
+            kind: "command".into(),
+            enabled: true,
+            platform: false,
+            enforcement: "required".into(),
+            instruction: None,
+            template_id: Some("npm_test".into()),
+            artifact_name: None,
+            artifact_path: None,
+            policy_id: None,
+        }];
+        let fail_output = RuntimeOutput {
+            status: "success".into(),
+            summary: "done with enough words for a summary".into(),
+            data: json!({
+                "verification": {
+                    "results": [{
+                        "id": "npm_test",
+                        "label": "Unit tests",
+                        "kind": "command",
+                        "passed": false,
+                        "detail": "npm_test exited 1 — simulated",
+                        "method": "command:npm_test",
+                        "enforcement": "required",
+                        "source": "runtime"
+                    }],
+                    "requiredFailed": ["npm_test"],
+                    "passBitOwner": "runtime"
+                }
+            }),
+            artifacts: Vec::new(),
+            thread_id: None,
+            turn_id: None,
+            tokens: 0,
+        };
+        // SSOT path is pure — no RunContext / ProcessCommandRunner needed.
+        assert_eq!(
+            verification_result_row(&fail_output, "npm_test"),
+            Some((false, "npm_test exited 1 — simulated".into()))
+        );
+        // Mirror gate control flow when verification.results is present.
+        let mut message: Option<String> = None;
+        for c in &criteria {
+            if !(c.platform || c.enforcement == "required") {
+                continue;
+            }
+            if let Some((passed, detail)) = verification_result_row(&fail_output, &c.id) {
+                if !passed {
+                    message = Some(format!(
+                        "required completion criterion failed: {} — {}",
+                        c.label, detail
+                    ));
+                }
+            } else {
+                panic!("must not fall through to evaluate_criterion when SSOT row exists");
+            }
+        }
+        let msg = message.expect("should fail from SSOT");
+        assert!(msg.contains("Unit tests"));
+        assert!(msg.contains("npm_test exited 1"));
+
+        let pass_output = RuntimeOutput {
+            data: json!({
+                "verification": {
+                    "results": [{
+                        "id": "npm_test",
+                        "passed": true,
+                        "detail": "npm_test exited 0"
+                    }]
+                }
+            }),
+            ..fail_output
+        };
+        assert_eq!(
+            verification_result_row(&pass_output, "npm_test"),
+            Some((true, "npm_test exited 0".into()))
+        );
+        for c in &criteria {
+            if let Some((passed, _)) = verification_result_row(&pass_output, &c.id) {
+                assert!(passed, "SSOT pass must not trigger required failure");
+            }
+        }
+    }
+
+    #[test]
+    fn delivery_rejects_verification_block_absent_on_specialist() {
+        let graph: RuntimeGraph = serde_json::from_value(json!({
+            "nodes": [
+                {"id":"builder","data":{"label":"Builder","role":"Builder","kind":"agent"}},
+                {"id":"qa","data":{"label":"QA","role":"QA","kind":"agent"}},
+                {"id":"approval","data":{"label":"Approval","role":"Human","kind":"approval"}},
+                {"id":"out","data":{"label":"Out","role":"Out","kind":"output"}}
+            ],
+            "edges": []
+        }))
+        .unwrap();
+        let mut outputs = HashMap::new();
+        outputs.insert(
+            "builder".into(),
+            RuntimeOutput {
+                status: "success".into(),
+                summary: "built with verification".into(),
+                data: json!({
+                    "verification": {
+                        "results": [{"id": "structured_json", "passed": true}],
+                        "passBitOwner": "runtime"
+                    }
+                }),
+                artifacts: Vec::new(),
+                thread_id: None,
+                turn_id: None,
+                tokens: 0,
+            },
+        );
+        // Specialist completed without host verification SSOT — delivery must reject.
+        outputs.insert(
+            "qa".into(),
+            RuntimeOutput {
+                status: "success".into(),
+                summary: "looks good".into(),
+                data: json!({"verdict": "pass"}),
+                artifacts: Vec::new(),
+                thread_id: None,
+                turn_id: None,
+                tokens: 0,
+            },
+        );
+        let err = require_specialist_verification_blocks(&graph, &outputs).unwrap_err();
+        assert!(
+            err.contains("missing data.verification") && err.contains("qa"),
+            "{err}"
+        );
+
+        // With verification present on all specialists, gate passes.
+        outputs.insert(
+            "qa".into(),
+            RuntimeOutput {
+                status: "success".into(),
+                summary: "verified".into(),
+                data: json!({
+                    "verification": {
+                        "results": [{"id": "structured_json", "passed": true}],
+                        "passBitOwner": "runtime"
+                    }
+                }),
+                artifacts: Vec::new(),
+                thread_id: None,
+                turn_id: None,
+                tokens: 0,
+            },
+        );
+        assert!(require_specialist_verification_blocks(&graph, &outputs).is_ok());
+    }
+
+    #[test]
+    fn resolve_artifact_content_hash_backfills_null_or_empty() {
+        let recomputed = resolve_artifact_content_hash(None, "export const x=1");
+        assert!(recomputed.starts_with("sha256:"));
+        assert_eq!(
+            resolve_artifact_content_hash(Some(""), "export const x=1"),
+            recomputed
+        );
+        assert_eq!(
+            resolve_artifact_content_hash(Some("sha256:abc"), "ignored"),
+            "sha256:abc"
+        );
+        // Empty approved hash still fails pair-compare against live recomputed hash.
+        let approved = crate::verifier::ApprovedArtifact {
+            artifact_key: "builder::0::a.ts".into(),
+            content_hash: String::new(),
+            source_node_id: "builder".into(),
+            name: "a.ts".into(),
+            host_ordinal: 0,
+        };
+        let live = crate::verifier::ArtifactRef {
+            artifact_key: "builder::0::a.ts".into(),
+            content_hash: recomputed,
+            source_node_id: "builder".into(),
+            name: "a.ts".into(),
+            host_ordinal: 0,
+        };
+        match crate::verifier::delivery_pair_compare(&[approved], &[live]) {
+            crate::verifier::DeliveryCompareResult::Fail(msg) => {
+                assert!(msg.contains("hash mismatch"))
+            }
+            crate::verifier::DeliveryCompareResult::Pass => {
+                panic!("empty approved hash must not pass")
+            }
+        }
     }
 
     #[test]
@@ -2346,6 +4240,40 @@ mod tests {
             Duration::from_millis(10),
         )
         .unwrap());
+    }
+
+    #[test]
+    fn recover_interrupted_runs_marks_running_as_interrupted() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        crate::initialize_database(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO runs(id,workflow_id,status,events_json,nodes_json,edges_json)
+                 VALUES('run-recovery','wf','running','[]','[]','[]')",
+                [],
+            )
+            .unwrap();
+        // Ensure optional columns used by recovery UPDATE exist (migrated schema).
+        let _ = connection.execute(
+            "UPDATE runs SET resumable=0, terminal_reason=NULL WHERE id='run-recovery'",
+            [],
+        );
+        let database = Database(Arc::new(Mutex::new(connection)));
+        recover_interrupted_runs(&database).unwrap();
+        let connection = database.0.lock().unwrap();
+        let (status, resumable, reason): (String, i64, Option<String>) = connection
+            .query_row(
+                "SELECT status,resumable,terminal_reason FROM runs WHERE id='run-recovery'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "interrupted");
+        assert_eq!(resumable, 1);
+        assert!(reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("application restarted"));
     }
 
     fn persistence_fixture() -> rusqlite::Connection {

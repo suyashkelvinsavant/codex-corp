@@ -1,0 +1,10 @@
+{
+  "id": "self-attestation-blocked",
+  "criterion": { "id": "c1", "kind": "claim", "enforcement": "required" },
+  "producerOutput": {
+    "status": "success",
+    "summary": "Done",
+    "data": { "criteria": [{ "id": "c1", "passed": true, "evidence": "I pinky swear" }] }
+  },
+  "expect": { "requiredFailed": true, "reason": "required claim never owns pass bit" }
+}

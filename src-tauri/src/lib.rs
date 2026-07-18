@@ -21,21 +21,54 @@ use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize};
 mod app_settings;
 mod business_data;
 mod chat_data;
+pub(crate) mod codex_turn;
+pub mod mcp_server;
+mod runtime_ownership;
+mod verifier;
 mod workflow_runtime;
+
+/// Desktop MCP auto-start gate. Default **on** for hackathon continuity.
+/// Opt out with `CODEX_CORP_MCP_AUTO=0` (also accepts `false` / `off` / `no`).
+/// Force on with `CODEX_CORP_MCP_AUTO=1` (also `true` / `on` / `yes`).
+/// Empty / unknown values keep default **on** (same as unset).
+fn mcp_auto_start_enabled() -> bool {
+    parse_mcp_auto_start(std::env::var("CODEX_CORP_MCP_AUTO").ok().as_deref())
+}
+
+/// Pure parse of `CODEX_CORP_MCP_AUTO` (unit-tested; env wiring is thin).
+fn parse_mcp_auto_start(value: Option<&str>) -> bool {
+    match value {
+        None => cfg!(debug_assertions),
+        Some(raw) => {
+            let v = raw.trim().to_ascii_lowercase();
+            // Empty after trim = unset → default on.
+            if v.is_empty() {
+                return cfg!(debug_assertions);
+            }
+            match v.as_str() {
+                "1" | "true" | "on" | "yes" => true,
+                "0" | "false" | "off" | "no" => false,
+                _ => cfg!(debug_assertions),
+            }
+        }
+    }
+}
 
 fn default_agent_output_schema() -> Value {
     serde_json::from_str(include_str!("../../src/shared/agent-output.schema.json"))
         .expect("embedded agent output schema must remain valid JSON")
 }
 
-struct Database(Mutex<Connection>);
+/// Shared SQLite handle. `Arc` so desktop, headless, and the MCP server share one connection pool.
 #[derive(Clone)]
-struct ApprovalBroker(Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>);
+pub(crate) struct Database(pub(crate) Arc<Mutex<Connection>>);
+#[derive(Clone)]
+pub(crate) struct ApprovalBroker(pub(crate) Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>);
 /// Broker for dynamic tool call results (JSON text content from the UI host).
 #[derive(Clone)]
-struct ToolBroker(Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>);
+pub(crate) struct ToolBroker(pub(crate) Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>);
 #[derive(Clone)]
-struct ProcessBroker(Arc<Mutex<HashMap<String, Arc<Mutex<Child>>>>>);
+pub(crate) struct ProcessBroker(pub(crate) Arc<Mutex<HashMap<String, Arc<Mutex<Child>>>>>);
 
 struct ProcessRegistration {
     node_id: String,
@@ -56,7 +89,38 @@ impl Drop for ProcessRegistration {
 }
 
 /// Kill the app-server child without holding the mutex across wait().
-fn kill_app_server_child(child: &Arc<Mutex<Child>>) {
+fn emit_optional<S: Serialize + Clone>(app: &Option<tauri::AppHandle>, event: &str, payload: S) {
+    if let Some(handle) = app {
+        let _ = handle.emit(event, payload);
+    }
+}
+
+/// Unattended Live Codex approval behavior when `app` is `None` (headless MCP).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeadlessCodexApprovalPolicy {
+    AutoAccept,
+    AutoDecline,
+    Wait,
+}
+
+/// Parse a headless approval policy string (pure; used by tests and env wrapper).
+pub(crate) fn parse_headless_codex_approval_policy(raw: &str) -> HeadlessCodexApprovalPolicy {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "auto_decline" | "decline" | "deny" => HeadlessCodexApprovalPolicy::AutoDecline,
+        "wait" | "manual" => HeadlessCodexApprovalPolicy::Wait,
+        "auto_accept" | "accept" => HeadlessCodexApprovalPolicy::AutoAccept,
+        _ => HeadlessCodexApprovalPolicy::AutoDecline,
+    }
+}
+
+/// Parse `CODEX_CORP_HEADLESS_APPROVAL`. Default is `auto_accept` for unattended VMs.
+pub(crate) fn headless_codex_approval_policy() -> HeadlessCodexApprovalPolicy {
+    parse_headless_codex_approval_policy(
+        &std::env::var("CODEX_CORP_HEADLESS_APPROVAL").unwrap_or_default(),
+    )
+}
+
+pub(crate) fn kill_app_server_child(child: &Arc<Mutex<Child>>) {
     if let Ok(mut guard) = child.lock() {
         let _ = guard.kill();
     }
@@ -176,6 +240,51 @@ struct GraphNodeData {
     cron_expression: Option<String>,
     #[serde(default)]
     cron_timezone: Option<String>,
+    #[serde(default)]
+    completion_criteria: Vec<GraphCriterion>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphCriterion {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    label: String,
+    #[serde(default, deserialize_with = "deserialize_graph_criterion_kind")]
+    kind: String,
+    #[serde(default = "default_true_bool")]
+    enabled: bool,
+    #[serde(default)]
+    platform: bool,
+    #[serde(default = "default_required_str")]
+    enforcement: String,
+    #[serde(default)]
+    instruction: Option<String>,
+    #[serde(default)]
+    template_id: Option<String>,
+    #[serde(default)]
+    artifact_name: Option<String>,
+    #[serde(default)]
+    artifact_path: Option<String>,
+    #[serde(default)]
+    policy_id: Option<String>,
+}
+
+fn default_true_bool() -> bool {
+    true
+}
+fn default_required_str() -> String {
+    "required".into()
+}
+
+fn deserialize_graph_criterion_kind<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    Ok(crate::verifier::normalize_kind(&raw))
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,7 +313,7 @@ fn standard_edge() -> String {
 }
 
 /// Pass through trimmed model id (no hardcoded product catalog / name maps).
-fn normalize_model_id(raw: &str) -> String {
+pub(crate) fn normalize_model_id(raw: &str) -> String {
     raw.trim().to_string()
 }
 
@@ -237,7 +346,12 @@ struct AgentRequest {
     role: String,
     model: String,
     effort: String,
-    system_prompt: String,
+    /// Authored harness-like base; empty omits baseInstructions (native Codex base).
+    #[serde(default)]
+    base_instructions: String,
+    /// Role/developer contract (+ connector/criteria composition on specialist path).
+    #[serde(default)]
+    developer_instructions: String,
     user_input: String,
     upstream_outputs: Vec<Value>,
     #[serde(default = "default_approval_policy")]
@@ -289,6 +403,18 @@ fn normalized_personality(value: Option<&str>) -> &'static str {
     }
 }
 
+/// Apply dual instruction surfaces to app-server thread params (omit empty base).
+pub(crate) fn apply_instruction_params(params: &mut Value, base: &str, developer: &str) {
+    let base = base.trim();
+    let developer = developer.trim();
+    if !base.is_empty() {
+        params["baseInstructions"] = json!(base);
+    }
+    if !developer.is_empty() {
+        params["developerInstructions"] = json!(developer);
+    }
+}
+
 fn build_agent_thread_start_params(
     request: &AgentRequest,
     model: &str,
@@ -302,9 +428,13 @@ fn build_agent_thread_start_params(
         "cwd":workspace,
         "approvalPolicy":approval_policy,
         "ephemeral":true,
-        "baseInstructions":request.system_prompt,
         "personality":personality
     });
+    apply_instruction_params(
+        &mut params,
+        &request.base_instructions,
+        &request.developer_instructions,
+    );
     let permission_profile = request
         .permission_profile
         .as_deref()
@@ -448,13 +578,26 @@ fn parse_agent_message(message: &str) -> Result<(String, String, Value, Vec<Valu
     Ok((status, summary, data, artifacts))
 }
 
-fn app_data_dir() -> PathBuf {
+/// App data root for SQLite, workspaces, and MCP PID/status/stop files.
+/// Override with `CODEX_CORP_DATA_DIR` (absolute path preferred).
+pub(crate) fn app_data_dir() -> PathBuf {
+    if let Some(override_dir) = std::env::var_os("CODEX_CORP_DATA_DIR") {
+        let path = PathBuf::from(override_dir);
+        if !path.as_os_str().is_empty() {
+            return path;
+        }
+    }
     dirs::data_local_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("CodexCorp")
 }
 
-fn default_chat_workspace_path() -> PathBuf {
+/// Cooperative stop-file path (shared by lifecycle and headless poll loops).
+pub fn mcp_stop_file_path() -> PathBuf {
+    app_data_dir().join("mcp-server.stop")
+}
+
+pub(crate) fn default_chat_workspace_path() -> PathBuf {
     app_data_dir().join("workspaces").join("company-mediator")
 }
 
@@ -487,13 +630,25 @@ async fn choose_chat_workspace(initial_path: Option<String>) -> Result<Option<St
     .map_err(|error| error.to_string())?
 }
 
-fn open_database() -> Result<Connection, String> {
+pub(crate) fn open_database() -> Result<Connection, String> {
     let directory = app_data_dir();
     std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
     let connection =
         Connection::open(directory.join("codex-corp.sqlite")).map_err(|error| error.to_string())?;
+    // Concurrent desktop + headless may open the same file; fail soft with a wait.
+    connection
+        .pragma_update(None, "journal_mode", "WAL")
+        .map_err(|error| error.to_string())?;
+    connection
+        .busy_timeout(Duration::from_millis(5_000))
+        .map_err(|error| error.to_string())?;
     initialize_database(&connection)?;
     Ok(connection)
+}
+
+/// Shared bootstrap used by desktop, headless, and MCP.
+pub(crate) fn open_shared_database() -> Result<Database, String> {
+    Ok(Database(Arc::new(Mutex::new(open_database()?))))
 }
 
 fn initialize_database(connection: &Connection) -> Result<(), String> {
@@ -548,6 +703,9 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
             run_id TEXT NOT NULL,
             node_id TEXT NOT NULL,
             metadata_json TEXT NOT NULL,
+            content_hash TEXT,
+            byte_length INTEGER,
+            storage_path TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS schedule_firings (
@@ -571,6 +729,11 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
     let _ = connection.execute("ALTER TABLE runs ADD COLUMN workspace_path TEXT", []);
     let _ = connection.execute("ALTER TABLE workflows ADD COLUMN workspace_path TEXT", []);
     let _ = connection.execute("ALTER TABLE workflows ADD COLUMN template_json TEXT", []);
+    // Artifact trust columns (III.5). Pre-migration rows keep NULL hashes and are
+    // excluded from hash-indexed delivery queries until re-run materializes them.
+    let _ = connection.execute("ALTER TABLE artifacts ADD COLUMN content_hash TEXT", []);
+    let _ = connection.execute("ALTER TABLE artifacts ADD COLUMN byte_length INTEGER", []);
+    let _ = connection.execute("ALTER TABLE artifacts ADD COLUMN storage_path TEXT", []);
     app_settings::initialize(connection)?;
     business_data::initialize(connection)?;
     chat_data::initialize(connection)?;
@@ -759,7 +922,7 @@ fn command_for_codex(path: &Path, args: &[&str]) -> Command {
     command
 }
 
-fn codex_app_server() -> Result<Child, String> {
+pub(crate) fn codex_app_server() -> Result<Child, String> {
     let path = active_codex_path();
     // stderr must NOT be piped-and-unread: a full OS pipe buffer deadlocks the
     // app-server after tool work (files written) while it still emits logs.
@@ -785,7 +948,7 @@ fn output_text(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stderr).trim().to_string()
 }
 
-fn send_json(writer: &mut impl Write, value: Value) -> Result<(), String> {
+pub(crate) fn send_json(writer: &mut impl Write, value: Value) -> Result<(), String> {
     // Buffer fully first so a single write_all is used (fails fast on broken pipe).
     let mut bytes = serde_json::to_vec(&value).map_err(|error| error.to_string())?;
     bytes.push(b'\n');
@@ -797,7 +960,7 @@ fn send_json(writer: &mut impl Write, value: Value) -> Result<(), String> {
 
 /// Write JSON-RPC to the app-server with a hard timeout so a stalled stdin
 /// (child not reading while we answer requestApproval) cannot pin execute_agent.
-fn send_json_timed(
+pub(crate) fn send_json_timed(
     stdin: &Arc<Mutex<ChildStdin>>,
     value: Value,
     timeout: Duration,
@@ -1115,6 +1278,105 @@ fn validate_graph(graph: &GraphSnapshot) -> Vec<GraphProblem> {
                 None,
             ));
         }
+        // Criterion kind validation (III.14) — kind aliases via verifier::normalize_kind
+        if node.data.kind == "agent" || node.data.kind == "creative" {
+            for criterion in &node.data.completion_criteria {
+                if !criterion.enabled && !criterion.platform {
+                    continue;
+                }
+                let kind = crate::verifier::normalize_kind(&criterion.kind);
+                let kind = kind.as_str();
+                let required = criterion.platform || criterion.enforcement == "required";
+                if required && kind == "claim" {
+                    problems.push(problem(
+                        format!("criterion-claim-required-{}-{}", node.id, criterion.id),
+                        format!(
+                            "{}: required claim criteria are invalid — use platform/command/artifact_exists/architecture_policy.",
+                            node.data.label
+                        ),
+                        Some(node.id.clone()),
+                        None,
+                    ));
+                }
+                if kind == "command" {
+                    let tid = criterion.template_id.as_deref().unwrap_or("").trim();
+                    if tid.is_empty() || !crate::verifier::is_allowed_template(tid) {
+                        problems.push(problem(
+                            format!("criterion-command-{}-{}", node.id, criterion.id),
+                            format!(
+                                "{}: command criterion needs an allowlisted templateId (npm_test, cargo_test, …).",
+                                node.data.label
+                            ),
+                            Some(node.id.clone()),
+                            None,
+                        ));
+                    } else if tid == "node_script" {
+                        let script = criterion.instruction.as_deref().unwrap_or("").trim();
+                        if script.is_empty()
+                            || std::path::Path::new(script).is_absolute()
+                            || script.contains("..")
+                            || script.starts_with('~')
+                        {
+                            problems.push(problem(
+                                format!("criterion-node-script-{}-{}", node.id, criterion.id),
+                                format!(
+                                    "{}: node_script criterion requires a confined relative instruction path.",
+                                    node.data.label
+                                ),
+                                Some(node.id.clone()),
+                                None,
+                            ));
+                        }
+                    }
+                }
+                if kind == "artifact_exists" {
+                    let has_name = criterion
+                        .artifact_name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .is_some();
+                    let has_path = criterion
+                        .artifact_path
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .is_some();
+                    if !has_name && !has_path {
+                        problems.push(problem(
+                            format!("criterion-artifact-{}-{}", node.id, criterion.id),
+                            format!(
+                                "{}: artifact_exists criterion needs artifactName or artifactPath.",
+                                node.data.label
+                            ),
+                            Some(node.id.clone()),
+                            None,
+                        ));
+                    }
+                }
+                if kind == "architecture_policy" {
+                    let policy = criterion
+                        .policy_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(
+                            crate::verifier::architecture::POLICY_NATIVE_RUNTIME_OWNERSHIP_V1,
+                        );
+                    if policy != crate::verifier::architecture::POLICY_NATIVE_RUNTIME_OWNERSHIP_V1 {
+                        problems.push(problem(
+                            format!("criterion-arch-{}-{}", node.id, criterion.id),
+                            format!(
+                                "{}: unknown architecture policyId: {policy}.",
+                                node.data.label
+                            ),
+                            Some(node.id.clone()),
+                            None,
+                        ));
+                    }
+                }
+            }
+        }
         if node.data.kind == "agent" || node.data.kind == "creative" {
             let selects_write = node
                 .data
@@ -1307,7 +1569,7 @@ fn build_execution_plan(
     })
 }
 
-fn parse_app_server_line(line: &str) -> Result<Value, String> {
+pub(crate) fn parse_app_server_line(line: &str) -> Result<Value, String> {
     serde_json::from_str(line.trim()).map_err(|error| format!("Malformed app-server JSON: {error}"))
 }
 
@@ -1366,8 +1628,18 @@ fn version_supported(value: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Shared Codex CLI probe used by the desktop command, headless CLI, and MCP tools.
+pub(crate) fn discover_codex_info() -> CodexInfo {
+    discover_codex_impl()
+}
+
 #[tauri::command]
 fn discover_codex() -> CodexInfo {
+    // IPC command name remains `discover_codex` for the frontend.
+    discover_codex_impl()
+}
+
+fn discover_codex_impl() -> CodexInfo {
     let version_output = codex_command(&["--version"]);
     let version = version_output.ok().and_then(|output| {
         let text = output_text(&output);
@@ -2033,6 +2305,14 @@ fn respond_mediator_tool(
 struct MediatorTurnRequest {
     model: String,
     effort: String,
+    /// Authored base; empty omits baseInstructions.
+    #[serde(default)]
+    base_instructions: String,
+    /// Role/mediator contract; empty omits developerInstructions.
+    #[serde(default)]
+    developer_instructions: String,
+    /// Legacy single-blob field — treated as base when dual fields are empty.
+    #[serde(default)]
     system_prompt: String,
     input: Vec<Value>,
     #[serde(default)]
@@ -2097,6 +2377,7 @@ async fn execute_mediator_turn(
     let tool_broker = tool_broker.inner().clone();
     let process_broker = process_broker.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let app = Some(app);
         let workspace = request
             .workspace_path
             .as_deref()
@@ -2217,6 +2498,15 @@ async fn execute_mediator_turn(
         } else {
             request.dynamic_tools.clone()
         };
+        // Dual instructions; legacy system_prompt maps to base when dual empty.
+        let mediator_base = if !request.base_instructions.trim().is_empty() {
+            request.base_instructions.as_str()
+        } else if !request.system_prompt.trim().is_empty() {
+            request.system_prompt.as_str()
+        } else {
+            ""
+        };
+        let mediator_developer = request.developer_instructions.as_str();
         let requested_thread = request
             .thread_id
             .as_deref()
@@ -2225,19 +2515,20 @@ async fn execute_mediator_turn(
         let mut resumed = false;
         let mut next_request_id = 2;
         let thread_result = if let Some(thread_id) = requested_thread {
+            let mut resume_params = json!({
+                "threadId": thread_id,
+                "model": model,
+                "cwd": workspace,
+                "approvalPolicy": "never",
+                "sandbox": "read-only",
+                "excludeTurns": true
+            });
+            apply_instruction_params(&mut resume_params, mediator_base, mediator_developer);
             send_json_timed(
                 &stdin,
                 json!({
                     "jsonrpc":"2.0","id":next_request_id,"method":"thread/resume",
-                    "params":{
-                        "threadId": thread_id,
-                        "model": model,
-                        "cwd": workspace,
-                        "approvalPolicy": "never",
-                        "sandbox": "read-only",
-                        "baseInstructions": request.system_prompt,
-                        "excludeTurns": true
-                    }
+                    "params": resume_params
                 }),
                 Duration::from_secs(15),
             )?;
@@ -2247,24 +2538,25 @@ async fn execute_mediator_turn(
                     result
                 }
                 Err(error) => {
-                    let _ = app.emit(
+                    emit_optional(&app,
                         "mediator-thread-recovered",
                         json!({"oldThreadId":thread_id,"reason":error}),
                     );
                     next_request_id += 1;
+                    let mut start_params = json!({
+                        "model": model,
+                        "cwd": workspace,
+                        "approvalPolicy": "never",
+                        "sandbox": "read-only",
+                        "ephemeral": true,
+                        "dynamicTools": tools
+                    });
+                    apply_instruction_params(&mut start_params, mediator_base, mediator_developer);
                     send_json_timed(
                         &stdin,
                         json!({
                             "jsonrpc":"2.0","id":next_request_id,"method":"thread/start",
-                            "params":{
-                                "model": model,
-                                "cwd": workspace,
-                                "approvalPolicy": "never",
-                                "sandbox": "read-only",
-                                "ephemeral": true,
-                                "baseInstructions": request.system_prompt,
-                                "dynamicTools": tools
-                            }
+                            "params": start_params
                         }),
                         Duration::from_secs(15),
                     )?;
@@ -2272,19 +2564,20 @@ async fn execute_mediator_turn(
                 }
             }
         } else {
+            let mut start_params = json!({
+                "model": model,
+                "cwd": workspace,
+                "approvalPolicy": "never",
+                "sandbox": "read-only",
+                "ephemeral": true,
+                "dynamicTools": tools
+            });
+            apply_instruction_params(&mut start_params, mediator_base, mediator_developer);
             send_json_timed(
                 &stdin,
                 json!({
                     "jsonrpc":"2.0","id":next_request_id,"method":"thread/start",
-                    "params":{
-                        "model": model,
-                        "cwd": workspace,
-                        "approvalPolicy": "never",
-                        "sandbox": "read-only",
-                        "ephemeral": true,
-                        "baseInstructions": request.system_prompt,
-                        "dynamicTools": tools
-                    }
+                    "params": start_params
                 }),
                 Duration::from_secs(15),
             )?;
@@ -2391,7 +2684,7 @@ async fn execute_mediator_turn(
                     .lock()
                     .map_err(|_| "tool broker lock poisoned".to_string())?
                     .insert(request_id.clone(), tx);
-                let _ = app.emit(
+                emit_optional(&app,
                     "mediator-tool-call",
                     MediatorToolCallEvent {
                         request_id: request_id.clone(),
@@ -2447,7 +2740,7 @@ async fn execute_mediator_turn(
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 message.push_str(delta);
-                let _ = app.emit(
+                emit_optional(&app,
                     "mediator-chat-delta",
                     MediatorChatDeltaEvent {
                         session_id: session_id.clone(),
@@ -3166,9 +3459,9 @@ fn chrono_like_now() -> String {
     format!("unix={secs}")
 }
 
-async fn execute_agent_internal(
+pub(crate) async fn execute_agent_internal(
     request: AgentRequest,
-    app: tauri::AppHandle,
+    app: Option<tauri::AppHandle>,
     broker: ApprovalBroker,
     process_broker: ProcessBroker,
     token_meter: Arc<std::sync::atomic::AtomicU64>,
@@ -3237,7 +3530,7 @@ async fn execute_agent_internal(
 
                 let read_response = |expected_id: i64,
                                      rx: &mpsc::Receiver<Result<String, String>>,
-                                     app: &tauri::AppHandle,
+                                     app: &Option<tauri::AppHandle>,
                                      node_id: &str,
                                      child: &Arc<Mutex<Child>>|
                  -> Result<Value, String> {
@@ -3259,7 +3552,8 @@ async fn execute_agent_internal(
                                     .and_then(Value::as_str)
                                     .unwrap_or_default();
                                 if !method.is_empty() {
-                                    let _ = app.emit(
+                                    emit_optional(
+                                        app,
                                         "codex-agent-event",
                                         NormalizedAgentEvent {
                                             node_id: node_id.into(),
@@ -3353,7 +3647,8 @@ async fn execute_agent_internal(
                     .and_then(Value::as_str)
                     .ok_or("thread/start response missing thread id")?
                     .to_string();
-                let _ = app.emit(
+                emit_optional(
+                    &app,
                     "codex-agent-event",
                     NormalizedAgentEvent {
                         node_id: request.node_id.clone(),
@@ -3427,7 +3722,8 @@ async fn execute_agent_internal(
                         .min(turn_deadline.saturating_duration_since(std::time::Instant::now()));
                     if idle.is_zero() {
                         kill_app_server_child(&child);
-                        let _ = app.emit(
+                        emit_optional(
+                            &app,
                             "codex-agent-event",
                             NormalizedAgentEvent {
                                 node_id: request.node_id.clone(),
@@ -3450,7 +3746,8 @@ async fn execute_agent_internal(
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {
                             kill_app_server_child(&child);
-                            let _ = app.emit(
+                            emit_optional(
+                                &app,
                                 "codex-agent-event",
                                 NormalizedAgentEvent {
                                     node_id: request.node_id.clone(),
@@ -3483,7 +3780,8 @@ async fn execute_agent_internal(
                         if tokens > total_tokens {
                             total_tokens = tokens;
                             token_meter.fetch_max(tokens, std::sync::atomic::Ordering::SeqCst);
-                            let _ = app.emit(
+                            emit_optional(
+                                &app,
                                 "codex-agent-event",
                                 NormalizedAgentEvent {
                                     node_id: request.node_id.clone(),
@@ -3501,7 +3799,8 @@ async fn execute_agent_internal(
                         {
                             message.push_str(delta);
                         }
-                        let _ = app.emit(
+                        emit_optional(
+                            &app,
                             "codex-agent-event",
                             NormalizedAgentEvent {
                                 node_id: request.node_id.clone(),
@@ -3529,7 +3828,8 @@ async fn execute_agent_internal(
                                 }
                             }
                         }
-                        let _ = app.emit(
+                        emit_optional(
+                            &app,
                             "codex-agent-event",
                             NormalizedAgentEvent {
                                 node_id: request.node_id.clone(),
@@ -3549,8 +3849,11 @@ async fn execute_agent_internal(
                             let broker_request_id = format!("{process_key}::{request_id}");
                             // When the node is configured for unattended policy, accept immediately
                             // so Live Codex turns do not stall waiting for a focused UI click.
+                            // Headless (no AppHandle): CODEX_CORP_HEADLESS_APPROVAL policy applies
+                            // for non-never approval policies (default auto_accept).
                             let decision = if approval_policy == "never" {
-                                let _ = app.emit(
+                                emit_optional(
+                                    &app,
                                     "codex-agent-event",
                                     NormalizedAgentEvent {
                                         node_id: request.node_id.clone(),
@@ -3562,6 +3865,78 @@ async fn execute_agent_internal(
                                     },
                                 );
                                 "accept".to_string()
+                            } else if app.is_none() {
+                                match headless_codex_approval_policy() {
+                                    HeadlessCodexApprovalPolicy::AutoAccept => {
+                                        emit_optional(
+                                            &app,
+                                            "codex-agent-event",
+                                            NormalizedAgentEvent {
+                                                node_id: request.node_id.clone(),
+                                                event_type: "approval.auto_accept".into(),
+                                                message: "Auto-accepted (headless policy)".into(),
+                                                thread_id: Some(thread_id.clone()),
+                                                turn_id: Some(turn_id.clone()),
+                                                tokens: None,
+                                            },
+                                        );
+                                        eprintln!(
+                                            "[codex-corp] requestApproval auto-accepted (headless policy) requestId={broker_request_id}"
+                                        );
+                                        "accept".to_string()
+                                    }
+                                    HeadlessCodexApprovalPolicy::AutoDecline => {
+                                        emit_optional(
+                                            &app,
+                                            "codex-agent-event",
+                                            NormalizedAgentEvent {
+                                                node_id: request.node_id.clone(),
+                                                event_type: "approval.auto_decline".into(),
+                                                message: "Auto-declined (headless policy)".into(),
+                                                thread_id: Some(thread_id.clone()),
+                                                turn_id: Some(turn_id.clone()),
+                                                tokens: None,
+                                            },
+                                        );
+                                        eprintln!(
+                                            "[codex-corp] requestApproval auto-declined (headless policy) requestId={broker_request_id}"
+                                        );
+                                        "decline".to_string()
+                                    }
+                                    HeadlessCodexApprovalPolicy::Wait => {
+                                        let (sender, receiver) = mpsc::channel();
+                                        broker
+                                            .0
+                                            .lock()
+                                            .map_err(|_| {
+                                                "approval broker lock poisoned".to_string()
+                                            })?
+                                            .insert(broker_request_id.clone(), sender);
+                                        emit_optional(
+                                            &app,
+                                            "codex-approval-requested",
+                                            NativeApprovalEvent {
+                                                request_id: broker_request_id.clone(),
+                                                node_id: request.node_id.clone(),
+                                                method: method.into(),
+                                                params: redact_sensitive(
+                                                    value
+                                                        .get("params")
+                                                        .cloned()
+                                                        .unwrap_or(Value::Null),
+                                                ),
+                                                thread_id: thread_id.clone(),
+                                                turn_id: turn_id.clone(),
+                                            },
+                                        );
+                                        eprintln!(
+                                            "[codex-corp] requestApproval waiting (headless wait policy); respond via MCP respond_codex_approval requestId={broker_request_id}"
+                                        );
+                                        receiver
+                                            .recv_timeout(Duration::from_secs(120))
+                                            .unwrap_or_else(|_| "decline".into())
+                                    }
+                                }
                             } else {
                                 let (sender, receiver) = mpsc::channel();
                                 broker
@@ -3569,7 +3944,8 @@ async fn execute_agent_internal(
                                     .lock()
                                     .map_err(|_| "approval broker lock poisoned".to_string())?
                                     .insert(broker_request_id.clone(), sender);
-                                let _ = app.emit(
+                                emit_optional(
+                                    &app,
                                     "codex-approval-requested",
                                     NativeApprovalEvent {
                                         request_id: broker_request_id.clone(),
@@ -3597,7 +3973,8 @@ async fn execute_agent_internal(
                                 json!({"jsonrpc":"2.0","id":id,"result":{"decision":decision}}),
                                 Duration::from_secs(5),
                             ) {
-                                let _ = app.emit(
+                                emit_optional(
+                                    &app,
                                     "codex-agent-event",
                                     NormalizedAgentEvent {
                                         node_id: request.node_id.clone(),
@@ -3613,7 +3990,8 @@ async fn execute_agent_internal(
                             }
                         }
                     } else {
-                        let _ = app.emit(
+                        emit_optional(
+                            &app,
                             "codex-agent-event",
                             NormalizedAgentEvent {
                                 node_id: request.node_id.clone(),
@@ -3642,7 +4020,8 @@ async fn execute_agent_internal(
                 }
                 let (status, summary, data, artifacts) = parse_agent_message(&message)?;
                 if total_tokens > 0 {
-                    let _ = app.emit(
+                    emit_optional(
+                        &app,
                         "codex-agent-event",
                         NormalizedAgentEvent {
                             node_id: request.node_id.clone(),
@@ -3802,16 +4181,46 @@ fn install_system_tray(app: &mut tauri::App) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let runtime_owner = runtime_ownership::RuntimeOwnershipGuard::acquire("desktop")
+        .expect("another Codex Corp runtime already owns this data directory");
     let database = open_database().expect("failed to initialize Codex Corp database");
     tauri::Builder::default()
-        .manage(Database(Mutex::new(database)))
+        .manage(Database(Arc::new(Mutex::new(database))))
         .manage(ApprovalBroker(Arc::new(Mutex::new(HashMap::new()))))
         .manage(ToolBroker(Arc::new(Mutex::new(HashMap::new()))))
         .manage(ProcessBroker(Arc::new(Mutex::new(HashMap::new()))))
+        .manage(runtime_owner)
         .manage(workflow_runtime::WorkflowRuntime::default())
         .manage(workflow_runtime::RunApprovalBroker::default())
         .setup(|app| {
             workflow_runtime::initialize(app.handle());
+            // Auto-start the Codex Corp MCP server so external clients can connect
+            // while the desktop shell is running (same lifecycle as headless).
+            // Opt out: CODEX_CORP_MCP_AUTO=0 (default is on for hackathon continuity).
+            if mcp_auto_start_enabled() {
+                let host = mcp_server::McpHost::from_tauri(app.handle());
+                match mcp_server::lifecycle::start_embedded(host) {
+                    Ok(status) => {
+                        eprintln!(
+                            "[codex-corp] MCP server listening on {} ({})",
+                            status.endpoint, status.transport
+                        );
+                        eprintln!(
+                            "[codex-corp] POST /mcp requires Authorization: Bearer <authToken> from mcp-server.status.json (or CODEX_CORP_MCP_TOKEN)"
+                        );
+                        eprintln!(
+                            "[codex-corp] Disable desktop MCP auto-start with CODEX_CORP_MCP_AUTO=0"
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!("[codex-corp] MCP server failed to start: {error}");
+                    }
+                }
+            } else {
+                eprintln!(
+                    "[codex-corp] MCP auto-start disabled (CODEX_CORP_MCP_AUTO=0)"
+                );
+            }
             #[cfg(desktop)]
             install_system_tray(app)?;
             if let Some(window) = app.get_webview_window("main") {
@@ -3871,13 +4280,34 @@ pub fn run() {
             workflow_runtime::list_active_runs,
             workflow_runtime::respond_run_approval
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Codex Corp");
+        .build(tauri::generate_context!())
+        .expect("error while building Codex Corp")
+        .run(|_app_handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                mcp_server::lifecycle::stop_embedded();
+            }
+        });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_auto_start_parse_defaults_and_opt_out() {
+        assert!(parse_mcp_auto_start(None));
+        assert!(parse_mcp_auto_start(Some("")));
+        assert!(parse_mcp_auto_start(Some("   ")));
+        assert!(parse_mcp_auto_start(Some("1")));
+        assert!(parse_mcp_auto_start(Some("true")));
+        assert!(parse_mcp_auto_start(Some("on")));
+        assert!(parse_mcp_auto_start(Some("yes")));
+        assert!(parse_mcp_auto_start(Some("maybe"))); // unknown → default on
+        assert!(!parse_mcp_auto_start(Some("0")));
+        assert!(!parse_mcp_auto_start(Some("false")));
+        assert!(!parse_mcp_auto_start(Some("OFF")));
+        assert!(!parse_mcp_auto_start(Some(" no ")));
+    }
 
     fn capability_request() -> AgentRequest {
         AgentRequest {
@@ -3887,7 +4317,8 @@ mod tests {
             role: "Planner".into(),
             model: "gpt-test".into(),
             effort: "medium".into(),
-            system_prompt: "Plan carefully".into(),
+            base_instructions: "Plan carefully".into(),
+            developer_instructions: "Stay on mission.".into(),
             user_input: "mission".into(),
             upstream_outputs: Vec::new(),
             approval_policy: "never".into(),
@@ -3916,6 +4347,8 @@ mod tests {
         assert_eq!(thread["permissions"], ":read-only");
         assert!(thread.get("sandbox").is_none());
         assert_eq!(thread["personality"], "pragmatic");
+        assert_eq!(thread["baseInstructions"], "Plan carefully");
+        assert_eq!(thread["developerInstructions"], "Stay on mission.");
 
         let turn = build_agent_turn_start_params(
             &request,
@@ -3929,6 +4362,22 @@ mod tests {
             turn["collaborationMode"]["settings"]["reasoning_effort"],
             "medium"
         );
+    }
+
+    #[test]
+    fn empty_base_instructions_omitted_from_thread_params() {
+        let mut request = capability_request();
+        request.base_instructions = String::new();
+        request.developer_instructions = "Role only".into();
+        let thread = build_agent_thread_start_params(
+            &request,
+            "gpt-test",
+            Path::new("C:/workspace"),
+            "never",
+            "read-only",
+        );
+        assert!(thread.get("baseInstructions").is_none());
+        assert_eq!(thread["developerInstructions"], "Role only");
     }
 
     #[test]
@@ -4255,6 +4704,39 @@ mod tests {
                     token_burn: 20,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn headless_approval_policy_parse_defaults_to_auto_decline() {
+        // Pure parser — no process env mutation (safe under parallel cargo test).
+        assert_eq!(
+            parse_headless_codex_approval_policy(""),
+            HeadlessCodexApprovalPolicy::AutoDecline
+        );
+        assert_eq!(
+            parse_headless_codex_approval_policy("auto_accept"),
+            HeadlessCodexApprovalPolicy::AutoAccept
+        );
+        assert_eq!(
+            parse_headless_codex_approval_policy("auto_decline"),
+            HeadlessCodexApprovalPolicy::AutoDecline
+        );
+        assert_eq!(
+            parse_headless_codex_approval_policy("decline"),
+            HeadlessCodexApprovalPolicy::AutoDecline
+        );
+        assert_eq!(
+            parse_headless_codex_approval_policy("wait"),
+            HeadlessCodexApprovalPolicy::Wait
+        );
+        assert_eq!(
+            parse_headless_codex_approval_policy("manual"),
+            HeadlessCodexApprovalPolicy::Wait
+        );
+        assert_eq!(
+            parse_headless_codex_approval_policy("  WAIT  "),
+            HeadlessCodexApprovalPolicy::Wait
         );
     }
 }

@@ -43,4 +43,28 @@ describe("DEFAULT_AGENT_OUTPUT_SCHEMA", () => {
       "artifacts",
     ]);
   });
+
+  it("allows claim/evidencePaths on criteria while keeping legacy passed optional", () => {
+    const data = (
+      DEFAULT_AGENT_OUTPUT_SCHEMA as {
+        properties: {
+          data: {
+            properties: {
+              criteria: {
+                items: {
+                  properties: Record<string, unknown>;
+                  required: string[];
+                };
+              };
+            };
+          };
+        };
+      }
+    ).properties.data.properties.criteria.items;
+    expect(data.properties.claim).toBeDefined();
+    expect(data.properties.evidencePaths).toBeDefined();
+    expect(data.properties.passed).toBeDefined();
+    expect(data.required).toEqual(["id", "evidence"]);
+    expect(data.required).not.toContain("passed");
+  });
 });

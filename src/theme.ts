@@ -17,6 +17,7 @@ export type AppearancePrefs = {
 export const THEME_STORAGE_KEY = "codex-corp-appearance";
 
 export const ACCENT_PRESETS: { id: string; label: string; hex: string }[] = [
+  { id: "white", label: "Signal white", hex: "#ffffff" },
   { id: "teal", label: "Foundry teal", hex: "#55d6be" },
   { id: "amber", label: "Signal amber", hex: "#e8b45b" },
   { id: "violet", label: "Circuit violet", hex: "#b58ad8" },
@@ -26,7 +27,7 @@ export const ACCENT_PRESETS: { id: string; label: string; hex: string }[] = [
 
 export const DEFAULT_APPEARANCE: AppearancePrefs = {
   mode: "dark",
-  accent: "#55d6be",
+  accent: "#ffffff",
   bodyWeight: "500",
 };
 
@@ -134,6 +135,23 @@ export function primaryButtonPair(accent: string): { bg: string; fg: string } {
 }
 
 /**
+ * Accent usable as icon/text on a surface (panel/foundry).
+ * White accent on light panels would vanish — darken until contrast is safe.
+ */
+export function accentOnSurface(accent: string, surface: string): string {
+  if (contrastRatio(accent, surface) >= 3) return accent;
+  const black = "#0b1210";
+  const white = "#f4fffc";
+  const toward =
+    relativeLuminance(surface) > 0.5 ? black : white;
+  for (const t of [0.28, 0.42, 0.55, 0.68, 0.8, 0.9]) {
+    const candidate = mix(accent, toward, t);
+    if (contrastRatio(candidate, surface) >= 3) return candidate;
+  }
+  return toward;
+}
+
+/**
  * Pure token map for CSS variables — unit-testable without a DOM.
  * Light mode never uses dark slab + pale text for selected controls.
  */
@@ -157,17 +175,24 @@ export function buildAppearanceCssVars(
   };
 
   if (prefs.mode === "light") {
+    const panel = "#ffffff";
     // Soft selected surfaces: pale tint of accent + dark readable text.
-    const soft = mix(accent, "#ffffff", 0.88);
-    const softBorder = mix(accent, "#ffffff", 0.5);
+    // Near-white accents collapse to pure white — force a visible grey wash.
+    let soft = mix(accent, "#ffffff", 0.88);
+    let softBorder = mix(accent, "#ffffff", 0.5);
+    if (relativeLuminance(soft) > 0.94) {
+      soft = "#e8ecf0";
+      softBorder = "#c5ced6";
+    }
     // Bias strongly toward near-black so selected labels stay readable.
     const softText = mix(accent, "#0b1210", 0.72);
+    const accentMark = accentOnSurface(accent, panel);
     const edgeStroke = "#8a97a4";
     return {
       ...base,
       "--foundry": "#f2f5f7",
       "--graphite": "#e6ebf0",
-      "--panel": "#ffffff",
+      "--panel": panel,
       "--wire": "#c5ced6",
       "--wire2": "#a8b4c0",
       "--text": "#141a21",
@@ -181,6 +206,8 @@ export function buildAppearanceCssVars(
       "--accent-soft": soft,
       "--accent-soft-border": softBorder,
       "--accent-soft-text": softText,
+      // Foreground accent for icons/chips on light panels (never pure white).
+      "--accent-mark": accentMark,
       "--nav-active-bg": soft,
       "--nav-active-fg": softText,
       "--nav-active-border": softBorder,
@@ -196,40 +223,46 @@ export function buildAppearanceCssVars(
     };
   }
 
-  const soft = mix(accent, "#0b0d10", 0.82);
-  const softBorder = mix(accent, "#0b0d10", 0.45);
-  const softText = mix(accent, "#e8eef4", 0.12);
-  const edgeStroke = "#52606d";
+  // Pitch-black stage; grey chrome (sidebars, top/bottom bars) so structure reads.
+  const voidBg = "#000000";
+  const chrome = "#141416";
+  const chromeRaised = "#1a1a1e";
+  const soft = mix(accent, chrome, 0.82);
+  const softBorder = mix(accent, chrome, 0.42);
+  const softText = mix(accent, "#f2f4f6", 0.08);
+  const accentMark = accentOnSurface(accent, chrome);
+  const edgeStroke = "#4a4a52";
   return {
     ...base,
-    "--foundry": "#0b0d10",
-    "--graphite": "#12161c",
-    "--panel": "#151a21",
-    "--wire": "#29313b",
-    "--wire2": "#35414d",
-    "--text": "#e8eef4",
-    "--text-muted": "#b4c0cc",
-    "--text-dim": "#8f9caa",
-    "--surface": "#12171c",
-    "--surface-2": "#151a20",
-    "--border": "#2a333c",
-    "--topbar-bg": "#0e1115",
-    "--shadow": "rgba(0, 0, 0, 0.45)",
+    "--foundry": voidBg,
+    "--graphite": "#0c0c0e",
+    "--panel": chrome,
+    "--wire": "#2c2c32",
+    "--wire2": "#3a3a42",
+    "--text": "#f2f4f6",
+    "--text-muted": "#a8b0b8",
+    "--text-dim": "#7a828a",
+    "--surface": chrome,
+    "--surface-2": chromeRaised,
+    "--border": "#2c2c32",
+    "--topbar-bg": chrome,
+    "--shadow": "rgba(0, 0, 0, 0.72)",
     "--accent-soft": soft,
     "--accent-soft-border": softBorder,
     "--accent-soft-text": softText,
+    "--accent-mark": accentMark,
     "--nav-active-bg": soft,
     "--nav-active-fg": softText,
     "--nav-active-border": softBorder,
     "--chip-bg": soft,
-    "--chip-fg": mix(accent, "#e8eef4", 0.2),
-    "--hover-bg": mix(accent, "#0b0d10", 0.9),
-    "--hover-fg": "#e8eef4",
+    "--chip-fg": mix(accent, "#f2f4f6", 0.12),
+    "--hover-bg": mix(accent, chrome, 0.88),
+    "--hover-fg": "#f2f4f6",
     "--edge-stroke": edgeStroke,
     "--port-bg": edgeStroke,
-    "--port-border": "#151a21",
-    "--canvas-dot": "#26303a",
-    "--minimap-mask": "rgba(8, 10, 13, 0.76)",
+    "--port-border": chrome,
+    "--canvas-dot": "#222228",
+    "--minimap-mask": "rgba(0, 0, 0, 0.78)",
   };
 }
 

@@ -1,6 +1,8 @@
 import type { FlowEdge, FlowNode } from "./model";
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { autoLayout } from "./graph";
 import { notifyPersistenceError } from "./persistence-events";
+import { builtinWorkflowTemplates } from "./node-packs/template-factory";
 
 export const DEFAULT_TEMPLATE_ID = "empty-draft";
 
@@ -11,6 +13,8 @@ export type WorkflowTemplate = {
   version: string;
   nodes: FlowNode[];
   edges: FlowEdge[];
+  /** Homescreen card icon id (see workflow-icons.ts). */
+  icon?: string;
   /** Product templates are explicit; ordinary saved workflows stay out of this view. */
   templateOrigin?: "built-in" | "user";
   /** Prevents Workflow Architect mutations. Manual editor changes remain user-controlled. */
@@ -23,14 +27,14 @@ export type WorkflowTemplate = {
 export const EMPTY_WORKFLOW_TEMPLATE: WorkflowTemplate = {
   id: DEFAULT_TEMPLATE_ID,
   name: "Untitled workflow",
-  description: "Empty workspace — create a workflow with Workflow Architect.",
+  description: "Empty workspace — create a workflow with Byte.",
   version: "v0.0",
   nodes: [],
   edges: [],
 };
 
-/** Built-in product templates. The fresh catalog currently has none. */
-export const WORKFLOW_TEMPLATES: WorkflowTemplate[] = [];
+/** Built-in product templates (pack-wired process shapes). */
+export const WORKFLOW_TEMPLATES: WorkflowTemplate[] = builtinWorkflowTemplates();
 
 export function createBlankWorkflowTemplate(
   createdAt = Date.now(),
@@ -148,7 +152,13 @@ function readDeletedWorkflows(): string[] {
 
 export function saveCustomWorkflow(template: WorkflowTemplate): void {
   const items = readCustomWorkflows();
-  const next = [...items.filter((item) => item.id !== template.id), template];
+  // Preserve catalog position on update. Appending reordered the list whenever
+  // lock/name/etc. changed, so rows jumped under the operator's cursor.
+  const index = items.findIndex((item) => item.id === template.id);
+  const next =
+    index >= 0
+      ? items.map((item, i) => (i === index ? template : item))
+      : [...items, template];
   if (desktopWorkflows) {
     desktopWorkflows = next;
     enqueueCatalogWrite(
@@ -183,7 +193,13 @@ export function bumpWorkflowVersion(version: string): string {
 export type WorkflowMetadataPatch = Partial<
   Pick<
     WorkflowTemplate,
-    "name" | "description" | "version" | "locked" | "templateOrigin" | "draft"
+    | "name"
+    | "description"
+    | "version"
+    | "icon"
+    | "locked"
+    | "templateOrigin"
+    | "draft"
   >
 >;
 
@@ -202,6 +218,9 @@ export function updateWorkflowMetadata(
   }
   if (typeof patch.version === "string") {
     next.version = normalizeWorkflowVersion(patch.version);
+  }
+  if (typeof patch.icon === "string") {
+    next.icon = patch.icon.trim() || undefined;
   }
   saveCustomWorkflow(next);
   return next;
@@ -233,13 +252,27 @@ export function deleteWorkflowFromCatalog(id: string): void {
   );
 }
 
+function compareWorkflowsByName(
+  a: WorkflowTemplate,
+  b: WorkflowTemplate,
+): number {
+  const byName = a.name.localeCompare(b.name, undefined, {
+    sensitivity: "base",
+    numeric: true,
+  });
+  if (byName !== 0) return byName;
+  return a.id.localeCompare(b.id);
+}
+
 export function listWorkflows(
   options: { includeDrafts?: boolean } = {},
 ): WorkflowTemplate[] {
   const deleted = new Set(readDeletedWorkflows());
-  return readCustomWorkflows().filter(
-    (item) => !deleted.has(item.id) && (options.includeDrafts || !item.draft),
-  );
+  return readCustomWorkflows()
+    .filter(
+      (item) => !deleted.has(item.id) && (options.includeDrafts || !item.draft),
+    )
+    .sort(compareWorkflowsByName);
 }
 
 export function listTemplates(): WorkflowTemplate[] {
@@ -274,6 +307,40 @@ export function cloneTemplateGraph(template: WorkflowTemplate): {
   return {
     nodes: structuredClone(template.nodes),
     edges: structuredClone(template.edges),
+  };
+}
+
+/**
+ * Deep-clone a template graph and apply layered auto-layout so factory /
+ * first-open canvases match the Auto layout command.
+ */
+export function cloneTemplateGraphLaidOut(template: WorkflowTemplate): {
+  nodes: FlowNode[];
+  edges: FlowEdge[];
+} {
+  const { nodes, edges } = cloneTemplateGraph(template);
+  if (!nodes.length) return { nodes, edges };
+  return { nodes: autoLayout(nodes, edges), edges };
+}
+
+/**
+ * Instantiate a builtin (or any catalog) template as a new user workflow.
+ * Does not mark the copy as a template — it appears under Workflows.
+ */
+export function createWorkflowFromTemplate(
+  source: WorkflowTemplate,
+  createdAt = Date.now(),
+): WorkflowTemplate {
+  const { nodes, edges } = cloneTemplateGraphLaidOut(source);
+  return {
+    id: `workflow-${createdAt.toString(36)}`,
+    name: source.name,
+    description: source.description,
+    version: source.version || "v0.1",
+    nodes,
+    edges,
+    draft: false,
+    locked: false,
   };
 }
 

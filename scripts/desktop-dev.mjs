@@ -4,6 +4,7 @@ import { cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { embedAndVerifyWindowsManifest } from './windows-manifest.mjs'
 
 const workspace = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const buildRoot = join(tmpdir(), 'codex-corp-desktop-dev')
@@ -35,6 +36,11 @@ const cargoCommand = isWin ? 'cargo.exe' : 'cargo'
 const targetDir = join(buildRoot, 'target')
 const exeName = isWin ? 'codex-corp.exe' : 'codex-corp'
 const exePath = join(targetDir, 'debug', exeName)
+
+// The isolated source tree is replaced on each run. Its Cargo target must be
+// replaced too, or build-script outputs can point at generated files removed
+// with the previous source snapshot (for example libsqlite3-sys bindgen.rs).
+await rm(targetDir, { recursive: true, force: true })
 
 try {
   await access(viteCli)
@@ -71,10 +77,22 @@ const build = spawn(
   },
 )
 
-build.on('exit', (code) => {
+build.on('exit', async (code) => {
   if (code !== 0) {
     stop()
     process.exitCode = code ?? 1
+    return
+  }
+
+  try {
+    await embedAndVerifyWindowsManifest(
+      exePath,
+      join(tauriRoot, 'windows-comctl.manifest'),
+    )
+  } catch (error) {
+    stop()
+    console.error(error)
+    process.exitCode = 1
     return
   }
 

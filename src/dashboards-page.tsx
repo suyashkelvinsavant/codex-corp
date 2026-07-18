@@ -326,7 +326,7 @@ export function DashboardsPage({
             <div>
               <h3>Finance &amp; efficiency agent</h3>
               <p>
-                Local briefing for you — and a digest for Workflow Architect to
+                Local briefing for you — and a digest for Byte to
                 close the feedback loop
               </p>
             </div>
@@ -346,7 +346,7 @@ export function DashboardsPage({
               onClick={() => void sendToArchitect()}
               disabled={!onOpenArchitect}
             >
-              Send insights to Architect
+              Send insights to Byte
             </button>
           </div>
           <pre className="dashboards-briefing" aria-label="Dashboard briefing">

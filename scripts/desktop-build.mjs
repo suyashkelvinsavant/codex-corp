@@ -3,6 +3,7 @@ import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { embedAndVerifyWindowsManifest } from "./windows-manifest.mjs";
 
 const workspace = resolve(fileURLToPath(new URL("..", import.meta.url)));
 if (
@@ -26,6 +27,10 @@ const buildRoot = join(tmpdir(), "codex-corp-desktop-release");
 const tauriRoot = join(buildRoot, "src-tauri");
 const targetDir = join(tmpdir(), "codex-corp-desktop-release-target");
 await rm(buildRoot, { recursive: true, force: true });
+// The isolated source tree changes on every build. Reusing its target directory
+// can leave build-script outputs pointing at generated files that no longer
+// exist (for example libsqlite3-sys bindgen.rs after dependency changes).
+await rm(targetDir, { recursive: true, force: true });
 await mkdir(buildRoot, { recursive: true });
 await cp(join(workspace, "src-tauri"), tauriRoot, { recursive: true });
 await cp(join(workspace, "dist"), join(buildRoot, "dist"), { recursive: true });
@@ -65,6 +70,10 @@ const executable = join(
   targetDir,
   "release",
   process.platform === "win32" ? "codex-corp.exe" : "codex-corp",
+);
+await embedAndVerifyWindowsManifest(
+  executable,
+  join(tauriRoot, "windows-comctl.manifest"),
 );
 const outputDir = join(workspace, "release");
 await mkdir(outputDir, { recursive: true });

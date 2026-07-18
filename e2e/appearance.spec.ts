@@ -277,7 +277,7 @@ test.describe("appearance theme E2E", () => {
     await openWorkspaceView(page, "Workflows");
     await page.locator(".workflow-card").first().click();
     await expect(page.locator(".agent-chat-edit")).toBeVisible();
-    await expect(page.getByText("Brief the mediator")).toBeVisible();
+    await expect(page.getByText("Brief Byte")).toBeVisible();
     tokens = await readTokens(page);
     expect(tokens.theme).toBe("light");
     expect(tokens.accent.toLowerCase()).toBe("#b58ad8");
@@ -445,7 +445,7 @@ test.describe("appearance theme E2E", () => {
 
     await openWorkspaceView(page, "Workflows");
     await page.locator(".workflow-card").first().click();
-    await expect(page.getByText("Brief the mediator")).toBeVisible();
+    await expect(page.getByText("Brief Byte")).toBeVisible();
     tokens = await readTokens(page);
     expect(tokens.accent.toLowerCase()).toBe("#e8b45b");
     expect(tokens.theme).toBe("light");
@@ -528,7 +528,7 @@ test.describe("appearance theme E2E", () => {
     // —— Chat shell/rail/stage ——
     await openWorkspaceView(page, "Workflows");
     await page.locator(".workflow-card").first().click();
-    await expect(page.getByText("Brief the mediator")).toBeVisible();
+    await expect(page.getByText("Brief Byte")).toBeVisible();
     await assertLightSurface(page.locator(".agent-chat-shell"), { minBg: 180 });
     await assertLightSurface(page.locator(".agent-chat-rail"), { minBg: 200 });
     await assertLightSurface(page.locator(".agent-chat-stage"), { minBg: 180 });

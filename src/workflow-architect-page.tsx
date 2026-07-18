@@ -187,7 +187,7 @@ export function WorkflowArchitectPage({
     try {
       if (!onTurn)
         throw new Error(
-          "Workflow Architect requires the Codex Corp desktop runtime.",
+          "Byte requires the Codex Corp desktop runtime.",
         );
       let streamed = "";
       const result = await onTurn({
@@ -320,7 +320,7 @@ export function WorkflowArchitectPage({
     <div className="architect-shell">
       <aside
         className="architect-rail"
-        aria-label="Workflow Architect chat history"
+        aria-label="Byte chat history"
       >
         <button className="agent-chat-back" onClick={onBack}>
           <ArrowLeft size={14} /> Workflows
@@ -330,8 +330,8 @@ export function WorkflowArchitectPage({
             <GitBranch size={18} />
           </span>
           <div>
-            <small>TOP LAYER AGENT</small>
-            <b>Workflow Architect</b>
+            <small>WORKFLOW COMPANION</small>
+            <b>Byte</b>
           </div>
         </div>
         <button className="architect-new" onClick={() => startNewChat()}>
@@ -424,7 +424,7 @@ export function WorkflowArchitectPage({
             </p>
           </div>
           <div className="architect-live">
-            <i /> Architect ready
+            <i /> Byte ready
           </div>
         </header>
         <section className="architect-chat">
@@ -475,7 +475,7 @@ export function WorkflowArchitectPage({
                   }
                 >
                   <small>
-                    {message.role === "user" ? "YOU" : "WORKFLOW ARCHITECT"}
+                    {message.role === "user" ? "YOU" : "BYTE"}
                   </small>
                   <p>{message.text || "Thinking through the graph…"}</p>
                 </article>

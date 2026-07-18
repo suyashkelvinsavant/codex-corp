@@ -48,10 +48,16 @@ import {
 } from "./codex-capabilities";
 import { PromptEditor } from "./prompt-editor";
 import {
+  COMMAND_TEMPLATE_IDS,
   ensureCompletionCriteria,
+  evaluateCompletionCriteria,
   makeCustomCriterion,
+  OPERATOR_VERIFIER_KINDS,
+  verificationResultsFromOutput,
   type CompletionCriterion,
   type CriterionEvaluation,
+  type CriterionKind,
+  type OperatorVerifierKind,
 } from "./completion-criteria";
 import {
   composeAuthorizedMission,
@@ -318,16 +324,21 @@ export function NodeInspector({
         </div>
         <span className={`big-status ${d.status}`}>{statusText[d.status]}</span>
       </div>
-      <nav className="inspector-tabs">
-        {tabs.map((t) => (
-          <button
-            key={t}
-            className={tab === t ? "active" : ""}
-            onClick={() => setTab(t)}
-          >
-            {t === "io" ? "I/O" : t}
-          </button>
-        ))}
+      <nav className="inspector-tabs" aria-label="Agent inspector">
+        {tabs.map((t) => {
+          const label = t === "io" ? "I/O" : t;
+          return (
+            <button
+              key={t}
+              type="button"
+              className={tab === t ? "active" : ""}
+              onClick={() => setTab(t)}
+              title={label}
+            >
+              {label}
+            </button>
+          );
+        })}
       </nav>
       <div className="inspector-content">
         {tab === "overview" && (
@@ -376,19 +387,40 @@ export function NodeInspector({
         )}
         {tab === "instructions" && (
           <>
-            <Section title="Agent contract">
+            <Section title="Instruction surfaces">
               <PromptEditor
-                label="System-style instructions"
-                value={d.prompt}
-                onChange={(next) => update({ prompt: next })}
+                label="Base instructions (harness)"
+                value={d.baseInstructions ?? ""}
+                onChange={(next) =>
+                  update({
+                    baseInstructions: next,
+                  })
+                }
+                placeholder="Authored harness-like base. Leave empty to opt into native Codex base."
+                helper={
+                  d.packId
+                    ? `Pack ${d.packId}@${d.packVersion ?? "?"} · empty base = native Codex base`
+                    : "Empty base = opt-in native Codex base (brand may return)"
+                }
+                rows={8}
+              />
+              <PromptEditor
+                label="Developer instructions (role contract)"
+                value={d.developerInstructions ?? d.prompt ?? ""}
+                onChange={(next) =>
+                  update({
+                    developerInstructions: next,
+                    prompt: next,
+                  })
+                }
                 placeholder="Role, objectives, MUST / MUST NOT, output contract…"
                 helper="Markdown supported · Expand for a wide editor"
-                rows={14}
+                rows={12}
               />
             </Section>
             <CompletionCriteriaEditor
               criteria={d.completionCriteria}
-              evaluation={d.criteriaEvaluation}
+              evaluation={resolveCriteriaEvaluation(d)}
               onChange={(completionCriteria) => update({ completionCriteria })}
             />
           </>
@@ -999,16 +1031,20 @@ function CreativeNodeInspector({
         <span className={`big-status ${d.status}`}>{statusText[d.status]}</span>
       </div>
       <nav className="inspector-tabs" aria-label="Creative studio inspector">
-        {creativeTabs.map((t) => (
-          <button
-            key={t}
-            type="button"
-            className={activeTab === t ? "active" : ""}
-            onClick={() => setTab(t)}
-          >
-            {t === "io" ? "I/O" : t}
-          </button>
-        ))}
+        {creativeTabs.map((t) => {
+          const label = t === "io" ? "I/O" : t;
+          return (
+            <button
+              key={t}
+              type="button"
+              className={activeTab === t ? "active" : ""}
+              onClick={() => setTab(t)}
+              title={label}
+            >
+              {label}
+            </button>
+          );
+        })}
       </nav>
       <div className="inspector-content creative-inspector-content">
         {activeTab === "overview" && (
@@ -1087,11 +1123,24 @@ function CreativeNodeInspector({
 
         {activeTab === "instructions" && (
           <>
-            <Section title="Creative direction">
+            <Section title="Instruction surfaces">
               <PromptEditor
-                label="Brief / system direction"
-                value={d.prompt}
-                onChange={(next) => update({ prompt: next })}
+                label="Base instructions (harness)"
+                value={d.baseInstructions ?? ""}
+                onChange={(next) => update({ baseInstructions: next })}
+                placeholder="Authored harness-like base. Leave empty to opt into native Codex base."
+                helper="Empty base = opt-in native Codex base"
+                rows={6}
+              />
+              <PromptEditor
+                label="Developer brief / role contract"
+                value={d.developerInstructions ?? d.prompt ?? ""}
+                onChange={(next) =>
+                  update({
+                    developerInstructions: next,
+                    prompt: next,
+                  })
+                }
                 placeholder="Brand tone, palette, constraints, references…"
                 helper={
                   <>
@@ -1099,12 +1148,12 @@ function CreativeNodeInspector({
                     <em>{primary.directionHint}</em>
                   </>
                 }
-                rows={14}
+                rows={12}
               />
             </Section>
             <CompletionCriteriaEditor
               criteria={d.completionCriteria}
-              evaluation={d.criteriaEvaluation}
+              evaluation={resolveCriteriaEvaluation(d)}
               onChange={(completionCriteria) => update({ completionCriteria })}
             />
           </>
@@ -2001,13 +2050,30 @@ export function EdgeInspector({
             Edge type
             <select
               value={edge.data?.edgeType ?? "standard"}
-              onChange={(event) =>
-                update({
-                  edgeType: event.target.value as NonNullable<
-                    FlowEdge["data"]
-                  >["edgeType"],
-                })
-              }
+              onChange={(event) => {
+                const edgeType = event.target.value as NonNullable<
+                  FlowEdge["data"]
+                >["edgeType"];
+                // Apply type defaults so graph labels and runtime stay consistent.
+                if (edgeType === "revision") {
+                  update({
+                    edgeType,
+                    maxRevisions:
+                      edge.data?.maxRevisions && edge.data.maxRevisions > 0
+                        ? edge.data.maxRevisions
+                        : 2,
+                  });
+                  return;
+                }
+                if (edgeType === "conditional") {
+                  update({
+                    edgeType,
+                    condition: edge.data?.condition?.trim() || "success",
+                  });
+                  return;
+                }
+                update({ edgeType });
+              }}
             >
               <option value="standard">Standard</option>
               <option value="conditional">Conditional</option>
@@ -2077,14 +2143,23 @@ export function EdgeInspector({
               Maximum revisions
               <input
                 type="number"
-                min="1"
-                max="10"
+                min={1}
+                max={10}
+                step={1}
                 value={edge.data.maxRevisions ?? 2}
-                onChange={(event) =>
-                  update({ maxRevisions: Number(event.target.value) })
-                }
+                onChange={(event) => {
+                  const raw = Number(event.target.value);
+                  const next = Number.isFinite(raw)
+                    ? Math.min(10, Math.max(1, Math.round(raw)))
+                    : 2;
+                  update({ maxRevisions: next });
+                }}
               />
             </label>
+            <p className="helper">
+              Graph label shows <code>used / max</code> for the revised node.
+              Runtime stops after this many revision loops.
+            </p>
             <Metric label="Limit behavior" value="Fail run" />
           </Section>
         )}
@@ -2092,6 +2167,47 @@ export function EdgeInspector({
     </>
   );
 }
+/** Prefer runtime verification SSOT chips; fall back to local re-eval / pending. */
+function resolveCriteriaEvaluation(d: AgentData): CriterionEvaluation[] {
+  const verificationResults = verificationResultsFromOutput(
+    d.structuredOutput ?? null,
+  );
+  const statusFromData =
+    typeof d.structuredOutput?.status === "string"
+      ? String(d.structuredOutput.status)
+      : undefined;
+  const resultLike = {
+    status:
+      statusFromData ||
+      (d.status === "completed" || d.status === "failed"
+        ? d.status === "completed"
+          ? "success"
+          : "failure"
+        : undefined),
+    summary: d.output,
+    data: d.structuredOutput,
+    artifacts: d.artifacts,
+  };
+  // When runtime rows exist, evaluateCompletionCriteria defers to them (G10).
+  if (verificationResults?.length) {
+    return evaluateCompletionCriteria(
+      d.completionCriteria,
+      resultLike,
+      verificationResults,
+    );
+  }
+  if (d.criteriaEvaluation?.length) return d.criteriaEvaluation;
+  return evaluateCompletionCriteria(d.completionCriteria, resultLike, null);
+}
+
+function patchCriterion(
+  list: CompletionCriterion[],
+  id: string,
+  patch: Partial<CompletionCriterion>,
+): CompletionCriterion[] {
+  return list.map((c) => (c.id === id ? { ...c, ...patch } : c));
+}
+
 function CompletionCriteriaEditor({
   criteria,
   evaluation,
@@ -2106,17 +2222,61 @@ function CompletionCriteriaEditor({
   const [draft, setDraft] = useState("");
 
   const setEnabled = (id: string, enabled: boolean) => {
-    onChange(list.map((c) => (c.id === id ? { ...c, enabled } : c)));
+    onChange(patchCriterion(list, id, { enabled }));
   };
 
   const setEnforcement = (
     id: string,
     enforcement: CompletionCriterion["enforcement"],
   ) => {
+    onChange(patchCriterion(list, id, { enforcement }));
+  };
+
+  const setKind = (id: string, kind: OperatorVerifierKind) => {
     onChange(
-      list.map((criterion) =>
-        criterion.id === id ? { ...criterion, enforcement } : criterion,
-      ),
+      list.map((c) => {
+        if (c.id !== id) return c;
+        const next: CompletionCriterion = {
+          ...c,
+          kind: kind as CriterionKind,
+        };
+        if (kind === "claim") {
+          return {
+            ...next,
+            enforcement: "advisory",
+            templateId: undefined,
+            artifactName: undefined,
+            artifactPath: undefined,
+            policyId: undefined,
+          };
+        }
+        if (kind === "command") {
+          return {
+            ...next,
+            templateId: c.templateId || "npm_test",
+            policyId: undefined,
+            artifactName: undefined,
+            artifactPath: undefined,
+          };
+        }
+        if (kind === "artifact_exists") {
+          return {
+            ...next,
+            templateId: undefined,
+            policyId: undefined,
+            artifactName: c.artifactName || "",
+            artifactPath: c.artifactPath || "",
+          };
+        }
+        // architecture_policy — pattern-scoped (native_runtime_ownership_v1)
+        return {
+          ...next,
+          policyId: c.policyId || "native_runtime_ownership_v1",
+          templateId: undefined,
+          artifactName: undefined,
+          artifactPath: undefined,
+        };
+      }),
     );
   };
 
@@ -2134,73 +2294,243 @@ function CompletionCriteriaEditor({
   return (
     <Section title="Completion criteria">
       <p className="helper" data-testid="completion-criteria-helper">
-        Platform guarantees are evaluated after each run. Custom criteria are
-        injected into the system prompt and soft-checked on terminal status.
+        Platform guarantees and host verifiers (command, artifact, architecture)
+        are evaluated by the runtime after each run. Claim criteria are advisory
+        evidence only. Post-run chips prefer{" "}
+        <code>data.verification.results</code> (runtime SSOT).
       </p>
       <div className="criteria-list" data-testid="completion-criteria-list">
         {list.map((c) => {
           const ev = evalById.get(c.id);
           const status = ev?.status ?? "pending";
+          const kindLabel = c.platform
+            ? "platform"
+            : c.kind === "claim" || c.kind === "custom"
+              ? "claim"
+              : c.kind;
           return (
             <div
               key={c.id}
               className={`criteria-row status-${status}`}
               data-testid={`criterion-${c.id}`}
               data-eval={status}
+              data-kind={c.kind}
             >
-              <label className="criteria-toggle">
-                <input
-                  type="checkbox"
-                  checked={c.enabled}
-                  disabled={c.platform}
-                  onChange={(e) => setEnabled(c.id, e.target.checked)}
-                  aria-label={`Enable criterion: ${c.label}`}
-                />
-                <span>
-                  <b>{c.label}</b>
-                  {c.platform ? (
-                    <small className="criteria-badge">platform</small>
-                  ) : (
-                    <small className="criteria-badge custom">custom</small>
-                  )}
-                  {ev ? (
-                    <small className={`criteria-eval eval-${status}`}>
-                      {status}
-                      {ev.detail ? ` · ${ev.detail}` : ""}
+              <div className="criteria-row-main">
+                <label className="criteria-toggle">
+                  <input
+                    type="checkbox"
+                    checked={c.enabled}
+                    disabled={c.platform}
+                    onChange={(e) => setEnabled(c.id, e.target.checked)}
+                    aria-label={`Enable criterion: ${c.label}`}
+                  />
+                  <span>
+                    <b>{c.label}</b>
+                    <small
+                      className={`criteria-badge${c.platform ? "" : " custom"}`}
+                    >
+                      {kindLabel}
                     </small>
-                  ) : (
-                    <small className="criteria-eval eval-pending">
-                      pending · run to evaluate
-                    </small>
+                    {ev ? (
+                      <small className={`criteria-eval eval-${status}`}>
+                        {status}
+                        {ev.detail ? ` · ${ev.detail}` : ""}
+                      </small>
+                    ) : (
+                      <small className="criteria-eval eval-pending">
+                        pending · run to evaluate
+                      </small>
+                    )}
+                  </span>
+                </label>
+                {!c.platform && (
+                  <div className="criteria-actions">
+                    <select
+                      value={
+                        OPERATOR_VERIFIER_KINDS.includes(
+                          c.kind as OperatorVerifierKind,
+                        )
+                          ? c.kind
+                          : "claim"
+                      }
+                      onChange={(event) =>
+                        setKind(
+                          c.id,
+                          event.target.value as OperatorVerifierKind,
+                        )
+                      }
+                      aria-label={`Kind for criterion: ${c.label}`}
+                      data-testid={`criterion-kind-${c.id}`}
+                    >
+                      <option value="claim">claim</option>
+                      <option value="command">command</option>
+                      <option value="artifact_exists">artifact_exists</option>
+                      <option value="architecture_policy">
+                        architecture_policy
+                      </option>
+                    </select>
+                    <select
+                      value={
+                        c.kind === "claim" || c.kind === "custom"
+                          ? "advisory"
+                          : c.enforcement
+                      }
+                      disabled={c.kind === "claim" || c.kind === "custom"}
+                      onChange={(event) =>
+                        setEnforcement(
+                          c.id,
+                          event.target
+                            .value as CompletionCriterion["enforcement"],
+                        )
+                      }
+                      aria-label={`Enforcement for criterion: ${c.label}`}
+                    >
+                      <option value="required">Required</option>
+                      <option value="advisory">Advisory</option>
+                    </select>
+                    <button
+                      type="button"
+                      className="criteria-remove"
+                      onClick={() => removeCustom(c.id)}
+                      aria-label={`Remove criterion: ${c.label}`}
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+                )}
+              </div>
+              {!c.platform && c.kind === "command" && (
+                <div className="criteria-config">
+                  <label>
+                    Command template
+                    <select
+                      value={c.templateId || "npm_test"}
+                      onChange={(event) =>
+                        onChange(
+                          patchCriterion(list, c.id, {
+                            templateId: event.target.value,
+                          }),
+                        )
+                      }
+                      aria-label={`Command template for: ${c.label}`}
+                      data-testid={`criterion-template-${c.id}`}
+                    >
+                      {COMMAND_TEMPLATE_IDS.map((tid) => (
+                        <option key={tid} value={tid}>
+                          {tid}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  {c.templateId === "node_script" && (
+                    <label>
+                      Script path (relative, path-confined)
+                      <input
+                        value={c.instruction ?? ""}
+                        onChange={(event) =>
+                          onChange(
+                            patchCriterion(list, c.id, {
+                              instruction: event.target.value,
+                            }),
+                          )
+                        }
+                        placeholder="scripts/verify.mjs"
+                        aria-label={`node_script path for: ${c.label}`}
+                      />
+                    </label>
                   )}
-                </span>
-              </label>
-              {!c.platform && (
-                <div className="criteria-actions">
-                  <select
-                    value={c.enforcement}
-                    onChange={(event) =>
-                      setEnforcement(
-                        c.id,
-                        event.target
-                          .value as CompletionCriterion["enforcement"],
-                      )
-                    }
-                    aria-label={`Enforcement for criterion: ${c.label}`}
-                  >
-                    <option value="required">Required</option>
-                    <option value="advisory">Advisory</option>
-                  </select>
-                  <button
-                    type="button"
-                    className="criteria-remove"
-                    onClick={() => removeCustom(c.id)}
-                    aria-label={`Remove criterion: ${c.label}`}
-                  >
-                    <X size={12} />
-                  </button>
+                  {(c.templateId === "cargo_test" ||
+                    c.templateId === "cargo_check") && (
+                    <p className="helper criteria-policy-note">
+                      cargo_* runs with the workflow workspace as cwd and
+                      discovers <code>Cargo.toml</code> from there (no nested
+                      monorepo path is hardcoded).
+                    </p>
+                  )}
                 </div>
               )}
+              {!c.platform && c.kind === "artifact_exists" && (
+                <div className="criteria-config">
+                  <label>
+                    Artifact name
+                    <input
+                      value={c.artifactName ?? ""}
+                      onChange={(event) =>
+                        onChange(
+                          patchCriterion(list, c.id, {
+                            artifactName: event.target.value,
+                          }),
+                        )
+                      }
+                      placeholder="delivery-bundle.json"
+                      aria-label={`Artifact name for: ${c.label}`}
+                      data-testid={`criterion-artifact-name-${c.id}`}
+                    />
+                  </label>
+                  <label>
+                    Artifact path fragment
+                    <input
+                      value={c.artifactPath ?? ""}
+                      onChange={(event) =>
+                        onChange(
+                          patchCriterion(list, c.id, {
+                            artifactPath: event.target.value,
+                          }),
+                        )
+                      }
+                      placeholder="dist/ or src/app.ts"
+                      aria-label={`Artifact path for: ${c.label}`}
+                      data-testid={`criterion-artifact-path-${c.id}`}
+                    />
+                  </label>
+                </div>
+              )}
+              {!c.platform && c.kind === "architecture_policy" && (
+                <div className="criteria-config">
+                  <label>
+                    Policy id
+                    <input
+                      value={c.policyId ?? "native_runtime_ownership_v1"}
+                      onChange={(event) =>
+                        onChange(
+                          patchCriterion(list, c.id, {
+                            policyId: event.target.value,
+                          }),
+                        )
+                      }
+                      placeholder="native_runtime_ownership_v1"
+                      aria-label={`Policy id for: ${c.label}`}
+                      data-testid={`criterion-policy-${c.id}`}
+                    />
+                  </label>
+                  <p className="helper criteria-policy-note">
+                    <code>native_runtime_ownership_v1</code> is pattern-scoped:
+                    it checks known native markers and suspect runtime path
+                    shapes, not every possible scheduler name.
+                  </p>
+                </div>
+              )}
+              {!c.platform &&
+                (c.kind === "claim" || c.kind === "custom") && (
+                  <div className="criteria-config">
+                    <label>
+                      Evidence guidance (prompt-injected)
+                      <input
+                        value={c.instruction ?? c.label}
+                        onChange={(event) =>
+                          onChange(
+                            patchCriterion(list, c.id, {
+                              instruction: event.target.value,
+                            }),
+                          )
+                        }
+                        placeholder="Describe what evidence the specialist should cite"
+                        aria-label={`Claim guidance for: ${c.label}`}
+                      />
+                    </label>
+                  </div>
+                )}
             </div>
           );
         })}
@@ -2210,7 +2540,7 @@ function CompletionCriteriaEditor({
           data-testid="criterion-draft"
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
-          placeholder="Add custom criterion…"
+          placeholder="Add criterion label…"
           aria-label="New custom completion criterion"
           onKeyDown={(e) => {
             if (e.key === "Enter") {

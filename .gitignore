@@ -26,6 +26,9 @@ graphify-out/
 firebase-debug.log
 code-review.md
 report.md
+research.md
+plan.md
+review.md
 
 # Pet-generation working files (the runtime uses the final spritesheet at
 # assets/pets/byte-spritesheet.webp)

@@ -1,0 +1,10 @@
+{
+  "id": "delivery-stale-hash",
+  "approvedArtifacts": [
+    { "artifactKey": "builder::0::a.ts", "contentHash": "h-approved" }
+  ],
+  "liveArtifactRefs": [
+    { "artifactKey": "builder::0::a.ts", "contentHash": "h-stale" }
+  ],
+  "expect": { "delivery": "fail", "reason": "hash mismatch" }
+}

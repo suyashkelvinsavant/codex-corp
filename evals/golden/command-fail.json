@@ -1,0 +1,21 @@
+{
+  "id": "command-fail",
+  "criterion": {
+    "id": "cmd-1",
+    "kind": "command",
+    "enforcement": "required",
+    "templateId": "npm_test"
+  },
+  "producerOutput": {
+    "status": "success",
+    "summary": "I pinky swear tests passed",
+    "data": {
+      "criteria": [{ "id": "cmd-1", "passed": true, "evidence": "green locally" }]
+    }
+  },
+  "hostCommand": { "templateId": "npm_test", "exitCode": 1 },
+  "expect": {
+    "requiredFailed": true,
+    "reason": "allowlisted command non-zero exit fails; producer claim ignored"
+  }
+}

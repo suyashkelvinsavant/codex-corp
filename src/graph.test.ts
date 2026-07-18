@@ -209,6 +209,45 @@ describe("workflow graph core", () => {
     expect(byId.agent.position.x).toBeLessThan(byId.out.position.x);
   });
 
+  it("rejects required claim criteria at design time", () => {
+    const agent = node("agent");
+    agent.data.completionCriteria = [
+      {
+        id: "claim-1",
+        label: "I promise",
+        kind: "claim",
+        enabled: true,
+        enforcement: "required",
+      },
+    ];
+    const problems = validateWorkflow(
+      [node("input", "input"), agent, node("out", "output")],
+      [edge("input", "agent"), edge("agent", "out")],
+    );
+    expect(
+      problems.some((p) => p.id.includes("criterion-claim-required")),
+    ).toBe(true);
+  });
+
+  it("rejects command criteria without allowlisted templateId", () => {
+    const agent = node("agent");
+    agent.data.completionCriteria = [
+      {
+        id: "cmd-1",
+        label: "Tests",
+        kind: "command",
+        enabled: true,
+        enforcement: "required",
+        templateId: "rm_rf",
+      },
+    ];
+    const problems = validateWorkflow(
+      [node("input", "input"), agent, node("out", "output")],
+      [edge("input", "agent"), edge("agent", "out")],
+    );
+    expect(problems.some((p) => p.id.includes("criterion-command"))).toBe(true);
+  });
+
   it("auto-layout finishes on standard-edge design loops (no UI freeze)", () => {
     // designer ↔ creative with standard edges (user RCA case)
     const nodes = [

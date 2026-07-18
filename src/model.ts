@@ -58,6 +58,10 @@ export type Artifact = {
   name: string;
   kind: "code" | "document" | "json" | "image" | "link";
   content?: string;
+  /** Host-assigned after materialize. */
+  hostOrdinal?: number;
+  artifactKey?: string;
+  contentHash?: string;
 };
 
 export type AgentData = {
@@ -77,7 +81,18 @@ export type AgentData = {
   collaborationMode?: "default" | "plan";
   /** Codex response style applied at thread and turn level. */
   personality?: "none" | "friendly" | "pragmatic";
+  /**
+   * @deprecated Prefer `developerInstructions` (+ `baseInstructions`).
+   * Kept as a legacy mirror of the developer role contract for older graphs.
+   */
   prompt: string;
+  /** Authored harness-like base; empty = opt-in native Codex base. */
+  baseInstructions?: string;
+  /** Role/developer contract for this specialist. */
+  developerInstructions?: string;
+  /** Builtin pack id when instantiated from the role catalog. */
+  packId?: string;
+  packVersion?: string;
   description: string;
   duration: string;
   tokens: number;

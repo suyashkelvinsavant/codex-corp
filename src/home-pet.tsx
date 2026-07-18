@@ -71,10 +71,10 @@ export function HomePet({ running, runHistory, onOpenArchitect }: { running: boo
     backgroundImage: `url(${bytePet})`,
   } as CSSProperties;
   const copy: Record<PetState, string> = { idle: "Byte is dreaming up workflows…", running: "Byte is on the case!", waiting: "Psst—need a workflow?", error: "Hmm… something tripped me up.", success: "Company mission accomplished!" };
-  return <aside className={`home-pet state-${state}`} aria-label={`Workflow Architect companion: ${copy[state]}`}>
+  return <aside className={`home-pet state-${state}`} aria-label={`Byte: ${copy[state]}`}>
     <button className="home-pet-bubble" onClick={() => onOpenArchitect()}>{copy[state]}</button>
     <div className="home-pet-playground">
-      <button className="home-pet-character" onClick={() => onOpenArchitect()} aria-label="Open Workflow Architect">
+      <button className="home-pet-character" onClick={() => onOpenArchitect()} aria-label="Open Byte">
         <span className="home-pet-sprite" style={spriteStyle} role="img" aria-label="Byte, a white and pink baby cat wearing headphones and working at a laptop" />
         <span className="home-pet-zzz">z</span>
       </button>

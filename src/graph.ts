@@ -3,6 +3,10 @@ import { isSpecialistKind } from "./model";
 import { validateConditionRule } from "./condition-rules";
 import { isValidCronExpression, isValidCronTimezone } from "./cron-trigger";
 import {
+  COMMAND_TEMPLATE_IDS,
+  normalizeCriterionKind,
+} from "./completion-criteria";
+import {
   isWeakSpecialistPrompt,
   MIN_SPECIALIST_PROMPT_CHARS,
 } from "./specialist-defaults";
@@ -236,30 +240,72 @@ export function validateWorkflow(
         message: `${node.data.label} is disconnected from an executable path.`,
       });
     }
-    if (isSpecialistKind(node.data.kind) && !node.data.prompt.trim()) {
-      problems.push({
-        id: `prompt-${node.id}`,
-        severity: "error",
-        nodeId: node.id,
-        message: `${node.data.label} needs instructions.`,
-      });
-    } else if (
-      isSpecialistKind(node.data.kind) &&
-      isWeakSpecialistPrompt(node.data.prompt)
-    ) {
-      problems.push({
-        id: `prompt-quality-${node.id}`,
-        severity: "warning",
-        nodeId: node.id,
-        message: `${node.data.label} should use a detailed system prompt (≥${MIN_SPECIALIST_PROMPT_CHARS} chars, role-specific, not a placeholder).`,
-      });
+    if (isSpecialistKind(node.data.kind)) {
+      const developer =
+        (node.data.developerInstructions ?? "").trim() ||
+        (node.data.prompt ?? "").trim();
+      if (!developer) {
+        problems.push({
+          id: `prompt-${node.id}`,
+          severity: "error",
+          nodeId: node.id,
+          message: `${node.data.label} needs developer instructions.`,
+        });
+      } else if (isWeakSpecialistPrompt(developer)) {
+        problems.push({
+          id: `prompt-quality-${node.id}`,
+          severity: "warning",
+          nodeId: node.id,
+          message: `${node.data.label} should use a detailed developer contract (≥${MIN_SPECIALIST_PROMPT_CHARS} chars, role-specific, not a placeholder).`,
+        });
+      }
+      for (const criterion of node.data.completionCriteria ?? []) {
+        if (!criterion.enabled && !criterion.platform) continue;
+        const kind = normalizeCriterionKind(criterion.kind);
+        const required =
+          Boolean(criterion.platform) || criterion.enforcement === "required";
+        if (required && (kind === "claim" || kind === "custom")) {
+          problems.push({
+            id: `criterion-claim-required-${node.id}-${criterion.id}`,
+            severity: "error",
+            nodeId: node.id,
+            message: `${node.data.label}: required claim criteria are invalid — use platform/command/artifact_exists/architecture_policy.`,
+          });
+        }
+        if (kind === "command") {
+          const tid = (criterion.templateId ?? "").trim();
+          if (
+            !tid ||
+            !(COMMAND_TEMPLATE_IDS as readonly string[]).includes(tid)
+          ) {
+            problems.push({
+              id: `criterion-command-${node.id}-${criterion.id}`,
+              severity: "error",
+              nodeId: node.id,
+              message: `${node.data.label}: command criterion needs an allowlisted templateId.`,
+            });
+          }
+        }
+        if (kind === "artifact_exists") {
+          const hasName = Boolean((criterion.artifactName ?? "").trim());
+          const hasPath = Boolean((criterion.artifactPath ?? "").trim());
+          if (!hasName && !hasPath) {
+            problems.push({
+              id: `criterion-artifact-${node.id}-${criterion.id}`,
+              severity: "error",
+              nodeId: node.id,
+              message: `${node.data.label}: artifact_exists criterion needs artifactName or artifactPath.`,
+            });
+          }
+        }
+      }
     }
     if (isSpecialistKind(node.data.kind) && !node.data.tools?.length) {
       problems.push({
         id: `tools-${node.id}`,
         severity: "warning",
         nodeId: node.id,
-        message: `${node.data.label} has no tools configured — Workflow Architect should set least-privilege tools.`,
+        message: `${node.data.label} has no tools configured — Byte should set least-privilege tools.`,
       });
     }
     if (isSpecialistKind(node.data.kind) && !node.data.model.trim()) {

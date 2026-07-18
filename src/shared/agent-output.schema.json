@@ -20,10 +20,18 @@
             "additionalProperties": false,
             "properties": {
               "id": { "type": "string" },
-              "passed": { "type": "boolean" },
-              "evidence": { "type": "string" }
+              "claim": {
+                "type": "string",
+                "enum": ["satisfied", "not_satisfied", "unknown"]
+              },
+              "evidence": { "type": "string" },
+              "evidencePaths": {
+                "type": "array",
+                "items": { "type": "string" }
+              },
+              "passed": { "type": "boolean" }
             },
-            "required": ["id", "passed", "evidence"]
+            "required": ["id", "evidence"]
           }
         }
       },

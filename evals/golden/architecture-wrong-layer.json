@@ -1,0 +1,23 @@
+{
+  "id": "architecture-wrong-layer",
+  "criterion": {
+    "id": "arch-1",
+    "kind": "architecture_policy",
+    "enforcement": "required",
+    "policyId": "native_runtime_ownership_v1"
+  },
+  "workspaceSignals": {
+    "suspectPaths": ["src/runtime/scheduler.ts", "src/agent-runtime/index.ts"],
+    "nativeMarkers": []
+  },
+  "producerOutput": {
+    "status": "success",
+    "summary": "Runtime lives in TypeScript now",
+    "data": { "criteria": [{ "id": "arch-1", "passed": true }] }
+  },
+  "expect": {
+    "requiredFailed": true,
+    "reason": "suspect TS runtime paths fail architecture policy (pattern-scoped)",
+    "note": "native_runtime_ownership_v1 only matches known suspect globs; unanticipated names may pass with residual risk"
+  }
+}

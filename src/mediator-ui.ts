@@ -212,7 +212,7 @@ export function parseMediatorControlIntent(raw: string): ChatRunIntent {
 
 export function mediatorControlHelpText(): string {
   return [
-    "Company mediator commands:",
+    "Byte commands:",
     "• **status** — who is in progress / completed / blocked",
     "• **run** — start the company (uses Mission brief)",
     "• **run with:** _mission text_ — update Mission brief then run",

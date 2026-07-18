@@ -1,0 +1,18 @@
+{
+  "id": "missing-artifact",
+  "criterion": {
+    "id": "art-1",
+    "kind": "artifact_exists",
+    "enforcement": "required",
+    "artifactName": "delivery-bundle.json"
+  },
+  "producerOutput": {
+    "status": "success",
+    "summary": "Shipped without the expected artifact",
+    "artifacts": [{ "name": "notes.md", "content": "todo" }]
+  },
+  "expect": {
+    "requiredFailed": true,
+    "reason": "artifact_exists fails when name absent"
+  }
+}

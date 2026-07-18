@@ -20,7 +20,7 @@ import type {
   ToolExecResult,
 } from "./company-mediator-tools";
 
-export const WORKFLOW_ARCHITECT_SYSTEM_PROMPT = `You are the Workflow Architect, the top-level Codex Corp agent. You own the company workflow catalog, not a single company run.
+export const WORKFLOW_ARCHITECT_SYSTEM_PROMPT = `You are Byte, the top-level Codex Corp companion. You own the company workflow catalog, not a single company run.
 
 Your job is to turn company requirements into robust multi-agent graphs and maintain them over time. Gather requirements before creating a graph: objective, inputs, outputs, constraints, approvals, tools, skills, and definition of done. Use tools for every catalog fact or mutation; never claim a workflow changed unless the tool succeeds.
 
@@ -33,7 +33,7 @@ You are responsible for every agent and creative node working at its best. For e
 
 If a DASHBOARD_FEEDBACK digest is present in context, use it to prefer lower-burn graphs, tighten high-cost specialists, and align designs with profitable workflows.
 
-You have CRUD access to unlocked workflows. A locked workflow is programmatically read-only: never attempt to update, patch, repair, add/remove nodes or edges, or delete it. You may inspect, validate, open, or duplicate a locked workflow and edit the duplicate. If the operator insists on changing the original, ask them to disable its Architect lock in the workflow editor; never ask for or claim an override. For destructive deletion, explain the target and ask for explicit confirmation first. Prefer focused specialist nodes with precise prompts, least-privilege tools/skills, typed handoffs, human gates for irreversible actions, and a final output node. After every mutation sequence, call workflow_validate. Do not describe a workflow as ready while validation errors remain. Summarize exactly what changed and flag remaining risks. Do not run company workflows or implement product code.`;
+You have CRUD access to unlocked workflows. A locked workflow is programmatically read-only: never attempt to update, patch, repair, add/remove nodes or edges, or delete it. You may inspect, validate, open, or duplicate a locked workflow and edit the duplicate. If the operator insists on changing the original, ask them to disable its Byte lock in the workflow editor; never ask for or claim an override. For destructive deletion, explain the target and ask for explicit confirmation first. Prefer focused specialist nodes with precise prompts, least-privilege tools/skills, typed handoffs, human gates for irreversible actions, and a final output node. After every mutation sequence, call workflow_validate. Do not describe a workflow as ready while validation errors remain. Summarize exactly what changed and flag remaining risks. Do not run company workflows or implement product code.`;
 
 export type ArchitectActions = {
   save: (workflow: WorkflowTemplate) => Promise<void> | void;
@@ -359,7 +359,7 @@ function makeNodes(rawNodes: any[]): FlowNode[] {
         cronEnabled: raw.cronEnabled,
         duration: "—",
         tokens: 0,
-        trace: ["Configured by Workflow Architect"],
+        trace: ["Configured by Byte"],
         requiresApproval: Boolean(raw.requiresApproval),
         completionCriteria:
           kind === "agent" || kind === "creative"
@@ -514,7 +514,7 @@ export async function executeWorkflowArchitectTool(
     ]);
     if (exists.locked && !nonMutating.has(name))
       return fail(
-        `Workflow ${id} is locked. Ask the user to disable the Architect lock in the workflow editor, or duplicate it and edit the duplicate.`,
+        `Workflow ${id} is locked. Ask the user to disable the Byte lock in the workflow editor, or duplicate it and edit the duplicate.`,
       );
     if (name === "workflow_update") {
       const workflow = {

@@ -25,6 +25,7 @@ import {
   reconnectEdge,
   useNodesState,
   useEdgesState,
+  useStore,
   MarkerType,
   type Connection,
   type NodeProps,
@@ -55,6 +56,7 @@ import {
   Maximize2,
   Merge,
   Network,
+  Pencil,
   Play,
   Plus,
   Redo2,
@@ -128,7 +130,9 @@ import {
 } from "./persistence";
 import {
   cloneTemplateGraph,
+  cloneTemplateGraphLaidOut,
   createBlankWorkflowTemplate,
+  createWorkflowFromTemplate,
   DEFAULT_TEMPLATE_ID,
   EMPTY_WORKFLOW_TEMPLATE,
   getTemplate,
@@ -141,6 +145,20 @@ import {
   hydrateWorkflowCatalog,
 } from "./templates";
 import { ensureSpecialistQuality } from "./specialist-defaults";
+import {
+  instantiatePack,
+  instantiatePackForRole,
+  listPacksForCatalog,
+  type NodePack,
+} from "./node-packs";
+import { RoleCatalogMenu } from "./role-catalog-menu";
+import { iconForPack, iconForSpecialistRole } from "./role-icons";
+import {
+  DEFAULT_WORKFLOW_ICON,
+  WORKFLOW_ICON_OPTIONS,
+  normalizeWorkflowIcon,
+  workflowIconComponent,
+} from "./workflow-icons";
 import {
   applyTokenUsageToNode,
   extractTotalTokensFromPayload,
@@ -368,7 +386,15 @@ function defaultRoleForKind(kind: Kind, role?: string): string {
 }
 
 function CorpNode({ data, selected }: NodeProps<FlowNode>) {
-  const Icon = roleIcons[data.kind];
+  const Icon =
+    data.kind === "agent" || data.kind === "creative"
+      ? iconForSpecialistRole({
+          packId: data.packId,
+          role: data.role,
+          label: data.label,
+          kind: data.kind,
+        })
+      : roleIcons[data.kind];
   const liveModels = useSyncExternalStore(
     subscribeLiveCodexModels,
     getLiveCodexModels,
@@ -534,6 +560,7 @@ function SignalEdge({
   data,
   markerEnd,
   selected,
+  target,
 }: EdgeProps<FlowEdge>) {
   const [path, labelX, labelY] = getBezierPath({
     sourceX,
@@ -545,6 +572,32 @@ function SignalEdge({
     curvature: 0.42,
   });
   const kind = data?.edgeType || "standard";
+  // Live revision count lives on the revised node (edge target); policy on the edge.
+  const usedRevisions = useStore(
+    useCallback(
+      (state) => {
+        const node = state.nodes.find((item) => item.id === target);
+        const revisions = (node?.data as { revisions?: number } | undefined)
+          ?.revisions;
+        return typeof revisions === "number" && revisions >= 0 ? revisions : 0;
+      },
+      [target],
+    ),
+  );
+  const maxRevisions = Math.max(
+    1,
+    Number.isFinite(data?.maxRevisions) ? Number(data?.maxRevisions) : 2,
+  );
+  const edgeLabel =
+    kind === "revision"
+      ? `REVISION · ${usedRevisions}/${maxRevisions}`
+      : kind === "conditional"
+        ? `IF · ${data?.condition?.trim() || "success"}`
+        : kind === "approval"
+          ? "APPROVAL"
+          : kind === "merge"
+            ? "MERGE"
+            : null;
   return (
     <>
       <BaseEdge
@@ -554,15 +607,15 @@ function SignalEdge({
         interactionWidth={24}
         className={`signal-edge edge-${kind} ${selected ? "selected" : ""} ${data?.highlighted ? "aperture-lit" : ""} ${data?.dimmed ? "aperture-dim" : ""}`}
       />
-      {kind === "revision" && (
+      {edgeLabel && (
         <EdgeLabelRenderer>
           <div
-            className="edge-label revision"
+            className={`edge-label ${kind === "revision" ? "revision" : kind}`}
             style={{
               transform: `translate(-50%,-50%) translate(${labelX}px,${labelY}px)`,
             }}
           >
-            REVISION · 1/2
+            {edgeLabel}
           </div>
         </EdgeLabelRenderer>
       )}
@@ -584,12 +637,8 @@ const library = [
     hint: "fresh Codex thread",
     icon: Bot,
   },
-  {
-    kind: "creative" as Kind,
-    label: "Creative",
-    hint: "logos · assets · edit",
-    icon: Image,
-  },
+  // Creative is available via Agent role catalog and SPECIALISTS (not a
+  // duplicate top-level entry).
   {
     kind: "approval" as Kind,
     label: "Approval",
@@ -634,18 +683,10 @@ const library = [
   },
 ];
 
-const specialistRoles = [
-  "Product Manager",
-  "Researcher",
-  "Architect",
-  "Designer",
-  "Frontend Engineer",
-  "Backend Engineer",
-  "QA Engineer",
-  "Security Reviewer",
-  "Code Reviewer",
-  "Delivery Agent",
-] as const;
+/** Specialist packs for library sidebar (excludes empty — Empty is last in role catalog). */
+const specialistPacks = listPacksForCatalog().filter(
+  (pack) => pack.id !== "empty-agent",
+);
 
 function App() {
   const [nodes, setNodes, onNodesChange] = useNodesState<FlowNode>(
@@ -658,6 +699,14 @@ function App() {
   const [workflowName, setWorkflowName] = useState("Untitled workflow");
   const [workflowDescription, setWorkflowDescription] = useState("");
   const [workflowVersion, setWorkflowVersion] = useState("v0.1");
+  const [workflowIcon, setWorkflowIcon] = useState(DEFAULT_WORKFLOW_ICON);
+  const [identityOpen, setIdentityOpen] = useState(false);
+  const [identityDraft, setIdentityDraft] = useState({
+    name: "Untitled workflow",
+    description: "",
+    version: "v0.1",
+    icon: DEFAULT_WORKFLOW_ICON,
+  });
   const [catalogRevision, setCatalogRevision] = useState(0);
   const [catalogReady, setCatalogReady] = useState(() => !isTauri());
   const [architectInitialPrompt, setArchitectInitialPrompt] = useState("");
@@ -845,9 +894,12 @@ function App() {
     );
   }, [libraryFilter]);
   const filteredSpecialists = useMemo(() => {
-    if (!libraryFilter) return [...specialistRoles];
-    return specialistRoles.filter((role) =>
-      role.toLowerCase().includes(libraryFilter),
+    if (!libraryFilter) return specialistPacks;
+    return specialistPacks.filter(
+      (pack) =>
+        pack.label.toLowerCase().includes(libraryFilter) ||
+        pack.role.toLowerCase().includes(libraryFilter) ||
+        pack.description.toLowerCase().includes(libraryFilter),
     );
   }, [libraryFilter]);
 
@@ -954,7 +1006,7 @@ function App() {
                 trace: [
                   ...n.data.trace,
                   source === "chat"
-                    ? "Mission updated from company mediator"
+                    ? "Mission updated from Byte"
                     : "Mission updated",
                 ],
               },
@@ -1056,7 +1108,7 @@ function App() {
           const detail =
             tool === "company_run_from"
               ? "Start from this node and intentionally skip its ancestors?"
-              : `Allow the mediator to ${tool.replace("company_", "").replace(/_/g, " ")}?`;
+              : `Allow Byte to ${tool.replace("company_", "").replace(/_/g, " ")}?`;
           if (!window.confirm(detail)) {
             await invoke("respond_mediator_tool", {
               requestId,
@@ -1097,7 +1149,7 @@ function App() {
       const recentConversation = req.history
         .map(
           (message) =>
-            `${message.role === "user" ? "Operator" : "Company mediator"}: ${message.text}`,
+            `${message.role === "user" ? "Operator" : "Byte"}: ${message.text}`,
         )
         .join("\n\n");
       const result = await invoke<{
@@ -1153,7 +1205,7 @@ function App() {
   ) => {
     if (!isTauri())
       throw new Error(
-        "Workflow Architect needs the Codex Corp desktop app with Live Codex.",
+        "Byte needs the Codex Corp desktop app with Live Codex.",
       );
     if (!codexInfo.compatible)
       throw new Error(
@@ -1224,7 +1276,7 @@ function App() {
             fallbackTranscript: req.history
               .map(
                 (m) =>
-                  `${m.role === "user" ? "Operator" : "Workflow Architect"}: ${m.text}`,
+                  `${m.role === "user" ? "Operator" : "Byte"}: ${m.text}`,
               )
               .join("\n\n"),
             contextDigest: `${buildArchitectContextDigest()}${await architectContextExtras()}`,
@@ -1511,28 +1563,20 @@ function App() {
     if (selectedId === nodeId) setSelectedId("");
     markDirty();
   };
-  const createNode = (
-    kind: Kind,
+  const [roleCatalog, setRoleCatalog] = useState<null | {
+    x: number;
+    y: number;
+    position?: { x: number; y: number };
+  }>(null);
+
+  const createNodeFromPack = (
+    pack: NodePack,
     position?: { x: number; y: number },
-    role?: string,
   ) => {
     pushHistory();
-    const id = `${kind}-${crypto.randomUUID()}`;
+    const id = `${pack.kind}-${crypto.randomUUID()}`;
     const i = nodes.length;
-    const isSpecialist = isSpecialistKind(kind);
-    const label = defaultLabelForKind(kind, role);
-    const nodeRole = defaultRoleForKind(kind, role);
-    const specialist = isSpecialist
-      ? ensureSpecialistQuality({
-          kind,
-          role: nodeRole,
-          label,
-          prompt: "",
-          tools: [],
-          skills: [],
-          description: "",
-        })
-      : null;
+    const inst = instantiatePack(pack);
     setNodes((ns) => [
       ...ns,
       {
@@ -1543,8 +1587,110 @@ function App() {
           y: 120 + (i % 4) * 150,
         },
         data: {
-          label,
-          role: nodeRole,
+          label: inst.label,
+          role: inst.role,
+          kind: inst.kind,
+          status: "idle",
+          model: defaultModelFromList(codexModels) || modelDefault,
+          effort: "low",
+          tools: inst.tools,
+          skills: inst.skills,
+          connectorTools: [],
+          packId: inst.packId,
+          packVersion: inst.packVersion,
+          baseInstructions: inst.baseInstructions,
+          developerInstructions: inst.developerInstructions,
+          prompt: inst.prompt,
+          description: inst.description,
+          duration: "—",
+          tokens: 0,
+          trace:
+            inst.kind === "creative"
+              ? ["Creative Studio ready"]
+              : ["Draft node created"],
+          maxRevisions: 2,
+          completionCriteria: inst.completionCriteria ?? defaultPlatformCriteria(),
+          maxRetries: 2,
+          timeoutSeconds: 120,
+          sandboxProfile: inst.sandboxProfile,
+          approvalPolicy: inst.approvalPolicy,
+          color: kindPopColor(inst.kind),
+        },
+      },
+    ]);
+    setSelectedId(id);
+    setSelectedEdge(null);
+    markDirty();
+    return id;
+  };
+
+  const createNode = (
+    kind: Kind,
+    position?: { x: number; y: number },
+    role?: string,
+    options?: { openRoleCatalogAt?: { x: number; y: number } },
+  ) => {
+    // Generic agent placement opens the role catalog (Empty last).
+    if (kind === "agent" && !role) {
+      const screen = options?.openRoleCatalogAt ?? {
+        x: window.innerWidth / 2 - 160,
+        y: window.innerHeight / 2 - 200,
+      };
+      setRoleCatalog({ x: screen.x, y: screen.y, position });
+      return "";
+    }
+
+    pushHistory();
+    const id = `${kind}-${crypto.randomUUID()}`;
+    const i = nodes.length;
+    const isSpecialist = isSpecialistKind(kind);
+    const label = defaultLabelForKind(kind, role);
+    const nodeRole = defaultRoleForKind(kind, role);
+    const packInst =
+      isSpecialist && role
+        ? instantiatePackForRole(role, kind === "creative" ? "creative" : "agent")
+        : isSpecialist && kind === "creative"
+          ? instantiatePackForRole("Creative", "creative")
+          : null;
+    const specialist = packInst
+      ? ensureSpecialistQuality({
+          kind: packInst.kind,
+          role: packInst.role,
+          label: packInst.label,
+          packId: packInst.packId,
+          packVersion: packInst.packVersion,
+          baseInstructions: packInst.baseInstructions,
+          developerInstructions: packInst.developerInstructions,
+          prompt: packInst.prompt,
+          tools: packInst.tools,
+          skills: packInst.skills,
+          description: packInst.description,
+        })
+      : isSpecialist
+        ? ensureSpecialistQuality({
+            kind,
+            role: nodeRole,
+            label,
+            prompt: "",
+            tools: [],
+            skills: [],
+            description: "",
+          })
+        : null;
+    setNodes((ns) => [
+      ...ns,
+      {
+        id,
+        type: "corpNode",
+        position: position ?? {
+          x: 320 + (i % 3) * 310,
+          y: 120 + (i % 4) * 150,
+        },
+        data: {
+          label: specialist?.packId
+            ? (packInst?.label ?? label)
+            : label,
+          role: specialist ? (packInst?.role ?? nodeRole) : nodeRole,
           kind,
           status: kind === "note" ? "draft" : "idle",
           model: isSpecialist
@@ -1562,6 +1708,10 @@ function App() {
               : [],
           skills: specialist ? specialist.skills : undefined,
           connectorTools: isSpecialist ? [] : undefined,
+          packId: specialist?.packId,
+          packVersion: specialist?.packVersion,
+          baseInstructions: specialist?.baseInstructions,
+          developerInstructions: specialist?.developerInstructions,
           prompt: specialist
             ? specialist.prompt
             : kind === "note"
@@ -1732,6 +1882,7 @@ function App() {
     setWorkflowName(meta.name);
     setWorkflowDescription(meta.description ?? "");
     setWorkflowVersion(meta.version || "v0.1");
+    setWorkflowIcon(normalizeWorkflowIcon(meta.icon));
     localStorage.setItem(ACTIVE_WORKFLOW_KEY, nextWorkflowId);
     setNodes(nextNodes);
     setEdges(nextEdges);
@@ -1752,6 +1903,7 @@ function App() {
     name?: string;
     description?: string;
     version?: string;
+    icon?: string;
   }) => {
     // Explicit metadata edits promote drafts into the catalog so name/description
     // are visible on Overview without requiring a full graph save first.
@@ -1764,8 +1916,34 @@ function App() {
       if (patch.description !== undefined)
         setWorkflowDescription(updated.description);
       if (patch.version !== undefined) setWorkflowVersion(updated.version);
+      if (patch.icon !== undefined)
+        setWorkflowIcon(normalizeWorkflowIcon(updated.icon));
       setCatalogRevision((value) => value + 1);
     }
+  };
+
+  const openIdentityEditor = () => {
+    setIdentityDraft({
+      name: workflowName,
+      description: workflowDescription,
+      version: workflowVersion,
+      icon: normalizeWorkflowIcon(workflowIcon),
+    });
+    setIdentityOpen(true);
+  };
+
+  const saveIdentityEditor = () => {
+    const name = identityDraft.name.trim() || "Untitled workflow";
+    const version = normalizeWorkflowVersion(identityDraft.version);
+    const description = identityDraft.description.trim();
+    const icon = normalizeWorkflowIcon(identityDraft.icon);
+    setWorkflowName(name);
+    setWorkflowVersion(version);
+    setWorkflowDescription(description);
+    setWorkflowIcon(icon);
+    persistWorkflowMetadata({ name, version, description, icon });
+    markDirty();
+    setIdentityOpen(false);
   };
 
   const save = async (emptyConfirmed = false) => {
@@ -1782,6 +1960,7 @@ function App() {
       name: workflowName.trim() || "Untitled workflow",
       description: workflowDescription.trim(),
       version: normalizeWorkflowVersion(workflowVersion),
+      icon: normalizeWorkflowIcon(workflowIcon),
       nodes: structuredClone(nodes),
       edges: structuredClone(edges),
       draft: false,
@@ -1796,6 +1975,7 @@ function App() {
         name: workflowName.trim() || "Untitled workflow",
         description: workflowDescription.trim(),
         version: normalizeWorkflowVersion(workflowVersion),
+        icon: normalizeWorkflowIcon(workflowIcon),
         nodes,
         edges,
         draft: false,
@@ -1859,11 +2039,14 @@ function App() {
   const resetToSeed = () => {
     userMutatedWorkflow.current = true;
     pushHistory();
-    const factory = cloneTemplateGraph(getTemplate(workflowId));
+    const factory = cloneTemplateGraphLaidOut(getTemplate(workflowId));
     applyGraph(factory.nodes, factory.edges, workflowId, "Seed template");
     emit(
       `Factory template restored · ${getTemplate(workflowId).name}`,
       "workflow.seed",
+    );
+    requestAnimationFrame(() =>
+      flowRef.current?.fitView({ padding: 0.12, duration: 300 }),
     );
   };
   const loadRunHistoryFor = async (id: string) => {
@@ -1999,7 +2182,9 @@ function App() {
     } catch {
       /* factory fallback */
     }
-    const factory = cloneTemplateGraph(template);
+    // Factory/template seeds use coarse index positions — auto-layout so first
+    // open matches the Auto layout command.
+    const factory = cloneTemplateGraphLaidOut(template);
     applyGraph(factory.nodes, factory.edges, nextId, "Template loaded");
     await loadRunHistoryFor(nextId);
     emit(`Switched to template · ${template.name}`, "workflow.template");
@@ -2019,6 +2204,15 @@ function App() {
     const template = createBlankWorkflowTemplate();
     await persistArchitectWorkflow(template);
     await switchTemplate(template.id, "editor");
+  };
+
+  /** Builtin template → new user workflow copy under Workflows + open editor. */
+  const useTemplateAsWorkflow = async (templateId: string) => {
+    if (running) return;
+    const source = getTemplate(templateId);
+    const instance = createWorkflowFromTemplate(source);
+    await persistArchitectWorkflow(instance);
+    await switchTemplate(instance.id, "editor");
   };
 
   const validate = async () => {
@@ -2550,6 +2744,7 @@ function App() {
         setWorkflowName(metadata.name);
         setWorkflowDescription(metadata.description ?? "");
         setWorkflowVersion(metadata.version || "v0.1");
+        setWorkflowIcon(normalizeWorkflowIcon(metadata.icon));
       }
       // 1) Auto-load last saved workflow for the active template when present.
       // Skip if the user already Seeded/edited after first paint (late-load race).
@@ -2574,7 +2769,7 @@ function App() {
               "workflow.autoload",
             );
           } else if (activeId !== DEFAULT_TEMPLATE_ID) {
-            const factory = cloneTemplateGraph(getTemplate(activeId));
+            const factory = cloneTemplateGraphLaidOut(getTemplate(activeId));
             setWorkflowId(activeId);
             setNodes(factory.nodes);
             setEdges(factory.edges);
@@ -2789,6 +2984,16 @@ function App() {
           "approval.requested": "approval",
         };
         if (payload.nodeId && nodeStatus[payload.eventType]) {
+          const diag = payload.diagnostics ?? {};
+          const summary =
+            typeof diag.summary === "string" ? diag.summary : undefined;
+          const data =
+            diag.data && typeof diag.data === "object" && !Array.isArray(diag.data)
+              ? (diag.data as Record<string, unknown>)
+              : undefined;
+          const artifacts = Array.isArray(diag.artifacts)
+            ? diag.artifacts
+            : undefined;
           setNodes((items) =>
             items.map((node) =>
               node.id === payload.nodeId
@@ -2797,6 +3002,28 @@ function App() {
                     data: {
                       ...node.data,
                       status: nodeStatus[payload.eventType]!,
+                      // Live SSOT chips: slim diagnostics carry summary + data.verification
+                      // (+ artifact meta without file bodies). Full content stays in node_executions.
+                      ...(payload.eventType === "node.attempt.completed"
+                        ? {
+                            ...(summary !== undefined ? { output: summary } : {}),
+                            ...(data !== undefined
+                              ? {
+                                  structuredOutput: {
+                                    ...(typeof node.data.structuredOutput ===
+                                      "object" &&
+                                    node.data.structuredOutput
+                                      ? node.data.structuredOutput
+                                      : {}),
+                                    ...data,
+                                  },
+                                }
+                              : {}),
+                            ...(artifacts !== undefined
+                              ? { artifacts: artifacts as typeof node.data.artifacts }
+                              : {}),
+                          }
+                        : {}),
                       trace: [...node.data.trace, payload.message].slice(-80),
                     },
                   }
@@ -3078,6 +3305,20 @@ function App() {
             onEditWorkflow={(id) => {
               void switchTemplate(id, "editor");
             }}
+            onUseTemplate={(id) => {
+              void useTemplateAsWorkflow(id);
+            }}
+            onDeleteWorkflow={(id) => {
+              void (async () => {
+                deleteWorkflowFromCatalog(id);
+                localStorage.removeItem(workflowStorageKey(id));
+                setCatalogRevision((value) => value + 1);
+                if (id === workflowId) {
+                  const fallback = listWorkflows()[0];
+                  if (fallback) await switchTemplate(fallback.id, "stay");
+                }
+              })();
+            }}
             onOpenCodexHealth={() => setCompatibilityOpen(true)}
             onCreateWorkflow={() => void createBlankWorkflow()}
             onOpenArchitect={(prompt) => {
@@ -3094,7 +3335,7 @@ function App() {
   if (appView === "architect") {
     return (
       <>
-        <FeatureBoundary name="Workflow Architect">
+        <FeatureBoundary name="Byte">
           <WorkflowArchitectPage
             revision={catalogRevision}
             initialPrompt={architectInitialPrompt}
@@ -3201,59 +3442,37 @@ function App() {
           </div>
         </div>
         <div className="workflow-picker editor-workflow-meta">
-          <div className="workflow-current">
-            <span>EDITING</span>
-            <label className="workflow-name-editor">
-              <input
-                value={workflowName}
-                onChange={(event) => {
-                  setWorkflowName(event.target.value);
-                  markDirty();
-                }}
-                onBlur={() => {
-                  const name = workflowName.trim() || "Untitled workflow";
-                  setWorkflowName(name);
-                  persistWorkflowMetadata({ name });
-                }}
-                aria-label="Workflow name"
-              />
-            </label>
-            <label className="workflow-version-editor">
-              <span>Version</span>
-              <input
-                value={workflowVersion}
-                onChange={(event) => {
-                  setWorkflowVersion(event.target.value);
-                  markDirty();
-                }}
-                onBlur={() => {
-                  const version = normalizeWorkflowVersion(workflowVersion);
-                  setWorkflowVersion(version);
-                  persistWorkflowMetadata({ version });
-                }}
-                aria-label="Workflow version"
-                title="Semantic product version for this company graph (e.g. v0.1, v1.2)"
-              />
-            </label>
-          </div>
-          <label className="workflow-description-editor">
-            <span>Description</span>
-            <textarea
-              value={workflowDescription}
-              rows={2}
-              placeholder="What this company workflow does…"
-              onChange={(event) => {
-                setWorkflowDescription(event.target.value);
-                markDirty();
-              }}
-              onBlur={() => {
-                persistWorkflowMetadata({
-                  description: workflowDescription.trim(),
-                });
-              }}
-              aria-label="Workflow description"
-            />
-          </label>
+          <button
+            type="button"
+            className="workflow-identity-trigger"
+            onClick={openIdentityEditor}
+            title="Edit workflow name, icon, version, and description"
+            aria-haspopup="dialog"
+            aria-expanded={identityOpen}
+          >
+            {(() => {
+              const IdentityIcon = workflowIconComponent(workflowIcon);
+              return (
+                <span className="workflow-identity-glyph" aria-hidden>
+                  <IdentityIcon size={16} />
+                </span>
+              );
+            })()}
+            <div className="workflow-identity-copy">
+              <div className="workflow-identity-title">
+                <strong>{workflowName || "Untitled workflow"}</strong>
+                <span className="workflow-version-tag">{workflowVersion}</span>
+              </div>
+              <span className="workflow-identity-desc">
+                {workflowDescription.trim() || "Add a description…"}
+              </span>
+            </div>
+            <span className="workflow-identity-edit" aria-hidden>
+              <Pencil size={13} />
+            </span>
+          </button>
+        </div>
+        <div className="top-actions">
           <button
             type="button"
             className={`architect-lock ${activeTemplate.locked ? "locked" : ""}`}
@@ -3265,16 +3484,19 @@ function App() {
             }}
             title={
               activeTemplate.locked
-                ? "Workflow Architect cannot modify this workflow"
-                : "Allow Workflow Architect to modify this workflow"
+                ? "Byte cannot modify this workflow"
+                : "Allow Byte to modify this workflow"
             }
             aria-pressed={Boolean(activeTemplate.locked)}
+            aria-label={
+              activeTemplate.locked
+                ? "Unlock workflow for Byte"
+                : "Lock workflow from Byte"
+            }
           >
             {activeTemplate.locked ? <Lock size={14} /> : <Unlock size={14} />}
-            Architect {activeTemplate.locked ? "locked" : "unlocked"}
+            {activeTemplate.locked ? "Locked" : "Unlocked"}
           </button>
-        </div>
-        <div className="top-actions">
           <button
             type="button"
             className="approval-center-trigger"
@@ -3432,10 +3654,10 @@ function App() {
           </div>
           {librarySearchOpen ? (
             <label className="library-search-field">
-              <Search size={13} aria-hidden />
+              <Search size={13} className="library-search-icon" aria-hidden />
               <input
                 ref={librarySearchRef}
-                type="search"
+                type="text"
                 value={libraryQuery}
                 onChange={(e) => setLibraryQuery(e.target.value)}
                 onKeyDown={(e) => {
@@ -3446,8 +3668,10 @@ function App() {
                 }}
                 placeholder="Search types and specialists…"
                 aria-label="Search node library"
+                autoComplete="off"
+                spellCheck={false}
               />
-              {libraryQuery && (
+              {libraryQuery ? (
                 <button
                   type="button"
                   className="library-search-clear"
@@ -3459,7 +3683,7 @@ function App() {
                 >
                   <X size={12} />
                 </button>
-              )}
+              ) : null}
             </label>
           ) : (
             <p className="panel-help">
@@ -3496,16 +3720,19 @@ function App() {
           {filteredSpecialists.length > 0 && (
             <>
               <div className="library-section">SPECIALISTS</div>
-              {filteredSpecialists.map((role) => (
-                <button
-                  className="profile-item"
-                  key={role}
-                  onClick={() => createNode("agent", undefined, role)}
-                >
-                  <Bot size={13} />
-                  {role}
-                </button>
-              ))}
+              {filteredSpecialists.map((pack) => {
+                const PackIcon = iconForPack(pack);
+                return (
+                  <button
+                    className="profile-item"
+                    key={pack.id}
+                    onClick={() => createNodeFromPack(pack)}
+                  >
+                    <PackIcon size={13} aria-hidden />
+                    {pack.label}
+                  </button>
+                );
+              })}
             </>
           )}
           {filteredLibrary.length === 0 && filteredSpecialists.length === 0 && (
@@ -3559,7 +3786,9 @@ function App() {
               x: e.clientX,
               y: e.clientY,
             });
-            createNode(kind, p);
+            createNode(kind, p, undefined, {
+              openRoleCatalogAt: { x: e.clientX, y: e.clientY },
+            });
           }}
           onDragOver={(e) => {
             e.preventDefault();
@@ -3703,15 +3932,18 @@ function App() {
           aria-hidden={!inspectorOpen}
         >
           {inspectorOpen && (
-            <button
-              type="button"
-              className="panel-collapse-btn inspector-collapse-float"
-              aria-label="Collapse inspector"
-              title="Collapse inspector"
-              onClick={() => setInspectorOpen(false)}
-            >
-              <ChevronRight size={14} />
-            </button>
+            <div className="inspector-chrome">
+              <span className="inspector-chrome-label">Inspector</span>
+              <button
+                type="button"
+                className="panel-collapse-btn"
+                aria-label="Collapse inspector"
+                title="Collapse inspector"
+                onClick={() => setInspectorOpen(false)}
+              >
+                <ChevronRight size={14} />
+              </button>
+            </div>
           )}
           <Suspense
             fallback={
@@ -4164,7 +4396,12 @@ function App() {
                 <button
                   role="menuitem"
                   onClick={() => {
-                    createNode("agent");
+                    createNode("agent", undefined, undefined, {
+                      openRoleCatalogAt: {
+                        x: contextMenu.x,
+                        y: contextMenu.y,
+                      },
+                    });
                     closeContextMenu();
                   }}
                 >
@@ -4202,6 +4439,168 @@ function App() {
                 </button>
               </>
             )}
+          </div>
+        </div>
+      )}
+      {roleCatalog && (
+        <RoleCatalogMenu
+          x={roleCatalog.x}
+          y={roleCatalog.y}
+          onCancel={() => setRoleCatalog(null)}
+          onSelect={(pack) => {
+            createNodeFromPack(pack, roleCatalog.position);
+            setRoleCatalog(null);
+          }}
+        />
+      )}
+      {identityOpen && (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onClick={(event) => {
+            if (event.target === event.currentTarget) setIdentityOpen(false);
+          }}
+        >
+          <div
+            className="workflow-identity-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="workflow-identity-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header className="workflow-identity-modal-header">
+              <div>
+                <span className="workflow-identity-modal-eyebrow">
+                  Workflow identity
+                </span>
+                <h2 id="workflow-identity-title">
+                  Name, icon, version & description
+                </h2>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                aria-label="Close identity editor"
+                onClick={() => setIdentityOpen(false)}
+              >
+                <X size={15} />
+              </button>
+            </header>
+            <div className="workflow-identity-modal-body">
+              <div
+                className="workflow-identity-field workflow-identity-icon-field"
+                role="group"
+                aria-label="Homescreen icon"
+              >
+                <span>Icon</span>
+                <p className="workflow-identity-icon-help">
+                  Shown on the workflows homescreen card for this company.
+                </p>
+                <div className="workflow-icon-picker">
+                  {WORKFLOW_ICON_OPTIONS.map(({ id, label, Icon }) => {
+                    const selected =
+                      normalizeWorkflowIcon(identityDraft.icon) === id;
+                    return (
+                      <button
+                        key={id}
+                        type="button"
+                        className={`workflow-icon-option${selected ? " selected" : ""}`}
+                        title={label}
+                        aria-label={label}
+                        aria-pressed={selected}
+                        onClick={() =>
+                          setIdentityDraft((draft) => ({
+                            ...draft,
+                            icon: id,
+                          }))
+                        }
+                      >
+                        <Icon size={16} aria-hidden />
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+              <label className="workflow-identity-field">
+                <span>Name</span>
+                <input
+                  value={identityDraft.name}
+                  onChange={(event) =>
+                    setIdentityDraft((draft) => ({
+                      ...draft,
+                      name: event.target.value,
+                    }))
+                  }
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      saveIdentityEditor();
+                    }
+                    if (event.key === "Escape") setIdentityOpen(false);
+                  }}
+                  autoFocus
+                  placeholder="Untitled workflow"
+                  aria-label="Workflow name"
+                />
+              </label>
+              <label className="workflow-identity-field workflow-identity-version">
+                <span>Version</span>
+                <input
+                  value={identityDraft.version}
+                  onChange={(event) =>
+                    setIdentityDraft((draft) => ({
+                      ...draft,
+                      version: event.target.value,
+                    }))
+                  }
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      saveIdentityEditor();
+                    }
+                    if (event.key === "Escape") setIdentityOpen(false);
+                  }}
+                  placeholder="v0.1"
+                  title="Semantic product version (e.g. v0.1, v1.2)"
+                  aria-label="Workflow version"
+                />
+              </label>
+              <label className="workflow-identity-field workflow-identity-description">
+                <span>Description</span>
+                <textarea
+                  value={identityDraft.description}
+                  onChange={(event) =>
+                    setIdentityDraft((draft) => ({
+                      ...draft,
+                      description: event.target.value,
+                    }))
+                  }
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape") setIdentityOpen(false);
+                  }}
+                  rows={3}
+                  placeholder="What this company workflow does…"
+                  aria-label="Workflow description"
+                />
+              </label>
+            </div>
+            <footer className="workflow-identity-modal-footer">
+              <button
+                type="button"
+                className="workflow-identity-cancel"
+                onClick={() => setIdentityOpen(false)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="workflow-identity-save"
+                onClick={saveIdentityEditor}
+              >
+                <Check size={14} aria-hidden />
+                Save details
+              </button>
+            </footer>
           </div>
         </div>
       )}

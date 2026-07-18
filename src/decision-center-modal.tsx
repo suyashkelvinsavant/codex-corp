@@ -48,7 +48,7 @@ export function DecisionCenterModal({
         <h2 id="decision-center-title">Approvals & questions</h2>
         {!pending.length && !question && (
           <p className="decision-center-empty">
-            No pending decisions. New approvals and mediator questions will
+            No pending decisions. New approvals and Byte questions will
             appear here.
           </p>
         )}
@@ -74,7 +74,7 @@ export function DecisionCenterModal({
           ))}
           {question && (
             <section className="decision-card mediator-question-modal">
-              <span>QUESTION · COMPANY MEDIATOR</span>
+              <span>QUESTION · BYTE</span>
               <h3>{question.title}</h3>
               <p>{question.body}</p>
               {!!question.options?.length && (

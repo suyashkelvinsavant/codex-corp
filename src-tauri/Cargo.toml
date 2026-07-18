@@ -8,6 +8,22 @@ edition = "2021"
 name = "codex_corp_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# Real unit tests live in the lib (`cargo test --lib` / package tests). Bins are
+# thin entrypoints without harness coverage. `test = false` also avoids linking
+# empty bin-test targets if the Windows build.rs RT_MANIFEST strip ever fails
+# (fallback skips /MANIFESTINPUT and leaves tauri's resource.lib intact).
+[[bin]]
+name = "codex-corp"
+path = "src/main.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "codex-corp-headless"
+path = "src/bin/headless.rs"
+test = false
+bench = false
+
 [features]
 # Tauri serves the bundled frontend only when this feature is enabled. Keep it
 # off for `desktop:dev`, where the WebView intentionally connects to Vite.
@@ -31,3 +47,13 @@ rfd = "0.15"
 # Request its std feature explicitly so modern Rust does not compile the
 # three-parameter no_std IndexMap against schemars' two-parameter alias.
 indexmap = { version = "1.9.3", features = ["std"] }
+# Content / bundle hashes for delivery integrity (plan III.5): portable SHA-256.
+sha2 = "0.10"
+# Headless process signals: Ctrl+C / SIGINT on all platforms; SIGTERM via signal-hook on Unix.
+ctrlc = "3"
+fs2 = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"

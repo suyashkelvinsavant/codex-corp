@@ -326,7 +326,7 @@ export function composeDashboardFeedback(
     `### Recommendations`,
     snapshot.totalExpense > snapshot.totalRevenue && snapshot.totalExpense > 0
       ? `- Expenses exceed revenue — tighten high-burn specialists or raise monetization tracking.`
-      : `- Keep mapping revenue sources to workflows so Architect can prioritize profitable graphs.`,
+      : `- Keep mapping revenue sources to workflows so Byte can prioritize profitable graphs.`,
     snapshot.totalTokenBurn > 0
       ? `- Review high-token specialists for shorter prompts, lower effort, or fewer revision loops.`
       : `- After the first Live Codex runs, re-run this briefing for cost signals.`,

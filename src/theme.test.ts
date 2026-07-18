@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  accentOnSurface,
   buildAppearanceCssVars,
   contrastRatio,
+  DEFAULT_APPEARANCE,
   onAccentColor,
   primaryButtonPair,
   relativeLuminance,
@@ -52,6 +54,7 @@ describe("appearance contrast tokens", () => {
 
   it("keeps primary CTA contrast above WCAG large-text floor for all presets", () => {
     for (const accent of [
+      "#ffffff",
       "#55d6be",
       "#e8b45b",
       "#b58ad8",
@@ -72,5 +75,66 @@ describe("appearance contrast tokens", () => {
       expect(relativeLuminance(vars["--nav-active-bg"])).toBeGreaterThan(0.65);
       expect(relativeLuminance(vars["--nav-active-fg"])).toBeLessThan(0.45);
     }
+  });
+
+  it("defaults dark mode to pitch black stage, grey chrome, white accent", () => {
+    expect(DEFAULT_APPEARANCE).toMatchObject({
+      mode: "dark",
+      accent: "#ffffff",
+    });
+    const vars = buildAppearanceCssVars({
+      mode: "dark",
+      accent: "#ffffff",
+      bodyWeight: "500",
+    });
+    expect(vars["--foundry"]).toBe("#000000");
+    expect(vars["--topbar-bg"]).toBe("#141416");
+    expect(vars["--panel"]).toBe("#141416");
+    expect(vars["--surface-2"]).toBe("#1a1a1e");
+    expect(vars["--accent"]).toBe("#ffffff");
+    expect(vars["--primary-bg"]).toBe("#ffffff");
+    expect(vars["--primary-fg"]).toBe("#0b1210");
+    expect(relativeLuminance(vars["--foundry"])).toBeLessThan(0.02);
+    // Chrome sits clearly above pure black so sidebars/bottom bars read as grey.
+    expect(relativeLuminance(vars["--panel"])).toBeGreaterThan(
+      relativeLuminance(vars["--foundry"]),
+    );
+  });
+
+  it("keeps icons/chips readable when light mode uses white accent", () => {
+    expect(accentOnSurface("#ffffff", "#ffffff")).not.toBe("#ffffff");
+    expect(
+      contrastRatio(accentOnSurface("#ffffff", "#ffffff"), "#ffffff"),
+    ).toBeGreaterThan(3);
+
+    const vars = buildAppearanceCssVars({
+      mode: "light",
+      accent: "#ffffff",
+      bodyWeight: "500",
+    });
+    // Pure white stays available for fills (primary buttons).
+    expect(vars["--accent"]).toBe("#ffffff");
+    expect(vars["--primary-bg"]).toBe("#ffffff");
+    // Mark token is darkened for paint-on-surface (icons, version chips, tabs).
+    expect(vars["--accent-mark"]).toBeDefined();
+    expect(vars["--accent-mark"].toLowerCase()).not.toBe("#ffffff");
+    expect(
+      contrastRatio(vars["--accent-mark"], vars["--panel"]),
+    ).toBeGreaterThan(3);
+    // Soft chip wash is not pure white-on-white.
+    expect(relativeLuminance(vars["--chip-bg"])).toBeLessThan(0.95);
+    expect(relativeLuminance(vars["--chip-fg"])).toBeLessThan(0.4);
+  });
+
+  it("keeps accent-mark high-contrast on dark chrome for white accent", () => {
+    const vars = buildAppearanceCssVars({
+      mode: "dark",
+      accent: "#ffffff",
+      bodyWeight: "500",
+    });
+    expect(vars["--accent-mark"].toLowerCase()).toBe("#ffffff");
+    expect(
+      contrastRatio(vars["--accent-mark"], vars["--panel"]),
+    ).toBeGreaterThan(3);
   });
 });

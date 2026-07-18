@@ -1,5 +1,7 @@
 # Codex Corp: research and product strategy
 
+This durable copy preserves the product rationale alongside the shipped documentation.
+
 **Research date:** 17 July 2026  
 **Scope:** Product and architecture research only. No application code was changed.  
 **Decision horizon:** Hackathon MVP first, revenue validation immediately after, production SaaS second. Video generation is intentionally future scope.

@@ -158,13 +158,22 @@ export function PromptEditor({
                 {" · "}
                 Esc to close
               </small>
-              <button
-                type="button"
-                className="primary"
-                onClick={() => setExpanded(false)}
-              >
-                Done
-              </button>
+              <div className="prompt-modal-footer-actions">
+                <button
+                  type="button"
+                  className="prompt-modal-close-btn"
+                  onClick={() => setExpanded(false)}
+                >
+                  Close
+                </button>
+                <button
+                  type="button"
+                  className="primary"
+                  onClick={() => setExpanded(false)}
+                >
+                  Done
+                </button>
+              </div>
             </footer>
           </div>
         </div>

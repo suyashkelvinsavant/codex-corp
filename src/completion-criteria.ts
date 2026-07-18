@@ -1,10 +1,55 @@
 /**
  * Per-specialist completion criteria: platform guarantees (evaluated) +
  * operator-editable criteria (prompt-injected + soft evaluation).
+ *
+ * ## Host vs client evaluation
+ *
+ * Host-owned kinds (`command`, `artifact_exists`, `architecture_policy`) produce
+ * `verification.results` at runtime. The TS layer must **not** invent pass/fail
+ * for those kinds without host rows — they stay `pending` until results exist.
+ * Lightweight client-side checks remain only for pure JSON/text kinds
+ * (`structured_json`, `concise_summary`, `no_hidden_reasoning`) and advisory
+ * `claim` evidence preview.
  */
 
 export type CriterionKind =
-  "structured_json" | "concise_summary" | "no_hidden_reasoning" | "custom";
+  | "structured_json"
+  | "concise_summary"
+  | "no_hidden_reasoning"
+  /** Self-attestation evidence only; never owns the required pass bit. */
+  | "claim"
+  /** @deprecated Prefer `claim`. Deserialized as `claim`. */
+  | "custom"
+  /** Host runs allowlisted command (npm_test, cargo_test, …). */
+  | "command"
+  /** Host checks materialized artifact presence. */
+  | "artifact_exists"
+  /** Host architecture policy (git-first). */
+  | "architecture_policy";
+
+/** Kinds whose pass/fail is owned by the Rust host (runtime `verification.results`). */
+export const HOST_VERIFIER_KINDS = [
+  "command",
+  "artifact_exists",
+  "architecture_policy",
+] as const;
+
+export type HostVerifierKind = (typeof HOST_VERIFIER_KINDS)[number];
+
+export function isHostVerifierKind(
+  kind: string | undefined | null,
+): kind is HostVerifierKind {
+  const normalized = normalizeCriterionKind(kind);
+  return (HOST_VERIFIER_KINDS as readonly string[]).includes(normalized);
+}
+
+export const COMMAND_TEMPLATE_IDS = [
+  "npm_test",
+  "npm_run_build",
+  "cargo_test",
+  "cargo_check",
+  "node_script",
+] as const;
 
 export type CompletionCriterion = {
   id: string;
@@ -13,10 +58,31 @@ export type CompletionCriterion = {
   enabled: boolean;
   /** Platform guarantees cannot be removed; may still be disabled by operator. */
   platform?: boolean;
-  /** Extra instruction for custom / prompt injection. */
+  /** Extra instruction for custom / prompt injection / node_script path. */
   instruction?: string;
   /** Required failures block/revise; advisory failures are evidence only. */
   enforcement: "required" | "advisory";
+  /** command: allowlisted template id */
+  templateId?: string;
+  /** artifact_exists: expected name */
+  artifactName?: string;
+  /** artifact_exists: expected path fragment */
+  artifactPath?: string;
+  /** architecture_policy id */
+  policyId?: string;
+};
+
+/** Runtime verification result row (prefer over local re-eval post-run). */
+export type VerificationResultRow = {
+  id: string;
+  label?: string;
+  kind?: string;
+  passed: boolean;
+  enforcement?: "required" | "advisory";
+  detail?: string;
+  /** Host method (kind or command:template / architecture_policy:id). */
+  method?: string;
+  source?: string;
 };
 
 export type CriterionEvalStatus = "pass" | "fail" | "pending" | "skipped";
@@ -107,14 +173,29 @@ export function ensureCompletionCriteria(
       continue;
     }
     if (merged.some((m) => m.id === c.id)) continue;
+    const kind = normalizeCriterionKind(c.kind);
+    const isClaim = kind === "claim";
     merged.push({
       id: c.id,
       label: c.label || "Custom criterion",
-      kind: c.kind === "custom" ? "custom" : "custom",
+      // Preserve host verifier kinds; legacy `custom` → claim.
+      kind,
       enabled: c.enabled !== false,
       platform: false,
       instruction: c.instruction,
-      enforcement: c.enforcement ?? "required",
+      templateId: c.templateId,
+      artifactName: c.artifactName,
+      artifactPath: c.artifactPath,
+      policyId: c.policyId,
+      // Required claim is invalid as a pass gate — force advisory.
+      // Host verifiers may stay required.
+      enforcement: isClaim
+        ? c.enforcement === "required"
+          ? "advisory"
+          : (c.enforcement ?? "advisory")
+        : c.enforcement === "required"
+          ? "required"
+          : (c.enforcement ?? "advisory"),
     });
   }
   return merged;
@@ -123,14 +204,33 @@ export function ensureCompletionCriteria(
 export function makeCustomCriterion(label: string): CompletionCriterion {
   const clean = label.replace(/\s+/g, " ").trim() || "Custom criterion";
   return {
-    id: `custom-${crypto.randomUUID()}`,
+    id: `claim-${crypto.randomUUID()}`,
     label: clean,
-    kind: "custom",
+    kind: "claim",
     enabled: true,
     platform: false,
     instruction: clean,
-    enforcement: "required",
+    // Claims cannot be required pass bits (plan invariant 2).
+    enforcement: "advisory",
   };
+}
+
+/** Normalize legacy `custom` kind to `claim`. */
+export function normalizeCriterionKind(
+  kind: string | undefined | null,
+): CriterionKind {
+  if (kind === "custom" || kind === "claim") return "claim";
+  if (
+    kind === "structured_json" ||
+    kind === "concise_summary" ||
+    kind === "no_hidden_reasoning" ||
+    kind === "command" ||
+    kind === "artifact_exists" ||
+    kind === "architecture_policy"
+  ) {
+    return kind;
+  }
+  return "claim";
 }
 
 /** Append enabled criteria into the specialist system prompt. */
@@ -178,6 +278,20 @@ function evaluateOne(
       label: criterion.label,
       status: "pending",
       detail: "No run result yet",
+      enforcement,
+    };
+  }
+
+  // Host-owned kinds (HOST_VERIFIER_KINDS SSOT): never invent pass/fail
+  // without verification.results. New host kinds added to the constant stay
+  // pending without updating this switch.
+  if (isHostVerifierKind(criterion.kind)) {
+    return {
+      id: criterion.id,
+      label: criterion.label,
+      status: "pending",
+      detail:
+        "Host-owned verifier — pending until runtime verification.results",
       enforcement,
     };
   }
@@ -244,8 +358,12 @@ function evaluateOne(
         enforcement,
       };
     }
+    // Host kinds handled above via isHostVerifierKind (command / artifact / arch).
+    case "claim":
     case "custom":
     default: {
+      // Claim criteria never own the required pass bit. Producer `passed`
+      // is evidence-only and is ignored for required gates.
       const evidence = Array.isArray(data?.criteria)
         ? data.criteria.find(
             (entry) =>
@@ -254,25 +372,110 @@ function evaluateOne(
               (entry as { id?: unknown }).id === criterion.id,
           )
         : undefined;
-      const passed =
+      const claimText =
         evidence && typeof evidence === "object"
-          ? (evidence as { passed?: unknown }).passed === true
-          : false;
+          ? String(
+              (evidence as { evidence?: unknown }).evidence ??
+                (evidence as { note?: unknown }).note ??
+                "",
+            ).trim()
+          : "";
+      const claimEnum =
+        evidence && typeof evidence === "object"
+          ? String((evidence as { claim?: unknown }).claim ?? "")
+              .trim()
+              .toLowerCase()
+          : "";
+      const passedFalse =
+        evidence &&
+        typeof evidence === "object" &&
+        (evidence as { passed?: unknown }).passed === false;
+      // Required claim is invalid: always fail closed for required enforcement.
+      if (enforcement === "required") {
+        return {
+          id: criterion.id,
+          label: criterion.label,
+          status: "fail",
+          detail:
+            "Required claim criteria are invalid — use platform/command/artifact verifiers",
+          enforcement,
+        };
+      }
+      // Advisory: need evidence text; fail on not_satisfied/unknown or passed:false.
+      // Still ignore passed:true as sole authority (empty evidence fails).
+      const negativeClaim =
+        claimEnum === "not_satisfied" || claimEnum === "unknown";
+      const ok = !!claimText && !passedFalse && !negativeClaim;
       return {
         id: criterion.id,
         label: criterion.label,
-        status: passed ? "pass" : "fail",
-        detail: passed
-          ? String(
-              (evidence as { evidence?: unknown }).evidence ??
-                "Agent supplied evidence",
-            )
-          : "Missing explicit passing evidence in data.criteria",
-        enforcement,
+        status: ok ? "pass" : "fail",
+        detail: !claimText
+          ? "No claim evidence in data.criteria (advisory only)"
+          : ok
+            ? claimText
+            : `claim=${claimEnum || "unspecified"} (advisory evidence present but not satisfied)`,
+        enforcement: "advisory",
       };
     }
   }
 }
+
+/**
+ * Pull runtime verification rows from a node output payload.
+ * Accepts either the RuntimeOutput `data` object or a full agent result shape.
+ */
+export function verificationResultsFromOutput(
+  data: Record<string, unknown> | null | undefined,
+): VerificationResultRow[] | null {
+  if (!data || typeof data !== "object") return null;
+  const dig = (obj: Record<string, unknown>): unknown => {
+    const direct = obj.verification;
+    if (direct && typeof direct === "object") {
+      const results = (direct as { results?: unknown }).results;
+      if (Array.isArray(results)) return results;
+    }
+    const nested = obj.data;
+    if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+      return dig(nested as Record<string, unknown>);
+    }
+    return null;
+  };
+  const raw = dig(data);
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  const rows: VerificationResultRow[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const r = entry as Record<string, unknown>;
+    const id = String(r.id ?? "").trim();
+    if (!id) continue;
+    const enforcement =
+      r.enforcement === "required" || r.enforcement === "advisory"
+        ? r.enforcement
+        : undefined;
+    rows.push({
+      id,
+      label: r.label != null ? String(r.label) : undefined,
+      kind: r.kind != null ? String(r.kind) : undefined,
+      passed: Boolean(r.passed),
+      enforcement,
+      detail: r.detail != null ? String(r.detail) : undefined,
+      method: r.method != null ? String(r.method) : undefined,
+      source: r.source != null ? String(r.source) : undefined,
+    });
+  }
+  return rows.length ? rows : null;
+}
+
+/** Operator-editable verifier kinds (inspector kind select). */
+export const OPERATOR_VERIFIER_KINDS = [
+  "claim",
+  "command",
+  "artifact_exists",
+  "architecture_policy",
+] as const;
+
+export type OperatorVerifierKind = (typeof OPERATOR_VERIFIER_KINDS)[number];
 
 export function requiredCriteriaFailed(evals: CriterionEvaluation[]): boolean {
   return evals.some(
@@ -281,10 +484,52 @@ export function requiredCriteriaFailed(evals: CriterionEvaluation[]): boolean {
   );
 }
 
+/**
+ * Prefer runtime `verification.results` when present (plan III.4 / Q2).
+ * Local re-eval only for pre-run preview or when no verification block exists.
+ */
+export function evaluateFromVerification(
+  verificationResults: VerificationResultRow[] | undefined | null,
+  criteria?: CompletionCriterion[],
+): CriterionEvaluation[] | null {
+  if (!verificationResults?.length) return null;
+  const byId = new Map(verificationResults.map((r) => [r.id, r]));
+  const list = ensureCompletionCriteria(criteria);
+  return list.map((c) => {
+    const row = byId.get(c.id);
+    const enforcement = c.platform ? "required" : c.enforcement;
+    if (!row) {
+      return {
+        id: c.id,
+        label: c.label,
+        status: "pending" as const,
+        detail: "No runtime verification row",
+        enforcement,
+      };
+    }
+    const detailParts = [
+      row.detail || (row.passed ? "Runtime verified" : "Runtime failed"),
+      row.method ? `method=${row.method}` : "",
+    ].filter(Boolean);
+    return {
+      id: c.id,
+      label: row.label || c.label,
+      status: row.passed ? ("pass" as const) : ("fail" as const),
+      detail: detailParts.join(" · "),
+      enforcement: row.enforcement ?? enforcement,
+    };
+  });
+}
+
 export function evaluateCompletionCriteria(
   criteria: CompletionCriterion[] | undefined,
   result: AgentResultLike | null | undefined,
+  verificationResults?: VerificationResultRow[] | null,
 ): CriterionEvaluation[] {
+  // Prefer runtime verification.results (SSOT for host kinds + full post-run view).
+  const fromRuntime = evaluateFromVerification(verificationResults, criteria);
+  if (fromRuntime) return fromRuntime;
+  // Without host rows: host kinds stay pending; JSON/text/claim may preview locally.
   return ensureCompletionCriteria(criteria).map((c) => evaluateOne(c, result));
 }
 

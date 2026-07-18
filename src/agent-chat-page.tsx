@@ -784,8 +784,8 @@ export function AgentChatPage({
             <Sparkles size={14} />
           </div>
           <div>
-            <b>Mediator</b>
-            <small>Company operator</small>
+            <b>Byte</b>
+            <small>Company companion</small>
           </div>
         </div>
 
@@ -837,7 +837,7 @@ export function AgentChatPage({
       <section className="agent-chat-stage">
         <header className="agent-chat-top">
           <div>
-            <span className="agent-chat-eyebrow">Company · Mediator</span>
+            <span className="agent-chat-eyebrow">Company · Byte</span>
             <h1>{template.name}</h1>
             <p>{template.description}</p>
           </div>
@@ -889,7 +889,7 @@ export function AgentChatPage({
             <div className="agent-chat-empty-glow" aria-hidden />
             <div className="agent-chat-empty-copy">
               <Sparkles size={22} />
-              <h2>Brief the mediator</h2>
+              <h2>Brief Byte</h2>
               <p>
                 Track progress, surface human approvals, and steer{" "}
                 <strong>{template.name}</strong> without drowning in the graph.
@@ -911,7 +911,7 @@ export function AgentChatPage({
               voiceSupported={voiceSupported}
               sending={sending}
               inputRef={inputRef}
-              placeholder="Message the mediator — attach images or docs anytime…"
+              placeholder="Message Byte — attach images or docs anytime…"
               models={liveModels}
               modelId={chatModel}
               effort={chatEffort}
@@ -958,7 +958,7 @@ export function AgentChatPage({
                   className={`agent-bubble ${msg.role} ${msg.kind ?? ""}`}
                 >
                   <div className="agent-bubble-meta">
-                    {msg.role === "user" ? "You" : "Mediator"}
+                    {msg.role === "user" ? "You" : "Byte"}
                     <span>{formatTime(msg.at)}</span>
                   </div>
                   {!!msg.attachments?.length && (
@@ -1040,14 +1040,24 @@ export function AgentChatPage({
               aria-modal="true"
               aria-labelledby="app-workspace-title"
             >
-              <header>
-                <span className="agent-chat-eyebrow">Set app context</span>
-                <h2 id="app-workspace-title">What are we working on?</h2>
-                <p>
-                  {workspaceRequestedByMediator
-                    ? "The mediator identified a project task. Confirm where the workflow should work."
-                    : "Choose the app context and folder used when this chat starts a workflow."}
-                </p>
+              <header className="app-workspace-modal-header">
+                <div>
+                  <span className="agent-chat-eyebrow">Set app context</span>
+                  <h2 id="app-workspace-title">What are we working on?</h2>
+                  <p>
+                    {workspaceRequestedByMediator
+                      ? "Byte identified a project task. Confirm where the workflow should work."
+                      : "Choose the app context and folder used when this chat starts a workflow."}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className="modal-close"
+                  aria-label="Close app context"
+                  onClick={cancelWorkspace}
+                >
+                  <X size={16} />
+                </button>
               </header>
 
               <div
@@ -1255,7 +1265,7 @@ function Composer({
         onChange={(e) => setDraft(e.target.value)}
         onKeyDown={onKeyDown}
         placeholder={placeholder}
-        aria-label="Message mediator"
+        aria-label="Message Byte"
       />
       <div className="agent-composer-bar">
         <div className="agent-composer-tools">
@@ -1295,7 +1305,7 @@ function Composer({
               value={modelInList ? modelId : modelId || ""}
               onChange={(e) => onModelChange(e.target.value)}
               disabled={sending || models.length === 0}
-              aria-label="Mediator model"
+              aria-label="Byte model"
             >
               {models.length === 0 ? (
                 <option value="">Models…</option>

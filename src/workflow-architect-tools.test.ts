@@ -220,7 +220,7 @@ Output contract
       actions,
     );
     expect(update.success).toBe(false);
-    expect(update.text).toMatch(/disable the Architect lock/i);
+    expect(update.text).toMatch(/disable the Byte lock/i);
     expect(actions.save).not.toHaveBeenCalled();
 
     const duplicate = await executeWorkflowArchitectTool(

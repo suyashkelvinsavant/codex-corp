@@ -16,9 +16,17 @@ Browser Vite alone is for UI/graph editing; **company runs and company chat** re
 | ----------------------- | ------------------------------------------------------- |
 | `npm run desktop:dev`   | Dev desktop app (Vite + native shell)                   |
 | `npm run desktop:build` | Release executable under `release/`                     |
+| `npm run headless`      | Headless runtime + MCP server (no GUI; see [HEADLESS.md](./HEADLESS.md)) |
 | `npm test`              | Unit tests (Vitest)                                     |
 | `npm run test:e2e`      | Playwright UI tests (graph/chat shell; no fake AI runs) |
 | `npm run dev`           | Vite only (no Live Codex)                               |
+
+## Headless + MCP
+
+Codex Corp embeds an **MCP server** (Streamable HTTP on `http://127.0.0.1:8742/mcp` by default) that auto-starts with both the desktop app and `npm run headless -- start`. It exposes Byte Workflow chat, Workflow Architect chat, catalog, and run tools. Full VM deployment notes: [HEADLESS.md](./HEADLESS.md).
+
+- **Disable desktop MCP auto-start:** `CODEX_CORP_MCP_AUTO=0`
+- **Token:** read `authToken` from `%LOCALAPPDATA%\CodexCorp\mcp-server.status.json` (or `CODEX_CORP_DATA_DIR`); loopback-only by default.
 
 ## Architecture
 
