@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -21,8 +22,8 @@ import {
   FileText,
   Image as ImageIcon,
   MessageSquarePlus,
-  Mic,
-  MicOff,
+  Phone,
+  PhoneOff,
   Network,
   Paperclip,
   Pencil,
@@ -34,6 +35,35 @@ import {
 } from "lucide-react";
 import type { ApprovalRequest, RunEvent, RunRecord } from "./model";
 import { getTemplate, templateStats } from "./templates";
+import { VoicePanel } from "./voice-panel";
+import {
+  initialVoiceStore,
+  applyStarted,
+  applyTranscriptDelta,
+  applyTranscriptDone,
+  applyError,
+  applyClosed,
+  resetStore,
+  type VoiceStore,
+} from "./realtime-voice";
+import {
+  listCodexVoices,
+  startCodexRealtime,
+  stopCodexRealtime,
+  appendCodexRealtimeAudio,
+  onRealtimeStarted,
+  onRealtimeTranscriptDelta,
+  onRealtimeTranscriptDone,
+  onRealtimeOutputAudio,
+  onRealtimeError,
+  onRealtimeClosed,
+  onRealtimeToolCall,
+} from "./realtime-voice-client";
+import { startMicCapture } from "./realtime-audio-capture";
+import { RealtimeSpeaker } from "./realtime-audio-playback";
+import { useByteVoiceSession } from "./use-byte-voice-session";
+import { isRealtimeUnavailableError } from "./codex-capabilities";
+import { invoke } from "@tauri-apps/api/core";
 import {
   createSession,
   ingestFiles,
@@ -164,7 +194,24 @@ export type AgentChatPageProps = {
   onChooseWorkspace?: (initialPath?: string) => Promise<string | null>;
   /** Resolved Codex Corp workspace used as the modal default. */
   onResolveDefaultWorkspace?: () => Promise<string>;
+  voiceContext: ByteVoiceContext;
+  onVoiceToolCall: VoiceToolResolver;
+  voiceAvailable: boolean;
+  onVoiceUnavailable: () => void;
 };
+
+export type ByteVoiceContext = {
+  baseInstructions?: string;
+  developerInstructions: string;
+  contextDigest: string;
+  dynamicTools: unknown[];
+};
+
+export type VoiceToolResolver = (
+  surface: "company" | "architect",
+  tool: string,
+  args: unknown,
+) => Promise<{ success: boolean; text: string }>;
 
 export function AgentChatPage({
   workflowId,
@@ -183,6 +230,10 @@ export function AgentChatPage({
   onMediatorTurn,
   onChooseWorkspace,
   onResolveDefaultWorkspace,
+  voiceContext,
+  onVoiceToolCall,
+  voiceAvailable,
+  onVoiceUnavailable,
 }: AgentChatPageProps) {
   const template = getTemplate(workflowId);
   const stats = templateStats(template);
@@ -192,8 +243,27 @@ export function AgentChatPage({
   const [draft, setDraft] = useState("");
   const [pendingFiles, setPendingFiles] = useState<ChatAttachment[]>([]);
   const [attachError, setAttachError] = useState<string | null>(null);
-  const [listening, setListening] = useState(false);
-  const [voiceSupported, setVoiceSupported] = useState(false);
+  const [voiceOpen, setVoiceOpen] = useState(false);
+  const [voiceStore, setVoiceStore] = useState<VoiceStore>(() =>
+    initialVoiceStore("default"),
+  );
+  const voiceStoreRef = useRef(voiceStore);
+  const persistedVoiceSessionsRef = useRef(new Set<string>());
+  const [voices, setVoices] = useState<string[]>([]);
+  const speakerRef = useRef<RealtimeSpeaker>(new RealtimeSpeaker());
+  const stopMicRef = useRef<(() => void) | null>(null);
+  const threadIdRef = useRef<string | null>(null);
+  // Tracks the *actual* running session key, independent of React state's
+  // async propagation. Reads from voiceStore.sessionKey in toggleVoiceMode
+  // raced: opening then quickly closing read the stale "default" key and the
+  // real session (created with a Date.now() key) leaked.
+  // Unlisteners collected during a voice session; torn down on close/error.
+  // Kept on a ref (not the Promise.all result) so the onRealtimeClosed
+  // handler can safely reference it without a before-assignment crash.
+  const realtimeUnlistenersRef = useRef<Array<() => void>>([]);
+  // Guards against double-teardown when the user clicks end while a /closed
+  // event is also in flight.
+  const voiceSession = useByteVoiceSession();
   const [sending, setSending] = useState(false);
   const [workspaceModalOpen, setWorkspaceModalOpen] = useState(false);
   const [projectMode, setProjectMode] = useState<AppProjectMode>("new");
@@ -246,16 +316,6 @@ export function AgentChatPage({
   const lastMsgFp = useRef("");
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const recognitionRef = useRef<{
-    stop: () => void;
-    start: () => void;
-    onresult: ((ev: unknown) => void) | null;
-    onerror: ((ev: unknown) => void) | null;
-    onend: (() => void) | null;
-    continuous: boolean;
-    interimResults: boolean;
-    lang: string;
-  } | null>(null);
 
   const activeSession: ChatSession | null = useMemo(() => {
     if (!store.sessions.length) return null;
@@ -303,6 +363,8 @@ export function AgentChatPage({
       requestAnimationFrame(() => inputRef.current?.focus());
     });
     return () => {
+      const key = voiceSession.claimStop();
+      if (key) void stopCodexRealtime(key).catch(() => {});
       cancelled = true;
     };
     // The host callback is intentionally excluded: it may be recreated by App.
@@ -361,68 +423,6 @@ export function AgentChatPage({
       scrollChatListToBottom(listRef.current, smooth ? "smooth" : "auto");
     });
   }, [messages, isEmpty]);
-
-  // Browser speech-to-text (dictation). Codex app-server has experimental
-  // realtime *voices* for spoken conversation — not STT for chat compose —
-  // so mediation uses the Web Speech API when available.
-  useEffect(() => {
-    const SpeechRecognition =
-      (window as unknown as { SpeechRecognition?: new () => unknown })
-        .SpeechRecognition ||
-      (window as unknown as { webkitSpeechRecognition?: new () => unknown })
-        .webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      setVoiceSupported(false);
-      return;
-    }
-    setVoiceSupported(true);
-    const rec = new SpeechRecognition() as NonNullable<
-      typeof recognitionRef.current
-    >;
-    rec.continuous = false;
-    rec.interimResults = true;
-    rec.lang = navigator.language || "en-US";
-    rec.onresult = (event: unknown) => {
-      const ev = event as {
-        results: ArrayLike<{ 0: { transcript: string }; isFinal?: boolean }>;
-        resultIndex: number;
-      };
-      let chunk = "";
-      for (let i = ev.resultIndex; i < ev.results.length; i++) {
-        chunk += ev.results[i][0].transcript;
-      }
-      if (chunk.trim()) {
-        setDraft((prev) => {
-          const base = prev.trim();
-          const next = chunk.trim();
-          return base ? `${base} ${next}` : next;
-        });
-      }
-    };
-    rec.onerror = (event: unknown) => {
-      const ev = event as { error: string; message?: string };
-      setListening(false);
-      if (ev.error === "not-allowed") {
-        setAttachError(
-          "Microphone permission denied. Enable microphone access in Windows/OS Settings -> Privacy -> Microphone for the app.",
-        );
-      } else if (ev.error === "no-speech") {
-        // No speech detected, silently stop listening
-      } else {
-        setAttachError(`Voice dictation error: ${ev.error || "unknown"}`);
-      }
-    };
-    rec.onend = () => setListening(false);
-    recognitionRef.current = rec;
-    return () => {
-      try {
-        rec.stop();
-      } catch {
-        /* ignore */
-      }
-      recognitionRef.current = null;
-    };
-  }, []);
 
   const sortedSessions = useMemo(
     () =>
@@ -540,24 +540,254 @@ export function AgentChatPage({
     }
   };
 
-  const toggleVoice = () => {
-    const rec = recognitionRef.current;
-    if (!rec) return;
-    if (listening) {
+  // Idempotent teardown. The shared lifecycle controller lets each session
+  // key be stopped once even when close, error, and navigation race.
+  const teardownVoice = useCallback(async () => {
+    const key = voiceSession.claimStop();
+    if (!key) return;
+    await stopCodexRealtime(key).catch(() => {});
+    stopMicRef.current?.();
+    stopMicRef.current = null;
+    threadIdRef.current = null;
+    speakerRef.current.close();
+    // Replace the speaker so a future session starts fresh (the old context
+    // is closed and cannot be resumed).
+    speakerRef.current = new RealtimeSpeaker();
+    realtimeUnlistenersRef.current.forEach((u) => {
       try {
-        rec.stop();
+        u();
       } catch {
-        /* ignore */
+        /* unlisten may throw if already torn down; ignore */
       }
-      setListening(false);
+    });
+    realtimeUnlistenersRef.current = [];
+  }, [voiceSession]);
+
+  const updateVoiceStore = (update: (current: VoiceStore) => VoiceStore) => {
+    const next = update(voiceStoreRef.current);
+    voiceStoreRef.current = next;
+    setVoiceStore(next);
+  };
+
+  const persistVoiceTranscript = (transcript: VoiceStore["transcript"]) => {
+    const key = voiceSession.currentKey();
+    if (!key || persistedVoiceSessionsRef.current.has(key) || !activeSession) return;
+    const voiceMessages = transcript
+      .filter((turn) => turn.text.trim())
+      .map((turn) =>
+        makeMessage(turn.role === "user" ? "user" : "mediator", turn.text),
+      );
+    if (!voiceMessages.length) return;
+    persistedVoiceSessionsRef.current.add(key);
+    setStore((current) => {
+      const next = {
+        ...current,
+        sessions: current.sessions.map((session) =>
+          session.id === activeSession.id
+            ? {
+                ...session,
+                messages: [...session.messages, ...voiceMessages],
+                updatedAt: new Date().toISOString(),
+              }
+            : session,
+        ),
+      };
+      saveChatStore(workflowId, next);
+      return next;
+    });
+  };
+
+  const toggleVoiceMode = () => {
+    if (voiceOpen) {
+      persistVoiceTranscript(voiceStoreRef.current.transcript);
+      // Closing — teardown runs async; clear UI immediately.
+      void teardownVoice().finally(() => {
+        const reset = resetStore("default");
+        voiceStoreRef.current = reset;
+        setVoiceStore(reset);
+      });
+      setVoiceOpen(false);
       return;
     }
+    // Opening — satisfy the AudioContext autoplay gate on this user gesture
+    // BEFORE any async work, so the first output chunk can actually play.
+    void speakerRef.current.resume().catch(() => {});
+    setVoiceOpen(true);
+    void startVoiceSession();
+  };
+
+  // Fetch voices once when voice panel opens.
+  useEffect(() => {
+    if (!voiceOpen) return;
+    listCodexVoices()
+      .then((v) => setVoices(v.v2?.map(String) ?? []))
+      .catch(() => setVoices([]));
+  }, [voiceOpen]);
+
+  // Tidy teardown on unmount so a closed tab/window doesn't leak the child.
+  useEffect(() => {
+    return () => {
+      const key = voiceSession.claimStop();
+      if (key) void stopCodexRealtime(key).catch(() => {});
+      stopMicRef.current?.();
+      realtimeUnlistenersRef.current.forEach((u) => {
+        try {
+          u();
+        } catch {
+          /* ignore */
+        }
+      });
+    };
+  }, []);
+
+  const startVoiceSession = async () => {
+    const sessionKey = `voice-${Date.now()}`;
+    const sessionToken = voiceSession.begin(sessionKey);
+    updateVoiceStore((s) => ({ ...s, sessionKey, state: "starting" }));
+    const capturePromise = startMicCapture({
+      onChunk: (base64Data) => {
+        void appendCodexRealtimeAudio(sessionKey, {
+          data: base64Data,
+          sampleRate: 24000,
+          numChannels: 1,
+          samplesPerChannel: 2400,
+          itemId: null,
+        }).catch(() => {});
+      },
+    });
+    // The promise is awaited after the app-server session exists. Attach a
+    // handler now so an early device/worklet rejection is never unhandled.
+    void capturePromise.catch(() => {});
+
     try {
-      rec.start();
-      setListening(true);
-    } catch {
-      setListening(false);
-      setAttachError("Could not start microphone dictation.");
+      // Register every listener before starting the server. Promise.all also
+      // ensures a partial registration failure is handled by the common
+      // teardown path below.
+      const unlisteners = await Promise.all([
+        onRealtimeStarted(sessionKey, (p) => {
+          threadIdRef.current = p.threadId;
+          updateVoiceStore((s) => applyStarted(s, p));
+        }),
+        onRealtimeTranscriptDelta(sessionKey, (p) => {
+          updateVoiceStore((s) => applyTranscriptDelta(s, p));
+        }),
+        onRealtimeTranscriptDone(sessionKey, () => {
+          updateVoiceStore((s) => applyTranscriptDone(s));
+        }),
+        onRealtimeOutputAudio(sessionKey, (p) => {
+          try {
+            speakerRef.current.enqueue(p.audio);
+          } catch (failure) {
+            updateVoiceStore((s) =>
+              applyError(s, {
+                message: failure instanceof Error ? failure.message : String(failure),
+              }),
+            );
+            void teardownVoice();
+          }
+        }),
+        onRealtimeError(sessionKey, (p) => {
+          if (isRealtimeUnavailableError(p.message)) onVoiceUnavailable();
+          updateVoiceStore((s) => applyError(s, p));
+          persistVoiceTranscript(voiceStoreRef.current.transcript);
+          void teardownVoice();
+        }),
+        onRealtimeClosed(sessionKey, (p) => {
+          updateVoiceStore((s) => applyClosed(s, p));
+          persistVoiceTranscript(voiceStoreRef.current.transcript);
+          void teardownVoice();
+        }),
+        onRealtimeToolCall(sessionKey, async (payload) => {
+      try {
+        const result = await onVoiceToolCall("company", payload.tool, payload.arguments);
+        await invoke("respond_mediator_tool", {
+          requestId: payload.requestId,
+          success: result.success,
+          content: result.text,
+        });
+      } catch (failure) {
+        await invoke("respond_mediator_tool", {
+          requestId: payload.requestId,
+          success: false,
+          content: JSON.stringify({ error: String(failure) }),
+        }).catch(() => undefined);
+      }
+        }),
+      ]);
+      realtimeUnlistenersRef.current = unlisteners;
+      if (!voiceSession.isCurrent(sessionToken)) {
+        realtimeUnlistenersRef.current.forEach((unlisten) => unlisten());
+        realtimeUnlistenersRef.current = [];
+        return;
+      }
+
+      const result = await startCodexRealtime({
+        sessionKey,
+        surface: "company",
+        model: chatModel,
+        effort: chatEffort,
+        workspacePath:
+          workspacePath === "Codex Corp workspace" ? undefined : workspacePath,
+        outputModality: voiceStore.outputModality,
+        voice: voiceStore.voice || undefined,
+        baseInstructions: voiceContext.baseInstructions,
+        developerInstructions: voiceContext.developerInstructions,
+        contextDigest: voiceContext.contextDigest,
+        recentTranscript: messages
+          .slice(-12)
+          .map((message) => `${message.role === "user" ? "Operator" : "Byte"}: ${message.text}`)
+          .join("\n")
+          .slice(-12_000),
+        dynamicTools: voiceContext.dynamicTools,
+      });
+      if (!voiceSession.isCurrent(sessionToken)) {
+        await stopCodexRealtime(sessionKey).catch(() => {});
+        return;
+      }
+      // The Rust command returns the threadId synchronously (from thread/start
+      // or thread/resume). Seed threadIdRef now so the first mic frame is not
+      // dropped waiting for the async /started notification.
+      threadIdRef.current = result.threadId;
+
+      // Persist the thread id onto the chat session so the next text or voice
+      // turn resumes it instead of starting a fresh ephemeral thread.
+      if (activeSession && result.threadId) {
+        setStore((prev) => {
+          const next: WorkflowChatStore = {
+            ...prev,
+            sessions: prev.sessions.map((s) =>
+              s.id !== activeSession.id
+                ? s
+                : {
+                    ...s,
+                    mediatorThreadId: result.threadId,
+                    updatedAt: new Date().toISOString(),
+                  },
+            ),
+          };
+          saveChatStore(workflowId, next);
+          return next;
+        });
+      }
+
+      // Mic capture can start now that we have a threadId. If /started never
+      // arrives, frames still flow because threadIdRef is populated here.
+      const capture = await capturePromise;
+      if (!voiceSession.isCurrent(sessionToken)) {
+        capture.stop();
+        await stopCodexRealtime(sessionKey).catch(() => {});
+        return;
+      }
+      stopMicRef.current = capture.stop;
+    } catch (err) {
+      if (isRealtimeUnavailableError(err)) onVoiceUnavailable();
+      updateVoiceStore((s) =>
+        applyError(s, {
+          message: err instanceof Error ? err.message : String(err),
+        }),
+      );
+      void capturePromise.then((capture) => capture.stop()).catch(() => {});
+      await teardownVoice();
     }
   };
 
@@ -918,10 +1148,10 @@ export function AgentChatPage({
               onSend={() => void send()}
               onPickFiles={() => fileInputRef.current?.click()}
               onFiles={addFiles}
-              onToggleVoice={toggleVoice}
-              listening={listening}
-              voiceSupported={voiceSupported}
               sending={sending}
+              voiceOpen={voiceOpen}
+              voiceAvailable={voiceAvailable}
+              onToggleVoice={toggleVoiceMode}
               inputRef={inputRef}
               placeholder="Message Byte — attach images or docs anytime…"
               models={liveModels}
@@ -1001,10 +1231,10 @@ export function AgentChatPage({
                 onSend={() => void send()}
                 onPickFiles={() => fileInputRef.current?.click()}
                 onFiles={addFiles}
-                onToggleVoice={toggleVoice}
-                listening={listening}
-                voiceSupported={voiceSupported}
                 sending={sending}
+                voiceOpen={voiceOpen}
+                voiceAvailable={voiceAvailable}
+                onToggleVoice={toggleVoiceMode}
                 inputRef={inputRef}
                 placeholder="Follow up — text, files, or dictate…"
                 models={liveModels}
@@ -1150,6 +1380,19 @@ export function AgentChatPage({
           </div>
         ) : null}
       </section>
+      {voiceOpen && (
+        <VoicePanel
+          store={voiceStore}
+          voices={voices}
+          onVoiceChange={(v) =>
+            setVoiceStore((s) => ({ ...s, voice: v }))
+          }
+          onModalityChange={(m) =>
+            setVoiceStore((s) => ({ ...s, outputModality: m }))
+          }
+          onEnd={toggleVoiceMode}
+        />
+      )}
     </div>
   );
 }
@@ -1195,10 +1438,10 @@ function Composer({
   onSend,
   onPickFiles,
   onFiles,
-  onToggleVoice,
-  listening,
-  voiceSupported,
   sending,
+  voiceOpen,
+  voiceAvailable,
+  onToggleVoice,
   inputRef,
   placeholder,
   models,
@@ -1218,10 +1461,10 @@ function Composer({
   onSend: () => void;
   onPickFiles: () => void;
   onFiles: (list: FileList | File[] | null) => void | Promise<void>;
-  onToggleVoice: () => void;
-  listening: boolean;
-  voiceSupported: boolean;
   sending: boolean;
+  voiceOpen: boolean;
+  voiceAvailable: boolean;
+  onToggleVoice: () => void;
   inputRef: RefObject<HTMLTextAreaElement | null>;
   placeholder: string;
   models: CodexModelOption[];
@@ -1290,23 +1533,21 @@ function Composer({
           >
             <Paperclip size={15} />
           </button>
-          {voiceSupported && (
+          {voiceAvailable ? (
             <button
               type="button"
-              className={`agent-tool-btn ${listening ? "live" : ""}`}
+              className={`agent-tool-btn ${voiceOpen ? "live" : ""}`}
               onClick={onToggleVoice}
-              title={
-                listening
-                  ? "Stop dictation"
-                  : "Dictate with microphone (browser speech-to-text)"
-              }
-              aria-label={listening ? "Stop dictation" : "Start dictation"}
-              aria-pressed={listening}
+              title={voiceOpen ? "End voice session" : "Start voice session"}
+              aria-label={voiceOpen ? "End voice session" : "Start voice session"}
+              aria-pressed={voiceOpen}
             >
-              {listening ? <MicOff size={15} /> : <Mic size={15} />}
+              {voiceOpen ? <PhoneOff size={15} /> : <Phone size={15} />}
             </button>
-          )}
-          <span className="agent-composer-divider" aria-hidden />
+          ) : null}
+          {voiceAvailable ? (
+            <span className="agent-composer-divider" aria-hidden />
+          ) : null}
           <div
             className="agent-composer-chip"
             data-testid="mediator-model-row"

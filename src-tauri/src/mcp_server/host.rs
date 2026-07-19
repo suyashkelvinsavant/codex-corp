@@ -13,7 +13,7 @@ use crate::codex_turn::{run_hosted_codex_turn, CodexTurnRequest};
 use crate::workflow_runtime::{RunApprovalBroker, WorkflowRuntime};
 use crate::{
     default_chat_workspace_path, discover_codex_info, open_shared_database, ApprovalBroker,
-    Database, ProcessBroker, ToolBroker,
+    Database, PendingInteractionKind, ProcessBroker, ToolBroker, TurnStdinBroker,
 };
 
 /// Owns shared state for tool execution. Constructed for desktop or headless.
@@ -50,6 +50,7 @@ impl McpHost {
             runtime: McpRuntime {
                 database: app.state::<Database>().inner().clone(),
                 process_broker: app.state::<ProcessBroker>().inner().clone(),
+                turn_stdin_broker: app.state::<TurnStdinBroker>().inner().clone(),
                 approval_broker: app.state::<ApprovalBroker>().inner().clone(),
                 tool_broker: app.state::<ToolBroker>().inner().clone(),
                 workflow_runtime: app.state::<WorkflowRuntime>().inner().clone(),
@@ -250,9 +251,11 @@ impl McpHost {
     }
 
     pub fn stop_run(&self, run_id: &str) -> Result<Value, String> {
-        self.runtime
-            .workflow_runtime
-            .stop_run_internal(run_id, &self.runtime.process_broker)?;
+        self.runtime.workflow_runtime.stop_run_internal(
+            run_id,
+            &self.runtime.process_broker,
+            &self.runtime.turn_stdin_broker,
+        )?;
         Ok(json!({ "ok": true, "runId": run_id, "status": "stop_requested" }))
     }
 
@@ -298,7 +301,7 @@ impl McpHost {
             return Err("requestId is required".into());
         }
         let normalized = normalize_codex_approval_decision(decision)?;
-        let sender = self
+        let pending = self
             .runtime
             .approval_broker
             .0
@@ -306,8 +309,12 @@ impl McpHost {
             .map_err(|_| "approval broker lock poisoned".to_string())?
             .remove(request_id)
             .ok_or_else(|| "approval request is no longer pending".to_string())?;
-        sender
-            .send(normalized.clone())
+        if pending.kind != PendingInteractionKind::Approval {
+            return Err("pending request is not an approval".into());
+        }
+        pending
+            .sender
+            .send(Value::String(normalized.clone()))
             .map_err(|error| error.to_string())?;
         Ok(json!({
             "ok": true,
@@ -325,7 +332,11 @@ impl McpHost {
             .0
             .lock()
             .map_err(|_| "approval broker lock poisoned".to_string())?;
-        let mut request_ids: Vec<String> = pending.keys().cloned().collect();
+        let mut request_ids: Vec<String> = pending
+            .iter()
+            .filter(|(_, interaction)| interaction.kind == PendingInteractionKind::Approval)
+            .map(|(id, _)| id.clone())
+            .collect();
         request_ids.sort();
         Ok(json!({
             "pending": request_ids.iter().map(|id| json!({ "requestId": id })).collect::<Vec<_>>(),
@@ -371,6 +382,7 @@ impl McpHost {
                 app.state::<RunApprovalBroker>(),
                 app.state::<ApprovalBroker>(),
                 app.state::<ProcessBroker>(),
+                app.state::<TurnStdinBroker>(),
                 app.state::<Database>(),
             ))?;
             return serde_json::to_value(result).map_err(|error| error.to_string());
@@ -385,6 +397,7 @@ impl McpHost {
             self.runtime.run_approvals.clone(),
             self.runtime.approval_broker.clone(),
             self.runtime.process_broker.clone(),
+            self.runtime.turn_stdin_broker.clone(),
         ))?;
         serde_json::to_value(record).map_err(|error| error.to_string())
     }

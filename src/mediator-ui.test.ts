@@ -6,6 +6,7 @@ import {
   mediatorControlHelpText,
   notificationFromRunEvent,
   parseMediatorControlIntent,
+  parseStructuredApproval,
   progressLineFromRunEvent,
 } from "./mediator-ui";
 import type { RunEvent } from "./model";
@@ -93,5 +94,39 @@ describe("mediator-ui", () => {
 
   it("exposes control help text", () => {
     expect(mediatorControlHelpText()).toMatch(/mission:/i);
+  });
+
+  it("parses generated approval contracts without inventing file lists", () => {
+    expect(parseStructuredApproval("item/fileChange/requestApproval", {
+      reason: "write generated output",
+      grantRoot: "C:/work",
+    })).toEqual({
+      kind: "fileChange",
+      files: [],
+      reason: "write generated output",
+      grantRoot: "C:/work",
+    });
+    const command = parseStructuredApproval("item/commandExecution/requestApproval", {
+      command: "npm test",
+      cwd: "C:/work",
+      commandActions: [{ type: "unknown", command: "npm test" }],
+      additionalPermissions: { network: { enabled: true } },
+      availableDecisions: ["accept", "decline"],
+    });
+    expect(command.kind).toBe("execCommand");
+    if (command.kind === "execCommand") {
+      expect(command.commandActions).toHaveLength(1);
+      expect(command.availableDecisions).toEqual(["accept", "decline"]);
+    }
+  });
+
+  it("preserves the structured permission profile", () => {
+    expect(parseStructuredApproval("item/permissions/requestApproval", {
+      reason: "needs repo access",
+      permissions: { fileSystem: { read: ["C:/work"] } },
+    })).toMatchObject({
+      kind: "permissions",
+      permissions: { fileSystem: { read: ["C:/work"] } },
+    });
   });
 });

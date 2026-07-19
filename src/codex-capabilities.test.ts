@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   capabilityRelevanceScore,
+  isRealtimeUnavailableError,
   reconcileCapabilitySelections,
   sanitizeCapabilityInventory,
 } from "./codex-capabilities";
@@ -54,11 +55,16 @@ describe("Codex connector capability inventory", () => {
         webSearch: true,
       },
       enabledRuntimeFeatures: ["apps"],
+      realtimeConversationAvailable: true,
+      account: null,
+      authMode: null,
+      requiresOpenaiAuth: false,
     });
     expect(result.skills.map((skill) => skill.name)).toEqual(["imagegen"]);
     expect(result.tools.map((tool) => tool.id)).toEqual([
       "apps::figma.generate",
     ]);
+    expect(result.realtimeConversationAvailable).toBe(true);
   });
 
   it("ranks capabilities from node context without granting them", () => {
@@ -97,6 +103,10 @@ describe("Codex connector capability inventory", () => {
         webSearch: true,
       },
       enabledRuntimeFeatures: [],
+      realtimeConversationAvailable: false,
+      account: null,
+      authMode: null,
+      requiresOpenaiAuth: false,
     });
     expect(
       reconcileCapabilitySelections(
@@ -111,5 +121,23 @@ describe("Codex connector capability inventory", () => {
       activeSkill: "imagegen",
       connectorTools: [],
     });
+  });
+
+  it.each([
+    [
+      'Codex app-server error: {"code":-32600,"message":"thread t does not support realtime conversation"}',
+      true,
+    ],
+    ["JSON-RPC -32601: method not found", true],
+    ["Realtime conversation requires API key auth", true],
+    ["Microphone permission denied", false],
+    ["Realtime websocket closed unexpectedly", false],
+  ])("classifies permanent realtime availability failures", (message, expected) => {
+    expect(isRealtimeUnavailableError(message)).toBe(expected);
+  });
+
+  it("fails closed when capability discovery omits realtime support", () => {
+    const result = sanitizeCapabilityInventory(undefined);
+    expect(result.realtimeConversationAvailable).toBe(false);
   });
 });

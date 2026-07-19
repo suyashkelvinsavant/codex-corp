@@ -42,6 +42,10 @@ export type CodexCapabilityInventory = {
     webSearch: boolean;
   };
   enabledRuntimeFeatures: string[];
+  realtimeConversationAvailable: boolean;
+  account: { type: string; email?: string | null; planType?: string | null } | null;
+  authMode: string | null;
+  requiresOpenaiAuth: boolean;
 };
 
 export const EMPTY_CODEX_CAPABILITIES: CodexCapabilityInventory = {
@@ -58,6 +62,10 @@ export const EMPTY_CODEX_CAPABILITIES: CodexCapabilityInventory = {
     webSearch: false,
   },
   enabledRuntimeFeatures: [],
+  realtimeConversationAvailable: false,
+  account: null,
+  authMode: null,
+  requiresOpenaiAuth: false,
 };
 
 export function sanitizeCapabilityInventory(
@@ -94,7 +102,23 @@ export function sanitizeCapabilityInventory(
     hooks: value?.hooks ?? [],
     provider: value?.provider ?? EMPTY_CODEX_CAPABILITIES.provider,
     enabledRuntimeFeatures: value?.enabledRuntimeFeatures ?? [],
+    realtimeConversationAvailable:
+      value?.realtimeConversationAvailable === true,
+    account: value?.account ?? null,
+    authMode: value?.authMode ?? null,
+    requiresOpenaiAuth: value?.requiresOpenaiAuth ?? false,
   };
+}
+
+export function isRealtimeUnavailableError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("does not support realtime conversation") ||
+    normalized.includes("realtime conversation requires api key auth") ||
+    normalized.includes("-32601") ||
+    normalized.includes("method not found")
+  );
 }
 
 const GENERIC_CAPABILITY_WORDS = new Set([

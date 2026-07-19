@@ -96,7 +96,7 @@ export type AgentData = {
   description: string;
   duration: string;
   tokens: number;
-  trace: string[];
+  trace: Array<string | TraceRecord>;
   /** Ephemeral, bounded assistant text assembled from app-server deltas. */
   streamingPreview?: string;
   output?: string;
@@ -154,6 +154,14 @@ export type AgentData = {
   contextInputs?: number;
 };
 
+export type TraceRecord = {
+  eventType: string;
+  text: string;
+  at: number;
+  threadId?: string;
+  turnId?: string;
+};
+
 export type ConditionOperator =
   "==" | "!=" | ">" | ">=" | "<" | "<=" | "contains" | "exists";
 
@@ -191,6 +199,8 @@ export type ValidationProblem = {
   severity: "error" | "warning";
   message: string;
   nodeId?: string;
+  threadId?: string;
+  turnId?: string;
   edgeId?: string;
 };
 
@@ -200,6 +210,8 @@ export type RunEvent = {
   type: string;
   message: string;
   nodeId?: string;
+  threadId?: string;
+  turnId?: string;
   edgeId?: string;
   level?: "info" | "warning" | "error";
   attemptId?: string;
@@ -217,6 +229,21 @@ export type ApprovalRequest = {
   status: "pending" | "approved" | "declined";
   nativeRequestId?: string;
   runId?: string;
+  /** Structured approval payload from the app-server protocol. */
+  structured?: StructuredApproval;
+};
+
+export type StructuredApproval =
+  | { kind: "fileChange"; files: FileChangeSummary[]; reason?: string | null; grantRoot?: string | null }
+  | { kind: "execCommand"; command: string; cwd: string; reason?: string | null; commandActions?: { type: string; command: string; name?: string; path?: string | null; query?: string | null }[]; additionalPermissions?: unknown; availableDecisions?: string[] }
+  | { kind: "commandExecution"; command?: string; cwd?: string; reason?: string | null }
+  | { kind: "permissions"; permissions?: unknown; reason?: string | null }
+  | { kind: "unknown" };
+
+export type FileChangeSummary = {
+  path: string;
+  type: "add" | "delete" | "update";
+  preview?: string;
 };
 
 export type RunRecord = {

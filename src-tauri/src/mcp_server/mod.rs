@@ -32,7 +32,7 @@ use crate::runtime_ownership::RuntimeOwnershipGuard;
 use crate::workflow_runtime::{RunApprovalBroker, WorkflowRuntime};
 use crate::Database;
 use crate::ProcessBroker;
-use crate::{ApprovalBroker, ToolBroker};
+use crate::{ApprovalBroker, ToolBroker, TurnStdinBroker};
 
 /// Format `host:port` for TCP bind / URLs. Bracket bare IPv6 literals.
 pub(crate) fn socket_addr(host: &str, port: u16) -> String {
@@ -177,6 +177,7 @@ pub const MAX_MCP_BODY_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) struct McpRuntime {
     pub(crate) database: Database,
     pub(crate) process_broker: ProcessBroker,
+    pub(crate) turn_stdin_broker: TurnStdinBroker,
     pub(crate) approval_broker: ApprovalBroker,
     #[allow(dead_code)] // reserved for future UI-brokered interactive tools
     pub(crate) tool_broker: ToolBroker,
@@ -192,6 +193,9 @@ impl McpRuntime {
         Self {
             database,
             process_broker: ProcessBroker(Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            ))),
+            turn_stdin_broker: TurnStdinBroker(Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             ))),
             approval_broker: ApprovalBroker(Arc::new(std::sync::Mutex::new(

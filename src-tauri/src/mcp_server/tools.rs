@@ -179,7 +179,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "respond_codex_approval",
             description:
-                "Accept or decline a pending Live Codex requestApproval (broker key process_key::id). Needed when CODEX_CORP_HEADLESS_APPROVAL=wait; default headless policy is auto_accept. Discover keys via list_pending_codex_approvals or headless stderr.",
+                "Accept or decline a pending Live Codex requestApproval (broker key process_key::id). Needed when CODEX_CORP_HEADLESS_APPROVAL=wait; default headless policy is auto_decline. Discover keys via list_pending_codex_approvals or headless stderr.",
             input_schema: object_schema(
                 json!({
                     "requestId": { "type": "string", "description": "Broker key (process_key::approval id)" },

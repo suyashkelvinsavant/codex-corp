@@ -20,6 +20,7 @@ use crate::verifier::{
 };
 use crate::{
     execute_agent_internal, AgentRequest, AgentResult, ApprovalBroker, Database, ProcessBroker,
+    TurnStdinBroker,
 };
 
 static RUN_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -60,6 +61,7 @@ impl WorkflowRuntime {
         &self,
         run_id: &str,
         process_broker: &ProcessBroker,
+        turn_stdin_broker: &TurnStdinBroker,
     ) -> Result<(), String> {
         let active = self
             .active
@@ -69,7 +71,7 @@ impl WorkflowRuntime {
             .cloned()
             .ok_or_else(|| "run is not active".to_string())?;
         active.stop.store(true, Ordering::SeqCst);
-        kill_run_processes(process_broker, run_id);
+        kill_run_processes(process_broker, turn_stdin_broker, run_id);
         Ok(())
     }
 }
@@ -427,6 +429,7 @@ struct RunContext {
     limiter: Arc<ProcessLimiter>,
     approval_broker: ApprovalBroker,
     process_broker: ProcessBroker,
+    turn_stdin_broker: TurnStdinBroker,
     run_approvals: RunApprovalBroker,
     target_workspace: Option<PathBuf>,
 }
@@ -727,7 +730,8 @@ fn required_criteria_failure(
     hard_criteria_gate: bool,
 ) -> Option<String> {
     for criterion in criteria {
-        let required = hard_criteria_gate || criterion.platform || criterion.enforcement == "required";
+        let required =
+            hard_criteria_gate || criterion.platform || criterion.enforcement == "required";
         if !required || (!criterion.enabled && !criterion.platform) {
             continue;
         }
@@ -1246,6 +1250,28 @@ async fn specialist_once(
         .output_schema
         .as_deref()
         .and_then(|raw| serde_json::from_str(raw).ok());
+    // Resume thread from previous attempt if available.
+    let resume_thread_id: Option<String> = context
+        .database
+        .0
+        .lock()
+        .ok()
+        .and_then(|db| {
+            let mut stmt = db
+                .prepare(
+                    "SELECT thread_id FROM node_attempts WHERE run_id = ?1 AND node_id = ?2 AND thread_id IS NOT NULL ORDER BY attempt DESC, revision DESC LIMIT 1",
+                )
+                .ok()?;
+            let mut rows = stmt
+                .query_map(params![context.run_id, node.id], |row| {
+                    row.get::<_, Option<String>>(0)
+                })
+                .ok()?;
+            match rows.next() {
+                Some(Ok(Some(tid))) if !tid.is_empty() => Some(tid),
+                _ => None,
+            }
+        });
     // Composition split (plan I.1.2): base | developer+connector+criteria | user_input+extra
     let base_instructions = node.data.base_instructions.trim().to_string();
     let developer_core = if !node.data.developer_instructions.trim().is_empty() {
@@ -1274,6 +1300,7 @@ async fn specialist_once(
         node_id: node.id.clone(),
         run_id: Some(context.run_id.clone()),
         attempt_id: Some(attempt_id.clone()),
+        thread_id: resume_thread_id,
         role: node.data.role.clone(),
         model: node.data.model.clone(),
         effort: node.data.effort.clone(),
@@ -1305,6 +1332,8 @@ async fn specialist_once(
         context.app.clone(),
         context.approval_broker.clone(),
         context.process_broker.clone(),
+        context.turn_stdin_broker.clone(),
+        context.database.clone(),
         token_meter.clone(),
     )
     .await;
@@ -1372,7 +1401,10 @@ async fn specialist_once(
                 } else {
                     evaluate_criterion(criterion, &output, context)
                 };
-                let enforcement = if node.data.hard_criteria_gate || criterion.platform || criterion.enforcement == "required" {
+                let enforcement = if node.data.hard_criteria_gate
+                    || criterion.platform
+                    || criterion.enforcement == "required"
+                {
                     "required"
                 } else {
                     "advisory"
@@ -1957,7 +1989,12 @@ async fn execute_specialist_with_revision(
     let mut reason = if output.status == "needs_revision" {
         Some(output.summary.clone())
     } else {
-        required_criteria_failure(&node.data.completion_criteria, &output, context, node.data.hard_criteria_gate)
+        required_criteria_failure(
+            &node.data.completion_criteria,
+            &output,
+            context,
+            node.data.hard_criteria_gate,
+        )
     };
     let Some(edge) = revision_edge else {
         if let Some(reason) = reason {
@@ -2018,7 +2055,12 @@ async fn execute_specialist_with_revision(
         reason = if output.status == "needs_revision" {
             Some(output.summary.clone())
         } else {
-            required_criteria_failure(&node.data.completion_criteria, &output, context, node.data.hard_criteria_gate)
+            required_criteria_failure(
+                &node.data.completion_criteria,
+                &output,
+                context,
+                node.data.hard_criteria_gate,
+            )
         };
     }
     Err(format!(
@@ -2748,7 +2790,11 @@ async fn run_worker(
         if let Some((node_id, error)) = batch_failure {
             terminal_error = Some(format!("node {node_id} terminally failed: {error}"));
             context.stop.store(true, Ordering::SeqCst);
-            kill_run_processes(&context.process_broker, &context.run_id);
+            kill_run_processes(
+                &context.process_broker,
+                &context.turn_stdin_broker,
+                &context.run_id,
+            );
             // Drain sibling workers so no node can publish success after the
             // terminal run event. Their processes have already been stopped.
             while handles.next().await.is_some() {
@@ -2850,8 +2896,37 @@ fn update_run_status(
     }
 }
 
-fn kill_run_processes(process_broker: &ProcessBroker, run_id: &str) {
+fn kill_run_processes(
+    process_broker: &ProcessBroker,
+    turn_stdin_broker: &TurnStdinBroker,
+    run_id: &str,
+) {
     let prefix = format!("{run_id}::");
+    // Phase 2.6: Send turn/interrupt via stdin for graceful shutdown before kill.
+    let active_turns: Vec<_> = turn_stdin_broker
+        .0
+        .lock()
+        .map(|turns| {
+            turns
+                .iter()
+                .filter(|(key, _)| key.starts_with(&prefix))
+                .map(|(_, handle)| handle.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    for handle in active_turns {
+        let request_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let _ = crate::send_json_timed(
+            &handle.stdin,
+            crate::turn_interrupt_request(request_id, &handle),
+            std::time::Duration::from_millis(500),
+        );
+    }
+    // Brief grace period for the app-server to process the interrupt.
+    std::thread::sleep(std::time::Duration::from_secs(2));
     let children: Vec<_> = process_broker
         .0
         .lock()
@@ -2865,6 +2940,10 @@ fn kill_run_processes(process_broker: &ProcessBroker, run_id: &str) {
         .unwrap_or_default();
     for child in children {
         crate::kill_app_server_child(&child);
+    }
+    // Clean up stdin handles.
+    if let Ok(mut stdin_map) = turn_stdin_broker.0.lock() {
+        stdin_map.retain(|key, _| !key.starts_with(&prefix));
     }
 }
 
@@ -2889,6 +2968,7 @@ async fn start_run_core(
     run_approvals: RunApprovalBroker,
     approval_broker: ApprovalBroker,
     process_broker: ProcessBroker,
+    turn_stdin_broker: TurnStdinBroker,
 ) -> Result<NativeRunRecord, String> {
     let graph_json: String = {
         let connection = database
@@ -2958,6 +3038,7 @@ async fn start_run_core(
         limiter: runtime.limiter.clone(),
         approval_broker,
         process_broker,
+        turn_stdin_broker,
         run_approvals,
         target_workspace,
     };
@@ -2992,6 +3073,7 @@ pub(crate) async fn start_run(
     run_approvals: tauri::State<'_, RunApprovalBroker>,
     approval_broker: tauri::State<'_, ApprovalBroker>,
     process_broker: tauri::State<'_, ProcessBroker>,
+    turn_stdin_broker: tauri::State<'_, TurnStdinBroker>,
     database: tauri::State<'_, Database>,
 ) -> Result<NativeRunRecord, String> {
     start_run_core(
@@ -3004,6 +3086,7 @@ pub(crate) async fn start_run(
         run_approvals.inner().clone(),
         approval_broker.inner().clone(),
         process_broker.inner().clone(),
+        turn_stdin_broker.inner().clone(),
     )
     .await
 }
@@ -3019,6 +3102,7 @@ pub(crate) async fn start_run_headless(
     run_approvals: RunApprovalBroker,
     approval_broker: ApprovalBroker,
     process_broker: ProcessBroker,
+    turn_stdin_broker: TurnStdinBroker,
 ) -> Result<NativeRunRecord, String> {
     start_run_core(
         workflow_id,
@@ -3030,6 +3114,7 @@ pub(crate) async fn start_run_headless(
         run_approvals,
         approval_broker,
         process_broker,
+        turn_stdin_broker,
     )
     .await
 }
@@ -3066,6 +3151,7 @@ pub(crate) fn stop_run(
     run_id: String,
     runtime: tauri::State<'_, WorkflowRuntime>,
     process_broker: tauri::State<'_, ProcessBroker>,
+    turn_stdin_broker: tauri::State<'_, TurnStdinBroker>,
 ) -> Result<(), String> {
     let active = runtime
         .active
@@ -3075,7 +3161,7 @@ pub(crate) fn stop_run(
         .cloned()
         .ok_or("run is not active")?;
     active.stop.store(true, Ordering::SeqCst);
-    kill_run_processes(process_broker.inner(), &run_id);
+    kill_run_processes(process_broker.inner(), turn_stdin_broker.inner(), &run_id);
     Ok(())
 }
 
@@ -3146,6 +3232,8 @@ pub(crate) fn list_active_runs(
 }
 
 #[tauri::command]
+// Tauri injects each managed state value as an explicit command parameter.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn resume_run(
     run_id: String,
     app: tauri::AppHandle,
@@ -3153,6 +3241,7 @@ pub(crate) async fn resume_run(
     run_approvals: tauri::State<'_, RunApprovalBroker>,
     approval_broker: tauri::State<'_, ApprovalBroker>,
     process_broker: tauri::State<'_, ProcessBroker>,
+    turn_stdin_broker: tauri::State<'_, TurnStdinBroker>,
     database: tauri::State<'_, Database>,
 ) -> Result<NativeRunRecord, String> {
     let record = get_run(run_id.clone(), database.clone())?;
@@ -3202,6 +3291,7 @@ pub(crate) async fn resume_run(
         limiter: runtime.limiter.clone(),
         approval_broker: approval_broker.inner().clone(),
         process_broker: process_broker.inner().clone(),
+        turn_stdin_broker: turn_stdin_broker.inner().clone(),
         run_approvals: run_approvals.inner().clone(),
         target_workspace,
     };
@@ -3397,6 +3487,7 @@ fn scheduler_tick(app: &tauri::AppHandle) {
             app.state::<RunApprovalBroker>(),
             app.state::<ApprovalBroker>(),
             app.state::<ProcessBroker>(),
+            app.state::<TurnStdinBroker>(),
             app.state::<Database>(),
         ));
         if let Err(error) = result {
@@ -4031,6 +4122,7 @@ mod tests {
             limiter: Arc::new(ProcessLimiter::new(1)),
             approval_broker: ApprovalBroker(Arc::new(Mutex::new(HashMap::new()))),
             process_broker: ProcessBroker(Arc::new(Mutex::new(HashMap::new()))),
+            turn_stdin_broker: TurnStdinBroker(Arc::new(Mutex::new(HashMap::new()))),
             run_approvals: RunApprovalBroker::default(),
             target_workspace,
         }

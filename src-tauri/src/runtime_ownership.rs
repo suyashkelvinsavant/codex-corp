@@ -30,12 +30,13 @@ impl RuntimeOwnershipGuard {
     }
 
     fn acquire_at(dir: &Path, mode: &str) -> Result<Arc<Self>, String> {
-        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         crate::mcp_server::lifecycle::restrict_data_dir_permissions(dir);
         let path = dir.join("runtime-owner.lock");
         let info_path = dir.join("runtime-owner.json");
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)

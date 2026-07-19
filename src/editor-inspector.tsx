@@ -1,6 +1,6 @@
-import { lazy, Suspense, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import type React from "react";
-import { isTauri as tauriIsTauri } from "@tauri-apps/api/core";
+import { isTauri as tauriIsTauri, invoke } from "@tauri-apps/api/core";
 import {
   Braces,
   Check,
@@ -12,6 +12,7 @@ import {
   Hand,
   Image,
   Inbox,
+  List,
   Merge,
   Play,
   Redo2,
@@ -22,6 +23,11 @@ import {
   Terminal,
   Wrench,
   X,
+  Brain,
+  ListTodo,
+  Monitor,
+  Diff,
+  FileWarning,
 } from "lucide-react";
 import {
   defaultNodeEffortForModel,
@@ -47,6 +53,7 @@ import {
   type CodexToolOption,
 } from "./codex-capabilities";
 import { PromptEditor } from "./prompt-editor";
+import { isStreamingTraceEvent, traceEventLabel } from "./stream-display";
 import {
   COMMAND_TEMPLATE_IDS,
   ensureCompletionCriteria,
@@ -145,9 +152,61 @@ export function NodeInspector({
   interrupt: () => void;
 }) {
   const d = node.data;
-  const nodeEvents = events.filter((event) => event.nodeId === node.id);
+  const nodeEvents = [
+    ...events.filter((event) => event.nodeId === node.id),
+    ...d.trace.flatMap((entry, index): RunEvent[] =>
+      typeof entry === "string"
+        ? []
+        : [{
+            id: `trace-${entry.at}-${index}`,
+            at: new Date(entry.at).toISOString(),
+            type: entry.eventType,
+            message: entry.text,
+            nodeId: node.id,
+            threadId: entry.threadId,
+            turnId: entry.turnId,
+            level: "info",
+          }],
+    ),
+  ].sort((left, right) => Date.parse(left.at) - Date.parse(right.at));
   const modelId = normalizeStoredModelId(d.model);
   const effortOptions = effortsForModel(availableModels, modelId);
+  const [threads, setThreads] = useState<Array<{
+    id: string;
+    name: string | null;
+    preview: string | null;
+    status: string | null;
+    createdAt: number;
+    updatedAt: number;
+    cwd: string | null;
+  }>>([]);
+  const [threadsLoaded, setThreadsLoaded] = useState(false);
+  const [threadsError, setThreadsError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (tab !== "threads" || threadsLoaded) return;
+    invoke<Array<{
+      id: string;
+      name: string | null;
+      preview: string | null;
+      status: string | null;
+      createdAt: number;
+      updatedAt: number;
+      cwd: string | null;
+    }>>("list_codex_threads", { limit: 30 })
+      .then((data) => {
+        setThreads([
+          ...data.filter((thread) => thread.id === d.threadId),
+          ...data.filter((thread) => thread.id !== d.threadId),
+        ]);
+        setThreadsError(null);
+        setThreadsLoaded(true);
+      })
+      .catch((failure) => {
+        setThreadsError(failure instanceof Error ? failure.message : String(failure));
+        setThreadsLoaded(true);
+      });
+  }, [tab, threadsLoaded, d.threadId]);
 
   if (d.kind === "creative") {
     return (
@@ -293,6 +352,7 @@ export function NodeInspector({
     "tools",
     "trace",
     "config",
+    "threads",
   ];
   const resetConfiguration = () =>
     update({
@@ -658,23 +718,38 @@ export function NodeInspector({
         {tab === "trace" && (
           <Section title="Execution trace">
             <div className="trace">
-              {nodeEvents.map((event, i) => (
-                <div key={event.id}>
-                  <span
-                    className={i === nodeEvents.length - 1 ? "active" : ""}
-                  />
-                  <div>
-                    <b>{event.message}</b>
-                    <small>
-                      {new Date(event.at).toLocaleTimeString()} ·{" "}
-                      {event.elapsedMs !== undefined
-                        ? `${event.elapsedMs}ms · `
-                        : ""}
-                      {event.status ?? event.level ?? event.type}
-                    </small>
+              {nodeEvents.map((event, i) => {
+                const label = traceEventLabel(event.type);
+                const isStreaming = isStreamingTraceEvent(event.type);
+                const icon = isStreaming ? (
+                  label === "Reasoning" ? <Brain size={12} /> :
+                  label === "Plan" ? <ListTodo size={12} /> :
+                  label === "Console" ? <Monitor size={12} /> :
+                  label === "Diff" ? <Diff size={12} /> :
+                  label === "File changes" ? <FileOutput size={12} /> :
+                  label === "Warning" ? <FileWarning size={12} /> :
+                  <Code2 size={12} />
+                ) : null;
+                return (
+                  <div key={event.id} className={isStreaming ? `trace-streaming trace-${label.toLowerCase().replace(/\s+/g, "-")}` : ""}>
+                    <span
+                      className={i === nodeEvents.length - 1 ? "active" : ""}
+                    />
+                    <div>
+                      {isStreaming && <span className="trace-streaming-icon">{icon}</span>}
+                      <b>{isStreaming ? label : event.message}</b>
+                      {isStreaming && <span className="trace-streaming-detail">{event.message.slice(0, 200)}{event.message.length > 200 ? "…" : ""}</span>}
+                      <small>
+                        {new Date(event.at).toLocaleTimeString()} ·{" "}
+                        {event.elapsedMs !== undefined
+                          ? `${event.elapsedMs}ms · `
+                          : ""}
+                        {event.status ?? event.level ?? event.type.replace(/^\[.*?\]\s*/, "")}
+                      </small>
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
               {!nodeEvents.length && (
                 <p className="helper">
                   No runtime events recorded for this node.
@@ -875,6 +950,45 @@ export function NodeInspector({
               </label>
             </Section>
           </>
+        )}
+        {tab === "threads" && (
+          <div className="thread-browser">
+            {!threadsLoaded ? (
+              <p className="helper">Loading Codex threads…</p>
+            ) : threadsError ? (
+              <p className="helper warning-text">
+                Thread history unavailable — {threadsError}{" "}
+                <button type="button" onClick={() => setThreadsLoaded(false)}>Retry</button>
+              </p>
+            ) : threads.length === 0 ? (
+              <p className="helper">No threads found.</p>
+            ) : (
+              threads.map((thread, index) => (
+                <div key={thread.id} className="thread-entry">
+                  {thread.id === d.threadId ? (
+                    <small>SELECTED NODE THREAD</small>
+                  ) : index === (d.threadId && threads[0]?.id === d.threadId ? 1 : 0) ? (
+                    <small>GLOBAL RECENT CODEX THREADS</small>
+                  ) : null}
+                  <div className="thread-header">
+                    <span className="thread-name">{thread.name ?? thread.id.slice(0, 8)}</span>
+                    {thread.status && (
+                      <span className={`thread-status thread-status-${thread.status}`}>
+                        {thread.status}
+                      </span>
+                    )}
+                  </div>
+                  {thread.preview && (
+                    <div className="thread-preview">{thread.preview}</div>
+                  )}
+                  <div className="thread-meta">
+                    <>Updated {new Date(thread.updatedAt).toLocaleDateString()}</>
+                    {thread.cwd && <> · {thread.cwd.split("/").pop()}</>}
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
         )}
       </div>
       <div className="inspector-actions">
@@ -1917,14 +2031,14 @@ function ControlNodeInspector({
               <Section title="Recent events">
                 <div className="trace">
                   {d.trace.slice(-6).map((line, i) => (
-                    <div key={`${line}-${i}`}>
+                    <div key={`${typeof line === "string" ? line : line.at}-${i}`}>
                       <span
                         className={
                           i === d.trace.slice(-6).length - 1 ? "active" : ""
                         }
                       />
                       <div>
-                        <b>{line}</b>
+                        <b>{typeof line === "string" ? line : line.text}</b>
                       </div>
                     </div>
                   ))}

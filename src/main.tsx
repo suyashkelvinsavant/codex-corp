@@ -182,11 +182,17 @@ import {
 import {
   isCodexAgentLifecycleEvent,
   notificationFromRunEvent,
+  parseStructuredApproval,
   type MediatorNotification,
   type MediatorQuestion,
   type MediatorQuestionAnswer,
 } from "./mediator-ui";
-import { appendStreamPreview, isAgentMessageDelta } from "./stream-display";
+import { appendStreamPreview, appendTypedTrace, isAgentMessageDelta, isStreamingTraceEvent } from "./stream-display";
+import {
+  buildUserInputResponse,
+  parseElicitationForm,
+  parseUserInputQuestions,
+} from "./codex-interactions";
 import { Metric } from "./metric";
 import {
   PERSISTENCE_ERROR_EVENT,
@@ -511,7 +517,10 @@ function CorpNode({ data, selected }: NodeProps<FlowNode>) {
       <div
         className={`node-activity ${data.streamingPreview ? "streaming" : ""}`}
       >
-        {data.streamingPreview || data.trace[data.trace.length - 1]}
+        {data.streamingPreview || (() => {
+          const last = data.trace[data.trace.length - 1];
+          return typeof last === "string" ? last : last?.text;
+        })()}
       </div>
       <div className="node-stats">
         {isControl ? (
@@ -767,6 +776,7 @@ function App() {
   const questionResolver = useRef<
     ((answer: MediatorQuestionAnswer | null) => void) | null
   >(null);
+  const interactionQueue = useRef<Promise<void>>(Promise.resolve());
   const [questionFreeText, setQuestionFreeText] = useState("");
   const [questionSelected, setQuestionSelected] = useState<string[]>([]);
   const [runId, setRunId] = useState<string | null>(null);
@@ -794,6 +804,8 @@ function App() {
     "loading" | "live" | "unavailable"
   >("loading");
   const [codexCapabilitiesError, setCodexCapabilitiesError] = useState("");
+  const [realtimeRuntimeUnavailable, setRealtimeRuntimeUnavailable] =
+    useState(false);
   const [libraryQuery, setLibraryQuery] = useState("");
   const [librarySearchOpen, setLibrarySearchOpen] = useState(false);
   const librarySearchRef = useRef<HTMLInputElement>(null);
@@ -1054,6 +1066,33 @@ function App() {
     },
   });
 
+  const resolveVoiceTool = async (
+    surface: "company" | "architect",
+    tool: string,
+    args: unknown,
+  ): Promise<{ success: boolean; text: string }> => {
+    if (surface === "company") {
+      if (["company_run", "company_run_from", "company_approve", "company_decline"].includes(tool)) {
+        const detail = tool === "company_run_from"
+          ? "Start from this node and intentionally skip its ancestors?"
+          : `Allow Byte to ${tool.replace("company_", "").replace(/_/g, " ")}?`;
+        if (!window.confirm(detail)) {
+          return { success: false, text: JSON.stringify({ error: "Operator cancelled confirmation" }) };
+        }
+      }
+      return executeCompanyMediatorTool(tool, args, mediatorHostContext());
+    }
+    return executeWorkflowArchitectTool(tool, args, {
+      save: persistArchitectWorkflow,
+      remove: async (id) => {
+        deleteWorkflowFromCatalog(id);
+        localStorage.removeItem(workflowStorageKey(id));
+        setCatalogRevision((value) => value + 1);
+      },
+      open: (id) => void switchTemplate(id, "editor"),
+    });
+  };
+
   const handleMediatorTurn = async (req: {
     text: string;
     attachments: ChatAttachment[];
@@ -1097,10 +1136,12 @@ function App() {
       : (effortOptions[0] ?? "low");
     const unlistenTool = await listen<{
       requestId: string;
+      sessionKey?: string;
       tool: string;
       arguments: unknown;
     }>("mediator-tool-call", async (event) => {
       const { requestId, tool, arguments: args } = event.payload;
+      if (event.payload.sessionKey) return;
       try {
         if (
           [
@@ -1228,10 +1269,12 @@ function App() {
         : (effortOptions[0] ?? "low");
     const unlistenTool = await listen<{
       requestId: string;
+      sessionKey?: string;
       tool: string;
       arguments: unknown;
     }>("mediator-tool-call", async (event) => {
       const { requestId, tool, arguments: args } = event.payload;
+      if (event.payload.sessionKey) return;
       try {
         const result = await executeWorkflowArchitectTool(tool, args, {
           save: persistArchitectWorkflow,
@@ -2913,6 +2956,7 @@ function App() {
         const payload = event.payload;
         const lifecycle = isCodexAgentLifecycleEvent(payload.eventType);
         const streaming = isAgentMessageDelta(payload.eventType);
+        const streamingTrace = isStreamingTraceEvent(payload.eventType);
         const tokenEvent =
           isTokenUsageEventType(payload.eventType) ||
           typeof payload.tokens === "number";
@@ -2921,12 +2965,21 @@ function App() {
           extractTotalTokensFromPayload(payload),
           extractTotalTokensFromPayload(payload.message),
         );
-        if (!lifecycle && !streaming && !tokenEvent && tokens <= 0) return;
+        if (!lifecycle && !streaming && !streamingTrace && !tokenEvent && tokens <= 0) return;
         setNodes((ns) =>
           ns.map((n) => {
             if (n.id !== payload.nodeId) return n;
             let next = n;
             if (tokens > 0) next = applyTokenUsageToNode(next, tokens);
+            const traceEntry = streamingTrace
+              ? {
+                  eventType: payload.eventType,
+                  text: payload.message,
+                  at: Date.now(),
+                  threadId: payload.threadId,
+                  turnId: payload.turnId,
+                }
+              : undefined;
             return {
               ...next,
               data: {
@@ -2942,7 +2995,9 @@ function App() {
                     : next.data.streamingPreview,
                 trace: lifecycle
                   ? [...next.data.trace, payload.message].slice(-80)
-                  : next.data.trace,
+                  : traceEntry
+                    ? appendTypedTrace(next.data.trace, traceEntry)
+                    : next.data.trace,
               },
             };
           }),
@@ -2956,6 +3011,17 @@ function App() {
       }),
     );
     unlisteners.push(
+      listen<{ message: string }>("codex-hook-persistence-error", (event) => {
+        if (disposed) return;
+        emit(
+          `Hook history was not saved: ${event.payload.message}`,
+          "hook.persistence.failed",
+          undefined,
+          "error",
+        );
+      }),
+    );
+    unlisteners.push(
       listen<{
         requestId: string;
         nodeId: string;
@@ -2964,16 +3030,22 @@ function App() {
       }>("codex-approval-requested", (event) => {
         if (disposed) return;
         const payload = event.payload;
+        const structured = parseStructuredApproval(payload.method, payload.params);
         const request: ApprovalRequest = {
           id: crypto.randomUUID(),
           nativeRequestId: payload.requestId,
           nodeId: payload.nodeId,
-          title: payload.method.includes("fileChange")
+          title: structured.kind === "fileChange"
             ? "Approve proposed file changes"
-            : "Approve Codex tool action",
+            : structured.kind === "execCommand"
+              ? `Approve command execution`
+              : payload.method.includes("fileChange")
+                ? "Approve proposed file changes"
+                : "Approve Codex tool action",
           detail: JSON.stringify(payload.params, null, 2),
           risk: "Review the command, paths, working directory and requested permission. This decision applies once.",
           status: "pending",
+          structured,
         };
         approvalsRef.current = [...approvalsRef.current, request];
         setApprovals(approvalsRef.current);
@@ -2995,6 +3067,88 @@ function App() {
               : n,
           ),
         );
+      }),
+    );
+    // Handle user-input and elicitation requests (reuse approval broker).
+    unlisteners.push(
+      listen<{
+        requestId: string;
+        nodeId: string;
+        method: string;
+        params: Record<string, unknown>;
+      }>("codex-user-input-requested", (event) => {
+        if (disposed) return;
+        const p = event.payload;
+        interactionQueue.current = interactionQueue.current.then(async () => {
+          let payload = buildUserInputResponse([]);
+          try {
+            const questions = parseUserInputQuestions(p.params);
+            const answers: MediatorQuestionAnswer[] = [];
+            const timeoutMs = Number(p.params.autoResolutionMs) || 0;
+            const collect = async () => {
+              for (const question of questions) {
+                const answer = await askMediatorQuestion(question);
+                if (!answer) return null;
+                answers.push(answer);
+              }
+              return answers;
+            };
+            const collected = timeoutMs > 0
+              ? await Promise.race([
+                  collect(),
+                  new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs)),
+                ])
+              : await collect();
+            if (collected) payload = buildUserInputResponse(collected);
+            else {
+              questionResolver.current?.(null);
+              questionResolver.current = null;
+              setActiveQuestion(null);
+            }
+          } catch (failure) {
+            emit(`Invalid Codex question: ${failure instanceof Error ? failure.message : String(failure)}`, "interaction.invalid", p.nodeId, "error");
+          }
+          await invoke("respond_user_input", { requestId: p.requestId, payload });
+        }).catch((failure) => {
+          emit(`Could not answer Codex question: ${String(failure)}`, "interaction.failed", p.nodeId, "error");
+        });
+      }),
+    );
+    unlisteners.push(
+      listen<{
+        requestId: string;
+        nodeId: string;
+        method: string;
+        params: Record<string, unknown>;
+      }>("codex-elicitation-requested", (event) => {
+        if (disposed) return;
+        const p = event.payload;
+        interactionQueue.current = interactionQueue.current.then(async () => {
+          let payload: Record<string, unknown> = { action: "cancel", content: {}, _meta: null };
+          try {
+            const fields = parseElicitationForm(p.params);
+            const content: Record<string, unknown> = {};
+            for (const field of fields) {
+              const answer = await askMediatorQuestion(field.question);
+              if (!answer) {
+                await invoke("respond_user_input", { requestId: p.requestId, payload });
+                return;
+              }
+              const raw = answer.freeText ?? answer.optionIds[0] ?? "";
+              content[field.id] = field.valueType === "number"
+                ? Number(raw)
+                : field.valueType === "boolean"
+                  ? raw === "true"
+                  : raw;
+            }
+            payload = { action: "accept", content, _meta: p.params._meta ?? null };
+          } catch (failure) {
+            emit(`Invalid MCP elicitation: ${failure instanceof Error ? failure.message : String(failure)}`, "interaction.invalid", p.nodeId, "error");
+          }
+          await invoke("respond_user_input", { requestId: p.requestId, payload });
+        }).catch((failure) => {
+          emit(`Could not answer MCP elicitation: ${String(failure)}`, "interaction.failed", p.nodeId, "error");
+        });
       }),
     );
     return () => {
@@ -3440,6 +3594,18 @@ function App() {
               })();
             }}
             onTurn={handleArchitectTurn}
+            voiceContext={{
+              developerInstructions: WORKFLOW_ARCHITECT_SYSTEM_PROMPT,
+              contextDigest: buildArchitectContextDigest(),
+              dynamicTools: workflowArchitectDynamicTools(),
+            }}
+            onVoiceToolCall={resolveVoiceTool}
+            voiceAvailable={
+              codexCapabilitiesStatus === "live" &&
+              codexCapabilities.realtimeConversationAvailable &&
+              !realtimeRuntimeUnavailable
+            }
+            onVoiceUnavailable={() => setRealtimeRuntimeUnavailable(true)}
           />
         </FeatureBoundary>
         {renderGlobalModals()}
@@ -3475,6 +3641,18 @@ function App() {
               void switchTemplate(id, "editor");
             }}
             onMediatorTurn={handleMediatorTurn}
+            voiceContext={{
+              developerInstructions: COMPANY_MEDIATOR_SYSTEM_PROMPT,
+              contextDigest: buildMediatorContextDigest(mediatorHostContext()),
+              dynamicTools: companyMediatorDynamicTools(),
+            }}
+            onVoiceToolCall={resolveVoiceTool}
+            voiceAvailable={
+              codexCapabilitiesStatus === "live" &&
+              codexCapabilities.realtimeConversationAvailable &&
+              !realtimeRuntimeUnavailable
+            }
+            onVoiceUnavailable={() => setRealtimeRuntimeUnavailable(true)}
             onResolveDefaultWorkspace={() =>
               isTauri()
                 ? invoke<string>("get_default_chat_workspace")

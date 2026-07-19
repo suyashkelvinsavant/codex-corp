@@ -383,6 +383,14 @@ test("Workflow Architect chat history persists in the left sidebar", async ({
   const composer = page.getByPlaceholder(
     "Describe a company workflow, a bug, or a change to agent access…",
   );
+  const actions = page.locator(".architect-compose-actions");
+  await expect(actions).toHaveCSS("display", "flex");
+  await expect(page.getByRole("button", { name: "Start voice session" })).toHaveCount(0);
+  const composerBox = await composer.boundingBox();
+  const sendBox = await page.getByRole("button", { name: "Send" }).boundingBox();
+  expect((composerBox?.x ?? 0) + (composerBox?.width ?? 0)).toBeLessThanOrEqual(
+    sendBox?.x ?? 0,
+  );
   await composer.fill("Remember this architect conversation");
   await composer.press("Enter");
   await expect(page.locator(".architect-history")).toContainText(

@@ -3,7 +3,7 @@
  * Types + pure helpers for notifications, question modals, and approval modals.
  */
 
-import type { RunEvent } from "./model";
+import type { RunEvent, StructuredApproval } from "./model";
 
 export type MediatorNotificationLevel =
   "info" | "warning" | "error" | "success";
@@ -35,6 +35,7 @@ export type MediatorQuestion = {
   allowFreeText?: boolean;
   optionsOnly?: boolean;
   placeholder?: string;
+  secret?: boolean;
   blocksRun?: boolean;
   source: "mediator" | "approval-node" | "specialist-request";
 };
@@ -207,6 +208,58 @@ export function parseMediatorControlIntent(raw: string): ChatRunIntent {
   if (runWith?.[1]?.trim()) return { kind: "run", mission: runWith[1].trim() };
   if (/^(run|start|execute|launch)\b/.test(lower)) return { kind: "run" };
   if (/^(help|commands|\?)$/.test(lower)) return { kind: "help" };
+  return { kind: "unknown" };
+}
+
+// ---------------------------------------------------------------------------
+// Structured approval parsing
+// ---------------------------------------------------------------------------
+
+export function parseStructuredApproval(
+  method: string,
+  params: Record<string, unknown>,
+): StructuredApproval {
+  if (
+    method === "item/fileChange/requestApproval" ||
+    method === "applyPatchApproval"
+  ) {
+    return {
+      kind: "fileChange",
+      files: [],
+      reason: (params.reason as string) ?? null,
+      grantRoot: (params.grantRoot as string) ?? null,
+    };
+  }
+  if (
+    method === "item/commandExecution/requestApproval" ||
+    method === "execCommandApproval"
+  ) {
+    const command = Array.isArray(params.command)
+      ? (params.command as string[]).join(" ")
+      : typeof params.command === "string"
+        ? params.command
+        : "";
+    return {
+      kind: "execCommand",
+      command,
+      cwd: (params.cwd as string) ?? ".",
+      reason: (params.reason as string) ?? null,
+      commandActions: Array.isArray(params.commandActions)
+        ? (params.commandActions as { type: string; command: string; name?: string; path?: string | null; query?: string | null }[])
+        : undefined,
+      additionalPermissions: params.additionalPermissions,
+      availableDecisions: Array.isArray(params.availableDecisions)
+        ? params.availableDecisions.map(String)
+        : undefined,
+    };
+  }
+  if (method === "item/permissions/requestApproval") {
+    return {
+      kind: "permissions",
+      permissions: params.permissions,
+      reason: (params.reason as string) ?? null,
+    };
+  }
   return { kind: "unknown" };
 }
 

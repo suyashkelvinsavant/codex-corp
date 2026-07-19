@@ -51,3 +51,35 @@ An older `release/Codex-Corp.exe` was also still running. Windows locked the des
 ### Evidence standard
 
 Do not claim the app is ready for manual verification based only on exit code, compiler output, file timestamp/hash, window title, or `Responding = True`. The final evidence must include the content rendered inside the new desktop window. If visual inspection is interrupted or unavailable, say that verification is incomplete.
+
+## 2026-07-19 — Codex Realtime Voice (Phase 1)
+
+### Architecture
+
+Voice mode uses `thread/realtime/*` JSON-RPC methods over the existing stdin/stdout transport. The frontend captures 24 kHz/16-bit/mono audio via `AudioWorklet`, batches to 100 ms frames (~6.4 KB base64), and sends via `append_codex_realtime_audio`. Output audio arrives as `codex-realtime-output-audio` events with `ThreadRealtimeAudioChunk` payloads (already base64-encoded). A dedicated `AudioContext` + `AudioBufferSourceNode` queues chunks for gapless playback.
+
+### Session lifecycle
+
+`RealtimeBroker` (mirrors `ToolBroker`/`ApprovalBroker`) holds `Arc<Mutex<RealtimeSession>>` entries keyed by `sessionKey`. Each session owns `stdin`, `child`, and `next_id` (AtomicU64). A dispatcher thread reads stdout and emits 8 Tauri events. `Drop` kills the child process.
+
+### Manual verification steps
+
+1. Launch exe, open mediator chat.
+2. Click phone button (not mic — mic button was removed).
+3. Grant microphone permission when prompted.
+4. Speak — confirm transcript appears in VoicePanel.
+5. Confirm spoken replies are audible (output audio).
+6. Click "End conversation" — confirm session closes cleanly.
+7. Check no `127.0.0.1` / `ERR_CONNECTION_REFUSED` in WebView.
+
+### IPC throughput
+
+- 100 ms frames → ~6.4 KB base64 per batch → ~10 `invoke` calls/sec.
+- `send_json_timed` uses 10s timeout to prevent deadlocks.
+- Dispatcher thread reads lines in a loop with no timeout (session lifetime).
+
+### Upgrade path
+
+- Phase 4: WebRTC transport (`transport:{type:webrtc,sdp}`).
+- Phase 4: `tauri::ipc::Channel` for output audio (bypasses global event-bus fanout).
+- Phase 4: Persistent voice transcript as structured chat messages.

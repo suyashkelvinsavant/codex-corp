@@ -557,6 +557,7 @@ dependencies = [
 name = "codex-corp"
 version = "0.3.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "chrono-tz",
  "ctrlc",

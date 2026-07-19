@@ -1,5 +1,6 @@
-import { Check, Hand, X } from "lucide-react";
-import type { ApprovalRequest } from "./model";
+import { Check, FileOutput, Hand, Terminal, ShieldQuestion, X } from "lucide-react";
+import type { CSSProperties } from "react";
+import type { ApprovalRequest, StructuredApproval } from "./model";
 import type { MediatorQuestion } from "./mediator-ui";
 
 export type DecisionCenterModalProps = {
@@ -57,7 +58,17 @@ export function DecisionCenterModal({
             <section className="decision-card" key={request.id}>
               <span>APPROVAL · {request.nodeId}</span>
               <h3>{request.title}</h3>
-              <p>{request.detail}</p>
+              {request.structured && request.structured.kind !== "unknown" ? (
+                <>
+                  <StructuredApprovalContent structured={request.structured} />
+                  <details className="decision-raw-payload">
+                    <summary>Raw request payload</summary>
+                    <pre className="decision-detail-raw">{request.detail}</pre>
+                  </details>
+                </>
+              ) : (
+                <p className="decision-detail-raw">{request.detail}</p>
+              )}
               <small>{request.risk}</small>
               <div className="modal-actions">
                 <button onClick={() => onDecideApproval(request, false)}>
@@ -111,7 +122,9 @@ export function DecisionCenterModal({
                       question.placeholder ?? "Optional free-text answer…"
                     }
                     value={freeText}
+                    aria-label={question.secret ? "Secret answer" : "Free-text answer"}
                     onChange={(event) => onFreeTextChange(event.target.value)}
+                    style={question.secret ? ({ WebkitTextSecurity: "disc" } as CSSProperties) : undefined}
                   />
                 )}
               <div className="modal-actions">
@@ -132,4 +145,80 @@ export function DecisionCenterModal({
       </div>
     </div>
   );
+}
+
+function StructuredApprovalContent({ structured }: { structured: StructuredApproval }) {
+  switch (structured.kind) {
+    case "fileChange":
+      return (
+        <div className="structured-approval structured-file-change">
+          {structured.reason && (
+            <p className="structured-reason">{structured.reason}</p>
+          )}
+          <div className="structured-file-list">
+            {structured.files.map((file) => (
+              <div key={file.path} className="structured-file-item">
+                <FileOutput size={13} />
+                <span className={`structured-file-type ${file.type}`}>{file.type}</span>
+                <code className="structured-file-path">{file.path}</code>
+              </div>
+            ))}
+          </div>
+          {structured.grantRoot && (
+            <p className="structured-grant-root">Grant root: <code>{structured.grantRoot}</code></p>
+          )}
+        </div>
+      );
+    case "execCommand":
+      return (
+        <div className="structured-approval structured-exec-command">
+          <div className="structured-command-row">
+            <Terminal size={13} />
+            <code className="structured-command">{structured.command}</code>
+          </div>
+          <p className="structured-cwd">in <code>{structured.cwd}</code></p>
+          {structured.reason && (
+            <p className="structured-reason">{structured.reason}</p>
+          )}
+          {structured.commandActions?.map((pc, i) => (
+            <div key={i} className="structured-parsed-cmd">
+              <small>{pc.type}{pc.name ? ` · ${pc.name}` : ""}{pc.path ? ` → ${pc.path}` : ""}</small>
+            </div>
+          ))}
+          {structured.additionalPermissions != null && (
+            <pre className="decision-detail-raw">{JSON.stringify(structured.additionalPermissions, null, 2)}</pre>
+          )}
+        </div>
+      );
+    case "permissions":
+      return (
+        <div className="structured-approval structured-permissions">
+          <div className="structured-command-row">
+            <ShieldQuestion size={13} />
+            <span>Permission profile request</span>
+          </div>
+          {structured.reason && (
+            <p className="structured-reason">{structured.reason}</p>
+          )}
+          {structured.permissions != null && (
+            <pre className="decision-detail-raw">{JSON.stringify(structured.permissions, null, 2)}</pre>
+          )}
+        </div>
+      );
+    case "commandExecution":
+      return (
+        <div className="structured-approval structured-exec-command">
+          {structured.command && (
+            <div className="structured-command-row">
+              <Terminal size={13} />
+              <code className="structured-command">{structured.command}</code>
+            </div>
+          )}
+          {structured.cwd && <p className="structured-cwd">in <code>{structured.cwd}</code></p>}
+          {structured.reason && <p className="structured-reason">{structured.reason}</p>}
+        </div>
+      );
+    default:
+      return null;
+  }
 }

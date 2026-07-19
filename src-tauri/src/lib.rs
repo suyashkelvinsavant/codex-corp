@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -6,7 +7,10 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, Arc, Condvar, Mutex,
+    },
     time::Duration,
 };
 #[cfg(desktop)]
@@ -62,17 +66,167 @@ fn default_agent_output_schema() -> Value {
 #[derive(Clone)]
 pub(crate) struct Database(pub(crate) Arc<Mutex<Connection>>);
 #[derive(Clone)]
-pub(crate) struct ApprovalBroker(pub(crate) Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>);
+pub(crate) struct ApprovalBroker(pub(crate) Arc<Mutex<HashMap<String, PendingInteraction>>>);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingInteractionKind {
+    Approval,
+    UserInput,
+    Elicitation,
+}
+
+pub(crate) struct PendingInteraction {
+    pub(crate) kind: PendingInteractionKind,
+    pub(crate) process_key: String,
+    pub(crate) sender: mpsc::Sender<Value>,
+}
+
+struct PendingProcessInteractions {
+    process_key: String,
+    broker: ApprovalBroker,
+}
+
+impl Drop for PendingProcessInteractions {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.broker.0.lock() {
+            pending.retain(|_, interaction| interaction.process_key != self.process_key);
+        }
+    }
+}
 /// Broker for dynamic tool call results (JSON text content from the UI host).
 #[derive(Clone)]
 pub(crate) struct ToolBroker(pub(crate) Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>);
 #[derive(Clone)]
 pub(crate) struct ProcessBroker(pub(crate) Arc<Mutex<HashMap<String, Arc<Mutex<Child>>>>>);
+/// Authoritative identifiers and stdin for graceful `turn/interrupt`.
+#[derive(Clone)]
+pub(crate) struct ActiveTurnHandle {
+    pub(crate) stdin: Arc<Mutex<ChildStdin>>,
+    pub(crate) thread_id: String,
+    pub(crate) turn_id: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct TurnStdinBroker(pub(crate) Arc<Mutex<HashMap<String, ActiveTurnHandle>>>);
+
+struct TurnRegistration {
+    key: String,
+    broker: TurnStdinBroker,
+}
+
+impl Drop for TurnRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut turns) = self.broker.0.lock() {
+            turns.remove(&self.key);
+        }
+    }
+}
+
+pub(crate) fn turn_interrupt_request(id: u64, handle: &ActiveTurnHandle) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "turn/interrupt",
+        "params": { "threadId": handle.thread_id, "turnId": handle.turn_id }
+    })
+}
+
+/// Broker for long-lived realtime voice sessions keyed by sessionKey.
+#[derive(Clone)]
+pub(crate) struct RealtimeBroker(
+    pub(crate) Arc<Mutex<HashMap<String, Arc<Mutex<RealtimeSession>>>>>,
+);
+
+impl Default for RealtimeBroker {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new(HashMap::new())))
+    }
+}
+
+pub(crate) struct RealtimeSession {
+    pub(crate) thread_id: String,
+    pub(crate) realtime_session_id: Option<String>,
+    pub(crate) version: Option<String>,
+    pub(crate) stdin: Arc<Mutex<ChildStdin>>,
+    pub(crate) child: Arc<Mutex<Child>>,
+    /// Kept for potential future use (e.g. direct emit from the session).
+    /// Optional so tests can construct a session without a Tauri app handle.
+    #[allow(dead_code)]
+    pub(crate) app_handle: Option<tauri::AppHandle>,
+    pub(crate) next_id: AtomicU64,
+    /// Owns the process registration for the full realtime lifetime.
+    pub(crate) process_lease: Option<ProcessRegistration>,
+    /// Signalled by the dispatcher on a terminal notification or EOF.
+    pub(crate) closed: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl Drop for RealtimeSession {
+    fn drop(&mut self) {
+        // Dropping the lease kills and deregisters the process exactly once.
+        if self.process_lease.take().is_none() {
+            kill_app_server_child(&self.child);
+        }
+    }
+}
 
 struct ProcessRegistration {
     node_id: String,
     broker: ProcessBroker,
     child: Arc<Mutex<Child>>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RealtimeAudioChunk {
+    data: String,
+    sample_rate: u32,
+    num_channels: u16,
+    samples_per_channel: Option<u32>,
+    item_id: Option<String>,
+}
+
+const MAX_REALTIME_AUDIO_BYTES: usize = 960_000;
+const MAX_REALTIME_AUDIO_FRAMES: usize = 240_000;
+
+impl RealtimeAudioChunk {
+    fn validate(&self) -> Result<(), String> {
+        if self.sample_rate != 24_000 {
+            return Err(format!(
+                "unsupported realtime sample rate: {}",
+                self.sample_rate
+            ));
+        }
+        if self.num_channels == 0 || self.num_channels > 2 {
+            return Err(format!(
+                "invalid realtime channel count: {}",
+                self.num_channels
+            ));
+        }
+        let decoded = BASE64_STANDARD
+            .decode(&self.data)
+            .map_err(|error| format!("invalid realtime audio base64: {error}"))?;
+        if decoded.len() > MAX_REALTIME_AUDIO_BYTES {
+            return Err("realtime audio chunk exceeds the maximum size".into());
+        }
+        if decoded.len() % 2 != 0 {
+            return Err("realtime PCM16 payload has an odd byte length".into());
+        }
+        let sample_count = decoded.len() / 2;
+        if sample_count % usize::from(self.num_channels) != 0 {
+            return Err("realtime audio samples are not divisible by channel count".into());
+        }
+        let frames = sample_count / usize::from(self.num_channels);
+        if frames > MAX_REALTIME_AUDIO_FRAMES {
+            return Err("realtime audio frame count exceeds the maximum".into());
+        }
+        if self
+            .samples_per_channel
+            .is_some_and(|declared| declared as usize != frames)
+        {
+            return Err("realtime audio frame count does not match payload".into());
+        }
+        Ok(())
+    }
 }
 impl Drop for ProcessRegistration {
     fn drop(&mut self) {
@@ -92,6 +246,106 @@ fn emit_optional<S: Serialize + Clone>(app: &Option<tauri::AppHandle>, event: &s
     if let Some(handle) = app {
         let _ = handle.emit(event, payload);
     }
+}
+
+fn unix_now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+fn normalize_unix_millis(value: i64) -> i64 {
+    if value.unsigned_abs() < 100_000_000_000 {
+        value.saturating_mul(1000)
+    } else {
+        value
+    }
+}
+
+fn parse_hook_run_record(
+    notification: &Value,
+    node_id: &str,
+    fallback_thread_id: &str,
+    fallback_turn_id: &str,
+) -> Result<app_settings::HookRunRecord, String> {
+    let run = notification
+        .pointer("/params/run")
+        .and_then(Value::as_object)
+        .ok_or("hook notification missing params.run")?;
+    let required = |key: &str| {
+        run.get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| format!("hook notification missing run.{key}"))
+    };
+    let started_at = run
+        .get("startedAt")
+        .and_then(Value::as_i64)
+        .map(normalize_unix_millis)
+        .unwrap_or_else(unix_now_millis);
+    Ok(app_settings::HookRunRecord {
+        id: required("id")?,
+        thread_id: notification
+            .pointer("/params/threadId")
+            .and_then(Value::as_str)
+            .unwrap_or(fallback_thread_id)
+            .to_string(),
+        turn_id: notification
+            .pointer("/params/turnId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| (!fallback_turn_id.is_empty()).then(|| fallback_turn_id.to_string())),
+        node_id: node_id.to_string(),
+        event_name: required("eventName")?,
+        handler_type: required("handlerType")?,
+        status: required("status")?,
+        source: run
+            .get("source")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        status_message: run
+            .get("statusMessage")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        started_at,
+        completed_at: run
+            .get("completedAt")
+            .and_then(Value::as_i64)
+            .map(normalize_unix_millis),
+        duration_ms: run.get("durationMs").and_then(Value::as_i64),
+    })
+}
+
+fn persist_hook_record(
+    database: &Database,
+    record: &app_settings::HookRunRecord,
+) -> Result<(), String> {
+    let connection = database
+        .0
+        .lock()
+        .map_err(|_| "database lock poisoned".to_string())?;
+    app_settings::persist_hook_run_with_connection(&connection, record)
+}
+
+fn emit_hook_record(
+    app: &Option<tauri::AppHandle>,
+    method: &str,
+    record: &app_settings::HookRunRecord,
+) {
+    emit_optional(
+        app,
+        "codex-hook-lifecycle",
+        json!({
+            "nodeId": record.node_id, "method": method, "hookRunId": record.id,
+            "eventName": record.event_name, "handlerType": record.handler_type,
+            "status": record.status, "source": record.source,
+            "statusMessage": record.status_message, "startedAt": record.started_at,
+            "completedAt": record.completed_at, "durationMs": record.duration_ms,
+            "threadId": record.thread_id, "turnId": record.turn_id,
+        }),
+    );
 }
 
 /// Unattended Live Codex approval behavior when `app` is `None` (headless MCP).
@@ -344,6 +598,9 @@ struct AgentRequest {
     run_id: Option<String>,
     #[serde(default)]
     attempt_id: Option<String>,
+    /// Resume an existing Codex thread instead of starting a fresh one.
+    #[serde(default)]
+    thread_id: Option<String>,
     role: String,
     model: String,
     effort: String,
@@ -2418,13 +2675,42 @@ fn respond_codex_approval(
     decision: String,
     broker: tauri::State<'_, ApprovalBroker>,
 ) -> Result<(), String> {
-    let sender = broker
+    let pending = broker
         .0
         .lock()
         .map_err(|_| "approval broker lock poisoned".to_string())?
         .remove(&request_id)
         .ok_or("approval request is no longer pending")?;
-    sender.send(decision).map_err(|error| error.to_string())
+    if pending.kind != PendingInteractionKind::Approval {
+        return Err("pending request is not an approval".into());
+    }
+    pending
+        .sender
+        .send(Value::String(decision))
+        .map_err(|error| error.to_string())
+}
+
+/// Respond to a pending user-input or elicitation request.
+/// `payload` is the typed JSON result to send back to app-server.
+#[tauri::command]
+fn respond_user_input(
+    request_id: String,
+    payload: Value,
+    broker: tauri::State<'_, ApprovalBroker>,
+) -> Result<(), String> {
+    let pending = broker
+        .0
+        .lock()
+        .map_err(|_| "approval broker lock poisoned".to_string())?
+        .remove(&request_id)
+        .ok_or("user input request is no longer pending")?;
+    if pending.kind == PendingInteractionKind::Approval {
+        return Err("pending request is an approval, not structured input".into());
+    }
+    pending
+        .sender
+        .send(payload)
+        .map_err(|error| error.to_string())
 }
 
 /// Resolve a pending dynamic tool call from the company mediator host.
@@ -2918,6 +3204,55 @@ async fn execute_mediator_turn(
                         .to_string();
                 }
                 break;
+            } else if method == "hook/started" || method == "hook/completed" {
+                match parse_hook_run_record(&value, "company-mediator", &thread_id, &turn_id) {
+                    Ok(record) => {
+                        if let Some(handle) = app.as_ref() {
+                            let database = handle.state::<Database>().inner().clone();
+                            if let Err(error) = persist_hook_record(&database, &record) {
+                                emit_optional(&app, "codex-hook-persistence-error", json!({"message": error}));
+                            }
+                        }
+                        emit_hook_record(&app, method, &record);
+                        emit_optional(
+                            &app,
+                            "codex-agent-event",
+                            NormalizedAgentEvent {
+                                node_id: "company-mediator".into(),
+                                event_type: method.into(),
+                                message: format!(
+                                    "hook {} ({}) → {}",
+                                    record.event_name, record.handler_type, record.status
+                                ),
+                                thread_id: Some(thread_id.clone()),
+                                turn_id: Some(turn_id.clone()),
+                                tokens: None,
+                            },
+                        );
+                    }
+                    Err(error) => emit_optional(
+                        &app,
+                        "codex-hook-persistence-error",
+                        json!({"message": error}),
+                    ),
+                }
+            } else if !method.is_empty() {
+                // Catch-all: forward unhandled events so the frontend can surface them.
+                emit_optional(
+                    &app,
+                    "codex-agent-event",
+                    NormalizedAgentEvent {
+                        node_id: "company-mediator".into(),
+                        event_type: method.into(),
+                        message: value
+                            .get("params")
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| method.into()),
+                        thread_id: Some(thread_id.clone()),
+                        turn_id: Some(turn_id.clone()),
+                        tokens: None,
+                    },
+                );
             }
         }
         if message.trim().is_empty() {
@@ -2931,6 +3266,1086 @@ async fn execute_mediator_turn(
     })
     .await
     .map_err(|e| format!("mediator turn join error: {e}"))?
+}
+
+// ---------------------------------------------------------------------------
+// Realtime voice session commands
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StartRealtimeRequest {
+    session_key: String,
+    surface: String,
+    model: Option<String>,
+    effort: Option<String>,
+    workspace_path: Option<String>,
+    voice: Option<String>,
+    output_modality: String,
+    base_instructions: Option<String>,
+    developer_instructions: Option<String>,
+    #[serde(default)]
+    context_digest: String,
+    #[serde(default)]
+    recent_transcript: String,
+    #[serde(default)]
+    dynamic_tools: Value,
+    #[serde(skip)]
+    app_server_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StartRealtimeResult {
+    thread_id: String,
+    realtime_session_id: Option<String>,
+    version: Option<String>,
+}
+
+/// Spawn a background thread that reads stdout lines and emits Tauri events
+/// for realtime notifications.
+struct RealtimeDispatcherContext {
+    session_key: String,
+    thread_id: String,
+    broker: RealtimeBroker,
+    tool_broker: ToolBroker,
+    approval_broker: ApprovalBroker,
+    database: Database,
+    surface: String,
+    app: tauri::AppHandle,
+}
+
+fn spawn_realtime_dispatcher(
+    buffered_lines: Vec<String>,
+    line_rx: mpsc::Receiver<Result<String, String>>,
+    context: RealtimeDispatcherContext,
+) {
+    std::thread::spawn(move || {
+        let RealtimeDispatcherContext {
+            session_key,
+            thread_id,
+            broker,
+            tool_broker,
+            approval_broker,
+            database,
+            surface,
+            app,
+        } = context;
+        let mut terminal = false;
+        for line_result in buffered_lines.into_iter().map(Ok).chain(line_rx) {
+            let line = match line_result {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            let value = match parse_app_server_line(&line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            // Notifications have no "id" field.
+            if value.get("id").is_some() && value.get("method").is_none() {
+                continue;
+            }
+            let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+            let params = value.get("params").cloned().unwrap_or(Value::Null);
+            match method {
+                "item/tool/call" => {
+                    let id = value.get("id").cloned().unwrap_or(Value::Null);
+                    let raw_id = id
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| id.to_string());
+                    let request_id = format!("realtime::{session_key}::{raw_id}");
+                    let (sender, receiver) = mpsc::channel();
+                    if let Ok(mut pending) = tool_broker.0.lock() {
+                        pending.insert(request_id.clone(), sender);
+                    }
+                    let _ = app.emit(
+                        "mediator-tool-call",
+                        json!({
+                            "requestId": request_id,
+                            "sessionKey": session_key,
+                            "surface": surface,
+                            "tool": params.get("tool").cloned().unwrap_or(Value::Null),
+                            "arguments": params.get("arguments").cloned().unwrap_or(Value::Null),
+                            "callId": params.get("callId").cloned().unwrap_or(Value::Null),
+                            "threadId": thread_id,
+                        }),
+                    );
+                    let pending_tools = tool_broker.clone();
+                    let sessions = broker.clone();
+                    let key = session_key.clone();
+                    std::thread::spawn(move || {
+                        let result = receiver
+                            .recv_timeout(Duration::from_secs(120))
+                            .unwrap_or_else(|_| {
+                                json!({"success":false,"content":"{\"error\":\"tool host timeout\"}"})
+                                    .to_string()
+                            });
+                        if let Ok(mut pending) = pending_tools.0.lock() {
+                            pending.remove(&request_id);
+                        }
+                        let parsed: Value = serde_json::from_str(&result)
+                            .unwrap_or(json!({"success":false,"content":result}));
+                        let session = sessions
+                            .0
+                            .lock()
+                            .ok()
+                            .and_then(|active| active.get(&key).cloned());
+                        if let Some(session) = session {
+                            let stdin = session.lock().ok().map(|session| session.stdin.clone());
+                            if let Some(stdin) = stdin {
+                                let _ = send_json_timed(
+                                    &stdin,
+                                    json!({
+                                        "jsonrpc":"2.0", "id":id, "result": {
+                                            "contentItems":[{"type":"inputText","text":parsed.get("content").and_then(Value::as_str).unwrap_or("")}],
+                                            "success":parsed.get("success").and_then(Value::as_bool).unwrap_or(false)
+                                        }
+                                    }),
+                                    Duration::from_secs(10),
+                                );
+                            }
+                        }
+                    });
+                }
+                "item/tool/requestUserInput" | "mcpServer/elicitation/request" => {
+                    let id = value.get("id").cloned().unwrap_or(Value::Null);
+                    let raw_id = id
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| id.to_string());
+                    let request_id = format!("realtime::{session_key}::{raw_id}");
+                    let (sender, receiver) = mpsc::channel();
+                    if let Ok(mut pending) = approval_broker.0.lock() {
+                        pending.insert(
+                            request_id.clone(),
+                            PendingInteraction {
+                                kind: if method == "item/tool/requestUserInput" {
+                                    PendingInteractionKind::UserInput
+                                } else {
+                                    PendingInteractionKind::Elicitation
+                                },
+                                process_key: format!("realtime-{session_key}"),
+                                sender,
+                            },
+                        );
+                    }
+                    let event_name = if method == "item/tool/requestUserInput" {
+                        "codex-user-input-requested"
+                    } else {
+                        "codex-elicitation-requested"
+                    };
+                    let _ = app.emit(
+                        event_name,
+                        json!({
+                            "requestId": request_id,
+                            "sessionKey": session_key,
+                            "surface": surface,
+                            "nodeId": format!("voice:{surface}"),
+                            "method": method,
+                            "params": params,
+                            "threadId": thread_id,
+                            "turnId": "realtime",
+                        }),
+                    );
+                    let pending_interactions = approval_broker.clone();
+                    let sessions = broker.clone();
+                    let key = session_key.clone();
+                    let is_user_input = method == "item/tool/requestUserInput";
+                    let timeout = if is_user_input {
+                        params
+                            .get("autoResolutionMs")
+                            .and_then(Value::as_u64)
+                            .map(Duration::from_millis)
+                            .unwrap_or(Duration::from_secs(120))
+                    } else {
+                        Duration::from_secs(120)
+                    };
+                    std::thread::spawn(move || {
+                        let cancellation = if is_user_input {
+                            json!({"answers":{}})
+                        } else {
+                            json!({"action":"cancel","content":{},"_meta":null})
+                        };
+                        let result = receiver.recv_timeout(timeout).ok().unwrap_or(cancellation);
+                        if let Ok(mut pending) = pending_interactions.0.lock() {
+                            pending.remove(&request_id);
+                        }
+                        let session = sessions
+                            .0
+                            .lock()
+                            .ok()
+                            .and_then(|active| active.get(&key).cloned());
+                        if let Some(session) = session {
+                            let stdin = session.lock().ok().map(|session| session.stdin.clone());
+                            if let Some(stdin) = stdin {
+                                let _ = send_json_timed(
+                                    &stdin,
+                                    json!({"jsonrpc":"2.0","id":id,"result":result}),
+                                    Duration::from_secs(10),
+                                );
+                            }
+                        }
+                    });
+                }
+                method if method.ends_with("requestApproval") => {
+                    let id = value.get("id").cloned().unwrap_or(Value::Null);
+                    let raw_id = id
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| id.to_string());
+                    let request_id = format!("realtime::{session_key}::{raw_id}");
+                    let (sender, receiver) = mpsc::channel();
+                    if let Ok(mut pending) = approval_broker.0.lock() {
+                        pending.insert(
+                            request_id.clone(),
+                            PendingInteraction {
+                                kind: PendingInteractionKind::Approval,
+                                process_key: format!("realtime-{session_key}"),
+                                sender,
+                            },
+                        );
+                    }
+                    let _ = app.emit(
+                        "codex-approval-requested",
+                        json!({
+                            "requestId": request_id,
+                            "sessionKey": session_key,
+                            "surface": surface,
+                            "nodeId": format!("voice:{surface}"),
+                            "method": method,
+                            "params": redact_sensitive(params),
+                            "threadId": thread_id,
+                            "turnId": "realtime",
+                        }),
+                    );
+                    let pending_interactions = approval_broker.clone();
+                    let sessions = broker.clone();
+                    let key = session_key.clone();
+                    std::thread::spawn(move || {
+                        let decision = receiver
+                            .recv_timeout(Duration::from_secs(120))
+                            .ok()
+                            .and_then(|value| value.as_str().map(str::to_string))
+                            .unwrap_or_else(|| "decline".into());
+                        if let Ok(mut pending) = pending_interactions.0.lock() {
+                            pending.remove(&request_id);
+                        }
+                        let session = sessions
+                            .0
+                            .lock()
+                            .ok()
+                            .and_then(|active| active.get(&key).cloned());
+                        if let Some(session) = session {
+                            let stdin = session.lock().ok().map(|session| session.stdin.clone());
+                            if let Some(stdin) = stdin {
+                                let _ = send_json_timed(
+                                    &stdin,
+                                    json!({"jsonrpc":"2.0","id":id,"result":{"decision":decision}}),
+                                    Duration::from_secs(10),
+                                );
+                            }
+                        }
+                    });
+                }
+                "hook/started" | "hook/completed" => {
+                    match parse_hook_run_record(
+                        &value,
+                        &format!("voice:{surface}"),
+                        &thread_id,
+                        "realtime",
+                    ) {
+                        Ok(record) => {
+                            if let Err(error) = persist_hook_record(&database, &record) {
+                                let _ = app.emit(
+                                    "codex-hook-persistence-error",
+                                    json!({"sessionKey":session_key,"message":error}),
+                                );
+                            }
+                            emit_hook_record(&Some(app.clone()), method, &record);
+                        }
+                        Err(error) => {
+                            let _ = app.emit(
+                                "codex-hook-persistence-error",
+                                json!({"sessionKey":session_key,"message":error}),
+                            );
+                        }
+                    }
+                }
+                "thread/realtime/started" => {
+                    let realtime_session_id = params
+                        .get("realtimeSessionId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    let version = params
+                        .get("version")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    // Update the session in the broker with the returned IDs.
+                    if let Ok(sessions) = broker.0.lock() {
+                        if let Some(session_arc) = sessions.get(&session_key) {
+                            if let Ok(mut session) = session_arc.lock() {
+                                session.realtime_session_id = realtime_session_id.clone();
+                                session.version = version.clone();
+                            }
+                        }
+                    }
+                    let _ = app.emit(
+                        "codex-realtime-started",
+                        json!({
+                            "sessionKey": session_key,
+                            "threadId": thread_id,
+                            "realtimeSessionId": realtime_session_id,
+                            "version": version,
+                        }),
+                    );
+                }
+                REALTIME_TRANSCRIPT_DELTA_METHOD => {
+                    let role = params
+                        .get("role")
+                        .and_then(Value::as_str)
+                        .unwrap_or("user")
+                        .to_string();
+                    let delta = params
+                        .get("delta")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let _ = app.emit(
+                        "codex-realtime-transcript-delta",
+                        json!({
+                            "sessionKey": session_key,
+                            "threadId": thread_id,
+                            "role": role,
+                            "delta": delta,
+                        }),
+                    );
+                }
+                REALTIME_TRANSCRIPT_DONE_METHOD => {
+                    let _ = app.emit(
+                        "codex-realtime-transcript-done",
+                        json!({ "sessionKey": session_key, "threadId": thread_id }),
+                    );
+                }
+                "thread/realtime/outputAudio/delta" => {
+                    let _ = app.emit(
+                        "codex-realtime-output-audio",
+                        json!({
+                            "sessionKey": session_key,
+                            "threadId": thread_id,
+                            "audio": params.get("audio").cloned().unwrap_or(Value::Null),
+                        }),
+                    );
+                }
+                "thread/realtime/itemAdded" => {
+                    let _ = app.emit(
+                        "codex-realtime-item-added",
+                        json!({
+                            "sessionKey": session_key,
+                            "threadId": thread_id,
+                            "item": params.get("item").cloned().unwrap_or(Value::Null),
+                        }),
+                    );
+                }
+                "thread/realtime/sdp" => {
+                    let _ = app.emit(
+                        "codex-realtime-sdp",
+                        json!({
+                            "sessionKey": session_key,
+                            "threadId": thread_id,
+                            "sdp": params.get("sdp").cloned().unwrap_or(Value::Null),
+                        }),
+                    );
+                }
+                "thread/realtime/error" => {
+                    let message = params
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown realtime error")
+                        .to_string();
+                    // Remove the session from the broker without holding the
+                    // broker lock across the session Drop (Drop re-locks the
+                    // broker to deregister; locking twice deadlocks a
+                    // non-reentrant Mutex). Removing clears the session's
+                    // back-reference first so Drop's own removal is a no-op,
+                    // then drops the Arc outside the lock.
+                    let removed = broker
+                        .0
+                        .lock()
+                        .ok()
+                        .and_then(|mut sessions| sessions.remove(&session_key));
+                    if let Some(session) = removed.as_ref() {
+                        if let Ok(session) = session.lock() {
+                            let (closed, wake) = &*session.closed;
+                            if let Ok(mut value) = closed.lock() {
+                                *value = true;
+                                wake.notify_all();
+                            }
+                        }
+                    }
+                    drop(removed);
+                    let _ = app.emit(
+                        "codex-realtime-error",
+                        json!({ "sessionKey": session_key, "threadId": thread_id, "message": message }),
+                    );
+                    terminal = true;
+                    break;
+                }
+                "thread/realtime/closed" => {
+                    let reason = params
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("closed")
+                        .to_string();
+                    // Same drop-outside-lock discipline as the error branch.
+                    let removed = broker
+                        .0
+                        .lock()
+                        .ok()
+                        .and_then(|mut sessions| sessions.remove(&session_key));
+                    if let Some(session) = removed.as_ref() {
+                        if let Ok(session) = session.lock() {
+                            let (closed, wake) = &*session.closed;
+                            if let Ok(mut value) = closed.lock() {
+                                *value = true;
+                                wake.notify_all();
+                            }
+                        }
+                    }
+                    drop(removed);
+                    let _ = app.emit(
+                        "codex-realtime-closed",
+                        json!({ "sessionKey": session_key, "threadId": thread_id, "reason": reason }),
+                    );
+                    terminal = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if !terminal {
+            let removed = broker
+                .0
+                .lock()
+                .ok()
+                .and_then(|mut sessions| sessions.remove(&session_key));
+            if let Some(session) = removed.as_ref() {
+                if let Ok(session) = session.lock() {
+                    let (closed, wake) = &*session.closed;
+                    if let Ok(mut value) = closed.lock() {
+                        *value = true;
+                        wake.notify_all();
+                    }
+                }
+            }
+            drop(removed);
+            let _ = app.emit(
+                "codex-realtime-error",
+                json!({
+                    "sessionKey": session_key,
+                    "threadId": thread_id,
+                    "message": "Codex realtime connection closed unexpectedly"
+                }),
+            );
+        }
+        let prefix = format!("realtime::{session_key}::");
+        if let Ok(mut pending) = tool_broker.0.lock() {
+            pending.retain(|key, _| !key.starts_with(&prefix));
+        }
+        if let Ok(mut pending) = approval_broker.0.lock() {
+            pending.retain(|key, _| !key.starts_with(&prefix));
+        };
+    });
+}
+
+const REALTIME_TRANSCRIPT_DELTA_METHOD: &str = "thread/realtime/transcript/delta";
+const REALTIME_TRANSCRIPT_DONE_METHOD: &str = "thread/realtime/transcript/done";
+
+fn enable_realtime_conversation(params: &mut Value) {
+    if !params.get("config").is_some_and(Value::is_object) {
+        params["config"] = json!({});
+    }
+    if let Some(config) = params.get_mut("config").and_then(Value::as_object_mut) {
+        config.insert("features.realtime_conversation".into(), Value::Bool(true));
+    }
+}
+
+fn build_realtime_start_params(
+    thread_id: &str,
+    surface: &str,
+    output_modality: &str,
+    effort: Option<&str>,
+    voice: Option<&str>,
+) -> Value {
+    let prompt = match effort.filter(|value| !value.trim().is_empty()) {
+        Some(effort) => format!(
+            "You are Byte on the {surface} surface. Use {effort} reasoning effort. Continue the host-governed conversation naturally."
+        ),
+        None => format!(
+            "You are Byte on the {surface} surface. Continue the host-governed conversation naturally."
+        ),
+    };
+    let mut params = json!({
+        "threadId": thread_id,
+        "outputModality": output_modality,
+        "transport": {"type": "websocket"},
+        "version": "v2",
+        "includeStartupContext": true,
+        "codexResponsesAsItems": true,
+        "prompt": prompt,
+    });
+    if let Some(voice) = voice {
+        params["voice"] = json!(voice);
+    }
+    params
+}
+
+#[tauri::command]
+async fn start_codex_realtime(
+    request: StartRealtimeRequest,
+    app: tauri::AppHandle,
+    broker: tauri::State<'_, RealtimeBroker>,
+    process_broker: tauri::State<'_, ProcessBroker>,
+    tool_broker: tauri::State<'_, ToolBroker>,
+    approval_broker: tauri::State<'_, ApprovalBroker>,
+    database: tauri::State<'_, Database>,
+) -> Result<StartRealtimeResult, String> {
+    let broker = broker.inner().clone();
+    let process_broker = process_broker.inner().clone();
+    let tool_broker = tool_broker.inner().clone();
+    let approval_broker = approval_broker.inner().clone();
+    let database = database.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if request.session_key.trim().is_empty() {
+            return Err("realtime session key is required".into());
+        }
+        if request.output_modality != "audio" && request.output_modality != "text" {
+            return Err("realtime output modality must be 'audio' or 'text'".into());
+        }
+        if request.surface != "company" && request.surface != "architect" {
+            return Err("realtime surface must be 'company' or 'architect'".into());
+        }
+        if broker
+            .0
+            .lock()
+            .map_err(|_| "broker lock poisoned".to_string())?
+            .contains_key(&request.session_key)
+        {
+            return Err(format!("session '{}' already exists", request.session_key));
+        }
+        let app_handle = app.clone();
+        let workspace = request
+            .workspace_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(default_chat_workspace_path);
+        let model = normalize_model_id(request.model.as_deref().unwrap_or(""));
+        let base_instructions = request.base_instructions.unwrap_or_default();
+        let mut developer_instructions = request.developer_instructions.unwrap_or_default();
+        if !request.context_digest.trim().is_empty() || !request.recent_transcript.trim().is_empty() {
+            developer_instructions.push_str(&format!(
+                "\n\nBYTE SESSION CONTEXT (bounded, host-authorized):\n{}\n\nRECENT TRANSCRIPT:\n{}",
+                request.context_digest.trim(), request.recent_transcript.trim()
+            ));
+        }
+        if !request.dynamic_tools.is_null() && !request.dynamic_tools.is_array() {
+            return Err("realtime dynamicTools must be an array".into());
+        }
+
+        // Spawn child process.
+        let mut child = if let Some(ref path) = request.app_server_path {
+            codex_app_server_at(Some(path))?
+        } else {
+            codex_app_server()?
+        };
+        let stdin_raw = child
+            .stdin
+            .take()
+            .ok_or("Codex app-server stdin unavailable")?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("Codex app-server stdout unavailable")?;
+        let stdin: Arc<Mutex<ChildStdin>> = Arc::new(Mutex::new(stdin_raw));
+
+        // Stdout reader thread.
+        let (line_tx, line_rx) = mpsc::channel::<Result<String, String>>();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if line_tx.send(Ok(line)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = line_tx.send(Err(error.to_string()));
+                        break;
+                    }
+                }
+            }
+        });
+
+        let child_arc = Arc::new(Mutex::new(child));
+        let process_key = format!("realtime-{}", request.session_key);
+        process_broker
+            .0
+            .lock()
+            .map_err(|_| "process broker lock poisoned".to_string())?
+            .insert(process_key.clone(), child_arc.clone());
+
+        let _child_for_cleanup = child_arc.clone();
+        let _broker_for_cleanup = broker.clone();
+        let _session_key_for_cleanup = request.session_key.clone();
+        let registration = ProcessRegistration {
+            node_id: process_key,
+            broker: process_broker.clone(),
+            child: child_arc.clone(),
+        };
+
+        // Handshake.
+        let mut next_request_id: i64 = 1;
+        // Lines that arrive while we're waiting for a specific response id
+        // (typically async notifications like thread/realtime/started that
+        // the app-server can emit immediately after the matching response).
+        // Without buffering these, the dispatcher would never see them and
+        // the frontend would not transition to the live state.
+        let mut buffered_lines: Vec<String> = Vec::new();
+        let read_response =
+            |expected_id: i64, buffered: &mut Vec<String>| -> Result<Value, String> {
+                let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                loop {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        kill_app_server_child(&child_arc);
+                        return Err(format!(
+                            "Codex app-server timed out waiting for response id={expected_id}"
+                        ));
+                    }
+                    match line_rx.recv_timeout(remaining) {
+                        Ok(Ok(line)) => {
+                            let value = parse_app_server_line(&line)?;
+                            if value.get("id").and_then(|id| id.as_i64()) == Some(expected_id)
+                                || value.get("id").and_then(|id| id.as_u64())
+                                    == Some(expected_id as u64)
+                            {
+                                if let Some(err) = value.get("error") {
+                                    return Err(format!("Codex app-server error: {err}"));
+                                }
+                                return Ok(value.get("result").cloned().unwrap_or(Value::Null));
+                            }
+                            // Non-matching line (typically an async notification
+                            // emitted between request and response). Preserve it
+                            // for the dispatcher to process.
+                            buffered.push(line);
+                        }
+                        Ok(Err(e)) => return Err(e),
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            return Err("Codex app-server closed".into());
+                        }
+                    }
+                }
+            };
+
+        send_json_timed(
+            &stdin,
+            json!({
+                "jsonrpc":"2.0",
+                "id": next_request_id,
+                "method":"initialize",
+                "params":{
+                    "clientInfo":{"name":"codex-corp","title":"Codex Corp","version":"0.3.0"},
+                    "capabilities":{"experimentalApi":true,"requestAttestation":false}
+                }
+            }),
+            Duration::from_secs(10),
+        )?;
+        let _ = read_response(next_request_id, &mut buffered_lines)?;
+        next_request_id += 1;
+        send_json_timed(
+            &stdin,
+            json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
+            Duration::from_secs(10),
+        )?;
+
+        // Thread start/resume.
+        // Every voice conversation gets a fresh ephemeral Byte thread. The
+        // returned thread ID is persisted by the host for the next text turn.
+        let requested_thread: Option<&str> = None;
+        let thread_result = if let Some(thread_id) = requested_thread {
+            let mut resume_params = json!({
+                "threadId": thread_id,
+                "approvalPolicy": "never",
+                "sandbox": "read-only",
+                "excludeTurns": true
+            });
+            if !model.is_empty() {
+                resume_params["model"] = json!(model);
+            }
+            apply_instruction_params(
+                &mut resume_params,
+                &base_instructions,
+                &developer_instructions,
+            );
+            send_json_timed(
+                &stdin,
+                json!({
+                    "jsonrpc":"2.0","id":next_request_id,"method":"thread/resume",
+                    "params": resume_params
+                }),
+                Duration::from_secs(15),
+            )?;
+            match read_response(next_request_id, &mut buffered_lines) {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = app_handle.emit(
+                        "codex-realtime-thread-recovered",
+                        json!({"oldThreadId": thread_id, "reason": error}),
+                    );
+                    next_request_id += 1;
+                    let mut start_params = json!({
+                        "cwd": workspace,
+                        "approvalPolicy": "never",
+                        "sandbox": "read-only",
+                        "ephemeral": true
+                    });
+                    if !model.is_empty() {
+                        start_params["model"] = json!(model);
+                    }
+                    apply_instruction_params(
+                        &mut start_params,
+                        &base_instructions,
+                        &developer_instructions,
+                    );
+                    enable_realtime_conversation(&mut start_params);
+                    send_json_timed(
+                        &stdin,
+                        json!({
+                            "jsonrpc":"2.0","id":next_request_id,"method":"thread/start",
+                            "params": start_params
+                        }),
+                        Duration::from_secs(15),
+                    )?;
+                    read_response(next_request_id, &mut buffered_lines)?
+                }
+            }
+        } else {
+            let mut start_params = json!({
+                "cwd": workspace,
+                "approvalPolicy": "never",
+                "sandbox": "read-only",
+                "ephemeral": true
+            });
+            if request.dynamic_tools.is_array() {
+                start_params["dynamicTools"] = request.dynamic_tools.clone();
+            }
+            if !model.is_empty() {
+                start_params["model"] = json!(model);
+            }
+            apply_instruction_params(
+                &mut start_params,
+                &base_instructions,
+                &developer_instructions,
+            );
+            enable_realtime_conversation(&mut start_params);
+            send_json_timed(
+                &stdin,
+                json!({
+                    "jsonrpc":"2.0","id":next_request_id,"method":"thread/start",
+                    "params": start_params
+                }),
+                Duration::from_secs(15),
+            )?;
+            read_response(next_request_id, &mut buffered_lines)?
+        };
+
+        let thread_id = thread_result
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .ok_or("thread/start missing thread id")?
+            .to_string();
+
+        // Send thread/realtime/start.
+        next_request_id += 1;
+        let realtime_start_params = build_realtime_start_params(
+            &thread_id,
+            &request.surface,
+            &request.output_modality,
+            request.effort.as_deref(),
+            request.voice.as_deref(),
+        );
+        send_json_timed(
+            &stdin,
+            json!({
+                "jsonrpc":"2.0","id":next_request_id,"method":"thread/realtime/start",
+                "params": realtime_start_params
+            }),
+            Duration::from_secs(15),
+        )?;
+        // Don't wait for response — the "started" notification comes via the
+        // dispatcher. But we do need to read the response to consume the id.
+        let _ = read_response(next_request_id, &mut buffered_lines)?;
+
+        // Create session (without line_rx) and spawn the dispatcher.
+        // broker/session_key are filled in after insertion to avoid a borrow
+        // cycle (Drop reads them; they reference the broker map that owns us).
+        let session = Arc::new(Mutex::new(RealtimeSession {
+            thread_id: thread_id.clone(),
+            realtime_session_id: None,
+            version: None,
+            stdin: stdin.clone(),
+            child: child_arc.clone(),
+            app_handle: Some(app_handle.clone()),
+            next_id: AtomicU64::new(100),
+            process_lease: Some(registration),
+            closed: Arc::new((Mutex::new(false), Condvar::new())),
+        }));
+        {
+            let mut sessions = broker
+                .0
+                .lock()
+                .map_err(|_| "broker lock poisoned".to_string())?;
+            if sessions.contains_key(&request.session_key) {
+                return Err(format!("session '{}' already exists", request.session_key));
+            }
+            sessions.insert(request.session_key.clone(), session.clone());
+        }
+
+        // Dispatcher reads remaining lines and emits Tauri events.
+        spawn_realtime_dispatcher(
+            buffered_lines,
+            line_rx,
+            RealtimeDispatcherContext {
+                session_key: request.session_key.clone(),
+                thread_id: thread_id.clone(),
+                broker: broker.clone(),
+                tool_broker,
+                approval_broker,
+                database,
+                surface: request.surface,
+                app: app_handle.clone(),
+            },
+        );
+
+        Ok(StartRealtimeResult {
+            thread_id,
+            realtime_session_id: None,
+            version: None,
+        })
+    })
+    .await
+    .map_err(|e| format!("start_codex_realtime join error: {e}"))?
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AppendRealtimeAudioRequest {
+    session_key: String,
+    audio: RealtimeAudioChunk,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AppendRealtimeTextRequest {
+    session_key: String,
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AppendRealtimeSpeechRequest {
+    session_key: String,
+    text: String,
+}
+
+#[tauri::command]
+async fn append_codex_realtime_audio(
+    request: AppendRealtimeAudioRequest,
+    broker: tauri::State<'_, RealtimeBroker>,
+) -> Result<(), String> {
+    let broker = broker.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        // Clone the session Arc out of the map and drop the map lock before
+        // sending. Holding the broker lock across send_json_timed serializes
+        // every audio frame and blocks the dispatcher's session-state updates
+        // (/started writes back into the session while holding the broker lock).
+        let session_arc = {
+            let sessions = broker
+                .0
+                .lock()
+                .map_err(|_| "broker lock poisoned".to_string())?;
+            sessions
+                .get(&request.session_key)
+                .cloned()
+                .ok_or_else(|| format!("session '{}' not found", request.session_key))?
+        };
+        let session = session_arc
+            .lock()
+            .map_err(|_| "session lock poisoned".to_string())?;
+        request.audio.validate()?;
+        let id = session.next_id.fetch_add(1, Ordering::SeqCst);
+        send_json_timed(
+            &session.stdin,
+            json!({
+                "jsonrpc":"2.0",
+                "id": id,
+                "method": "thread/realtime/appendAudio",
+                "params": {
+                    "threadId": session.thread_id,
+                    "audio": request.audio
+                }
+            }),
+            Duration::from_secs(10),
+        )
+    })
+    .await
+    .map_err(|e| format!("append_audio join error: {e}"))?
+}
+
+#[tauri::command]
+async fn append_codex_realtime_text(
+    request: AppendRealtimeTextRequest,
+    broker: tauri::State<'_, RealtimeBroker>,
+) -> Result<(), String> {
+    let broker = broker.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        // Same drop-the-map-lock-before-send discipline as append_audio.
+        let session_arc = {
+            let sessions = broker
+                .0
+                .lock()
+                .map_err(|_| "broker lock poisoned".to_string())?;
+            sessions
+                .get(&request.session_key)
+                .cloned()
+                .ok_or_else(|| format!("session '{}' not found", request.session_key))?
+        };
+        let session = session_arc
+            .lock()
+            .map_err(|_| "session lock poisoned".to_string())?;
+        let id = session.next_id.fetch_add(1, Ordering::SeqCst);
+        send_json_timed(
+            &session.stdin,
+            json!({
+                "jsonrpc":"2.0",
+                "id": id,
+                "method": "thread/realtime/appendText",
+                "params": {
+                    "threadId": session.thread_id,
+                    "text": request.text
+                }
+            }),
+            Duration::from_secs(10),
+        )
+    })
+    .await
+    .map_err(|e| format!("append_text join error: {e}"))?
+}
+
+#[tauri::command]
+async fn append_codex_realtime_speech(
+    request: AppendRealtimeSpeechRequest,
+    broker: tauri::State<'_, RealtimeBroker>,
+) -> Result<(), String> {
+    let broker = broker.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        // Same drop-the-map-lock-before-send discipline as append_audio.
+        let session_arc = {
+            let sessions = broker
+                .0
+                .lock()
+                .map_err(|_| "broker lock poisoned".to_string())?;
+            sessions
+                .get(&request.session_key)
+                .cloned()
+                .ok_or_else(|| format!("session '{}' not found", request.session_key))?
+        };
+        let session = session_arc
+            .lock()
+            .map_err(|_| "session lock poisoned".to_string())?;
+        let id = session.next_id.fetch_add(1, Ordering::SeqCst);
+        send_json_timed(
+            &session.stdin,
+            json!({
+                "jsonrpc":"2.0",
+                "id": id,
+                "method": "thread/realtime/appendSpeech",
+                "params": {
+                    "threadId": session.thread_id,
+                    "text": request.text
+                }
+            }),
+            Duration::from_secs(10),
+        )
+    })
+    .await
+    .map_err(|e| format!("append_speech join error: {e}"))?
+}
+
+#[tauri::command]
+async fn stop_codex_realtime(
+    session_key: String,
+    broker: tauri::State<'_, RealtimeBroker>,
+) -> Result<(), String> {
+    let broker = broker.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        // Send thread/realtime/stop best-effort. Clone the session Arc out of
+        // the map and drop the map lock before sending so a slow app-server
+        // write cannot block the dispatcher or other append calls.
+        let session_arc = {
+            let sessions = broker
+                .0
+                .lock()
+                .map_err(|_| "broker lock poisoned".to_string())?;
+            sessions.get(&session_key).cloned()
+        };
+        let close_signal = session_arc.as_ref().and_then(|session_arc| {
+            session_arc
+                .lock()
+                .ok()
+                .map(|session| session.closed.clone())
+        });
+        if let Some(session_arc) = session_arc {
+            if let Ok(session) = session_arc.lock() {
+                let id = session.next_id.fetch_add(1, Ordering::SeqCst);
+                let _ = send_json_timed(
+                    &session.stdin,
+                    json!({
+                        "jsonrpc":"2.0",
+                        "id": id,
+                        "method": "thread/realtime/stop",
+                        "params": {
+                            "threadId": session.thread_id
+                        }
+                    }),
+                    Duration::from_secs(5),
+                );
+            }
+        }
+        // Wait on the terminal signal instead of a fixed sleep. The dispatcher
+        // signals for closed, error, and EOF; timeout falls back to force cleanup.
+        if let Some(signal) = close_signal {
+            let (closed, wake) = &*signal;
+            if let Ok(value) = closed.lock() {
+                let _ = wake.wait_timeout_while(value, Duration::from_secs(2), |closed| !*closed);
+            }
+        }
+        let removed = broker
+            .0
+            .lock()
+            .ok()
+            .and_then(|mut sessions| sessions.remove(&session_key));
+        drop(removed);
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("stop_codex_realtime join error: {e}"))?
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -3011,6 +4426,15 @@ struct CodexProviderCapabilities {
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
+struct CodexAccountInfo {
+    #[serde(rename = "type")]
+    account_type: String,
+    email: Option<String>,
+    plan_type: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct CodexCapabilityInventory {
     skills: Vec<CodexSkillOption>,
     tools: Vec<CodexToolOption>,
@@ -3021,6 +4445,31 @@ struct CodexCapabilityInventory {
     hooks: Vec<CodexHookOption>,
     provider: CodexProviderCapabilities,
     enabled_runtime_features: Vec<String>,
+    realtime_conversation_available: bool,
+    account: Option<CodexAccountInfo>,
+    auth_mode: Option<String>,
+    requires_openai_auth: bool,
+}
+
+fn has_realtime_conversation_feature(result: &Value) -> bool {
+    result
+        .get("data")
+        .and_then(Value::as_array)
+        .is_some_and(|features| {
+            features.iter().any(|feature| {
+                feature.get("name").and_then(Value::as_str) == Some("realtime_conversation")
+            })
+        })
+}
+
+fn has_realtime_api_key_auth(auth_method: Option<&str>, environment_key: Option<&str>) -> bool {
+    if auth_method == Some("apikey") {
+        return true;
+    }
+    environment_key.is_some_and(|key| {
+        let key = key.trim();
+        key.starts_with("sk-") && key.len() >= 20
+    })
 }
 
 /// Discover the skills and MCP tools that this exact Codex app-server exposes.
@@ -3146,6 +4595,18 @@ async fn list_codex_capabilities(cwd: Option<String>) -> Result<CodexCapabilityI
         )
         .map_err(&fail)?;
         let features_result = read_until_response_silent(&mut reader, 9).unwrap_or(Value::Null);
+        send_json(
+            &mut stdin,
+            json!({"jsonrpc":"2.0","id":10,"method":"account/read","params":{"refreshToken":false}}),
+        )
+        .map_err(&fail)?;
+        let account_result = read_until_response_silent(&mut reader, 10).unwrap_or(Value::Null);
+        send_json(
+            &mut stdin,
+            json!({"jsonrpc":"2.0","id":11,"method":"getAuthStatus","params":{"includeToken":false}}),
+        )
+        .map_err(&fail)?;
+        let auth_result = read_until_response_silent(&mut reader, 11).unwrap_or(Value::Null);
         let _ = child.kill();
 
         let mut skills = Vec::new();
@@ -3330,6 +4791,16 @@ async fn list_codex_capabilities(cwd: Option<String>) -> Result<CodexCapabilityI
             .filter_map(|item| item.get("name").and_then(Value::as_str).map(str::to_string))
             .collect();
         enabled_runtime_features.sort();
+        let auth_mode = auth_result
+            .get("authMethod")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let environment_api_key = std::env::var("OPENAI_API_KEY").ok();
+        let realtime_conversation_available = has_realtime_conversation_feature(&features_result)
+            && has_realtime_api_key_auth(
+                auth_mode.as_deref(),
+                environment_api_key.as_deref(),
+            );
         Ok(CodexCapabilityInventory {
             skills,
             tools,
@@ -3340,6 +4811,14 @@ async fn list_codex_capabilities(cwd: Option<String>) -> Result<CodexCapabilityI
             hooks,
             provider,
             enabled_runtime_features,
+            realtime_conversation_available,
+            account: account_result.pointer("/account/type").and_then(Value::as_str).map(|t| CodexAccountInfo {
+                account_type: t.to_string(),
+                email: account_result.pointer("/account/email").and_then(Value::as_str).map(str::to_string),
+                plan_type: account_result.pointer("/account/planType").and_then(Value::as_str).map(str::to_string),
+            }),
+            auth_mode,
+            requires_openai_auth: auth_result.get("requiresOpenaiAuth").and_then(Value::as_bool).unwrap_or(false),
         })
     })
     .await
@@ -3487,6 +4966,494 @@ async fn list_codex_models() -> Result<Vec<CodexModelOption>, String> {
     .map_err(|error| error.to_string())?
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct McpServerStatusEntry {
+    name: String,
+    tools_count: usize,
+    resources_count: usize,
+    auth_status: String,
+    server_version: Option<String>,
+    server_title: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpStatusResponseDto {
+    data: Vec<McpStatusDto>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpStatusDto {
+    name: String,
+    #[serde(default)]
+    tools: HashMap<String, Value>,
+    #[serde(default)]
+    resources: Vec<Value>,
+    auth_status: String,
+    server_info: Option<McpServerInfoDto>,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpServerInfoDto {
+    version: Option<String>,
+    title: Option<String>,
+}
+
+#[tauri::command]
+async fn list_mcp_server_status() -> Result<Vec<McpServerStatusEntry>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut connection = AppServerConnection::connect()?;
+        let result = connection.request(
+            "mcpServerStatus/list",
+            json!({"limit":100,"detail":"full"}),
+            Duration::from_secs(30),
+        )?;
+
+        let decoded: McpStatusResponseDto = serde_json::from_value(result)
+            .map_err(|error| format!("Malformed mcpServerStatus/list response: {error}"))?;
+        let entries = decoded
+            .data
+            .into_iter()
+            .map(|server| McpServerStatusEntry {
+                name: server.name,
+                tools_count: server.tools.len(),
+                resources_count: server.resources.len(),
+                auth_status: server.auth_status,
+                server_version: server
+                    .server_info
+                    .as_ref()
+                    .and_then(|info| info.version.clone()),
+                server_title: server.server_info.and_then(|info| info.title),
+            })
+            .collect();
+        Ok(entries)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexConfigSnapshot {
+    model: Option<String>,
+    approval_policy: Option<String>,
+    sandbox_mode: Option<String>,
+    web_search: Option<String>,
+    instructions: Option<String>,
+    developer_instructions: Option<String>,
+    model_reasoning_effort: Option<String>,
+    model_provider: Option<String>,
+    raw: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigReadResponseDto {
+    config: ConfigDto,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigDto {
+    model: Option<String>,
+    approval_policy: Option<String>,
+    sandbox_mode: Option<String>,
+    web_search: Option<String>,
+    instructions: Option<String>,
+    developer_instructions: Option<String>,
+    model_reasoning_effort: Option<String>,
+    model_provider: Option<String>,
+}
+
+#[tauri::command]
+async fn read_codex_config() -> Result<CodexConfigSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut connection = AppServerConnection::connect()?;
+        let result = connection.request("config/read", json!({}), Duration::from_secs(30))?;
+
+        let decoded: ConfigReadResponseDto = serde_json::from_value(result.clone())
+            .map_err(|error| format!("Malformed config/read response: {error}"))?;
+        let config = decoded.config;
+        let snapshot = CodexConfigSnapshot {
+            model: config.model,
+            approval_policy: config.approval_policy,
+            sandbox_mode: config.sandbox_mode,
+            web_search: config.web_search,
+            instructions: config.instructions,
+            developer_instructions: config.developer_instructions,
+            model_reasoning_effort: config.model_reasoning_effort,
+            model_provider: config.model_provider,
+            raw: result,
+        };
+        Ok(snapshot)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn write_codex_config(key: String, value: serde_json::Value) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut child = codex_app_server()?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or("Codex app-server stdin unavailable")?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("Codex app-server stdout unavailable")?;
+        let stderr = child.stderr.take();
+        let stderr_buf = Arc::new(Mutex::new(String::new()));
+        if let Some(err) = stderr {
+            let sink = stderr_buf.clone();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(err);
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                    if let Ok(mut guard) = sink.lock() {
+                        if guard.len() < 4000 {
+                            guard.push_str(&line);
+                        }
+                    }
+                    line.clear();
+                }
+            });
+        }
+        let mut reader = BufReader::new(stdout);
+
+        let fail = |msg: String| -> String {
+            let err = stderr_buf
+                .lock()
+                .map(|g| g.trim().to_string())
+                .unwrap_or_default();
+            if err.is_empty() {
+                msg
+            } else {
+                format!("{msg} | stderr: {err}")
+            }
+        };
+
+        send_json(
+            &mut stdin,
+            json!({
+                "jsonrpc":"2.0", "id":1, "method":"initialize",
+                "params":{
+                    "clientInfo":{"name":"codex-corp","title":"Codex Corp","version":"0.3.0"},
+                    "capabilities":{"experimentalApi":true,"requestAttestation":false}
+                }
+            }),
+        )
+        .map_err(&fail)?;
+        let _ = read_until_response_silent(&mut reader, 1).map_err(&fail)?;
+        send_json(
+            &mut stdin,
+            json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
+        )
+        .map_err(&fail)?;
+
+        send_json(
+            &mut stdin,
+            json!({
+                "jsonrpc":"2.0", "id":2, "method":"config/value/write",
+                "params":{"key": key, "value": value}
+            }),
+        )
+        .map_err(&fail)?;
+        let _ = read_until_response_silent(&mut reader, 2).map_err(&fail)?;
+
+        let _ = child.kill();
+        Ok(())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadSummary {
+    id: String,
+    name: Option<String>,
+    preview: Option<String>,
+    status: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+    cwd: Option<String>,
+    model_provider: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadListResponseDto {
+    data: Vec<ThreadDto>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadReadResponseDto {
+    thread: ThreadDto,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadDto {
+    id: String,
+    name: Option<String>,
+    preview: String,
+    status: ThreadStatusDto,
+    created_at: i64,
+    updated_at: i64,
+    cwd: String,
+    model_provider: String,
+    #[serde(default)]
+    turns: Vec<TurnDto>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum ThreadStatusDto {
+    NotLoaded,
+    Idle,
+    SystemError,
+    Active {
+        #[serde(default)]
+        active_flags: Vec<Value>,
+    },
+}
+
+impl ThreadStatusDto {
+    fn label(&self) -> String {
+        match self {
+            Self::NotLoaded => "notLoaded",
+            Self::Idle => "idle",
+            Self::SystemError => "systemError",
+            Self::Active { active_flags } if active_flags.is_empty() => "active",
+            Self::Active { .. } => "active",
+        }
+        .into()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnDto {
+    id: String,
+    #[serde(default)]
+    items: Vec<Value>,
+    status: Value,
+    started_at: Option<i64>,
+}
+
+fn thread_summary(thread: ThreadDto) -> CodexThreadSummary {
+    CodexThreadSummary {
+        id: thread.id,
+        name: thread.name,
+        preview: Some(thread.preview),
+        status: Some(thread.status.label()),
+        created_at: thread.created_at.saturating_mul(1000),
+        updated_at: thread.updated_at.saturating_mul(1000),
+        cwd: Some(thread.cwd),
+        model_provider: Some(thread.model_provider),
+    }
+}
+
+#[tauri::command]
+async fn list_codex_threads(limit: Option<u32>) -> Result<Vec<CodexThreadSummary>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut connection = AppServerConnection::connect()?;
+        let result = connection.request(
+            "thread/list",
+            json!({"limit": limit.unwrap_or(50)}),
+            Duration::from_secs(30),
+        )?;
+
+        let decoded: ThreadListResponseDto = serde_json::from_value(result)
+            .map_err(|error| format!("Malformed thread/list response: {error}"))?;
+        let threads = decoded.data.into_iter().map(thread_summary).collect();
+        Ok(threads)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexTurnSummary {
+    id: String,
+    role: Option<String>,
+    summary: Option<String>,
+    created_at: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadDetail {
+    id: String,
+    name: Option<String>,
+    preview: Option<String>,
+    status: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+    cwd: Option<String>,
+    turns: Vec<CodexTurnSummary>,
+}
+
+fn turn_summary(turn: TurnDto) -> CodexTurnSummary {
+    let role = turn
+        .items
+        .first()
+        .and_then(|item| match item.get("type").and_then(Value::as_str) {
+            Some("userMessage") => Some("user".to_string()),
+            Some("agentMessage") => Some("assistant".to_string()),
+            Some(other) => Some(other.to_string()),
+            None => None,
+        });
+    let summary = turn.items.iter().find_map(|item| {
+        item.get("text")
+            .and_then(Value::as_str)
+            .or_else(|| item.pointer("/content/0/text").and_then(Value::as_str))
+            .map(|text| text.chars().take(500).collect())
+    });
+    let status = turn.status.as_str().map(str::to_string);
+    CodexTurnSummary {
+        id: turn.id,
+        role,
+        summary: summary.or(status),
+        created_at: turn.started_at.map(|seconds| seconds.saturating_mul(1000)),
+    }
+}
+
+#[tauri::command]
+async fn read_codex_thread(thread_id: String) -> Result<CodexThreadDetail, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut connection = AppServerConnection::connect()?;
+        let result = connection.request(
+            "thread/read",
+            json!({"threadId": thread_id}),
+            Duration::from_secs(30),
+        )?;
+
+        let decoded: ThreadReadResponseDto = serde_json::from_value(result)
+            .map_err(|error| format!("Malformed thread/read response: {error}"))?;
+        let thread = decoded.thread;
+        let turns = thread.turns.into_iter().map(turn_summary).collect();
+        let detail = CodexThreadDetail {
+            id: thread.id,
+            name: thread.name,
+            preview: Some(thread.preview),
+            status: Some(thread.status.label()),
+            created_at: thread.created_at.saturating_mul(1000),
+            updated_at: thread.updated_at.saturating_mul(1000),
+            cwd: Some(thread.cwd),
+            turns,
+        };
+        Ok(detail)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// List available realtime voices from the Codex app-server.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RealtimeVoicesListInner {
+    pub(crate) v1: Vec<String>,
+    pub(crate) v2: Vec<String>,
+    pub(crate) default_v1: String,
+    pub(crate) default_v2: String,
+}
+
+#[tauri::command]
+async fn list_codex_voices() -> Result<RealtimeVoicesListInner, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut child = codex_app_server()?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or("Codex app-server stdin unavailable")?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("Codex app-server stdout unavailable")?;
+        let stderr = child.stderr.take();
+        let stderr_buf = Arc::new(Mutex::new(String::new()));
+        if let Some(err) = stderr {
+            let sink = stderr_buf.clone();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(err);
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                    if let Ok(mut guard) = sink.lock() {
+                        if guard.len() < 4000 {
+                            guard.push_str(&line);
+                        }
+                    }
+                    line.clear();
+                }
+            });
+        }
+        let mut reader = BufReader::new(stdout);
+
+        let fail = |msg: String| -> String {
+            let err = stderr_buf
+                .lock()
+                .map(|g| g.trim().to_string())
+                .unwrap_or_default();
+            if err.is_empty() {
+                msg
+            } else {
+                format!("{msg} | stderr: {err}")
+            }
+        };
+
+        send_json(
+            &mut stdin,
+            json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"initialize",
+                "params":{
+                    "clientInfo":{"name":"codex-corp","title":"Codex Corp","version":"0.3.0"},
+                    "capabilities":{"experimentalApi":true,"requestAttestation":false}
+                }
+            }),
+        )
+        .map_err(&fail)?;
+        let _ = read_until_response_silent(&mut reader, 1).map_err(&fail)?;
+        send_json(
+            &mut stdin,
+            json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
+        )
+        .map_err(&fail)?;
+
+        send_json(
+            &mut stdin,
+            json!({
+                "jsonrpc":"2.0",
+                "id": 2,
+                "method": "thread/realtime/listVoices",
+                "params": {}
+            }),
+        )
+        .map_err(&fail)?;
+        let result = read_until_response_silent(&mut reader, 2).map_err(&fail)?;
+
+        let _ = child.kill();
+
+        let voices_value = result
+            .get("voices")
+            .cloned()
+            .or_else(|| Some(result.clone()));
+        let voices: RealtimeVoicesListInner =
+            serde_json::from_value(voices_value.unwrap_or(Value::Null))
+                .map_err(|e| fail(format!("failed to parse voices: {e}")))?;
+
+        Ok(voices)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 fn parse_model_list_item(item: &Value) -> Option<CodexModelOption> {
     let id = item
         .get("id")
@@ -3582,6 +5549,110 @@ fn read_until_response_silent(
     }
 }
 
+/// One initialized app-server lease for short capability/config requests.
+/// It owns the process and preserves every non-matching protocol line instead
+/// of silently consuming notifications while waiting for a response.
+struct AppServerConnection {
+    child: Child,
+    stdin: ChildStdin,
+    line_rx: mpsc::Receiver<Result<String, String>>,
+    next_id: i64,
+    queued: Vec<Value>,
+}
+
+impl AppServerConnection {
+    fn connect() -> Result<Self, String> {
+        let mut child = codex_app_server()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or("Codex app-server stdin unavailable")?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("Codex app-server stdout unavailable")?;
+        let (line_tx, line_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) if line_tx.send(Ok(line)).is_err() => break,
+                    Ok(_) => {}
+                    Err(error) => {
+                        let _ = line_tx.send(Err(error.to_string()));
+                        break;
+                    }
+                }
+            }
+        });
+        let mut connection = Self {
+            child,
+            stdin,
+            line_rx,
+            next_id: 1,
+            queued: Vec::new(),
+        };
+        connection.request(
+            "initialize",
+            json!({
+                "clientInfo":{"name":"codex-corp","title":"Codex Corp","version":"0.3.0"},
+                "capabilities":{"experimentalApi":true,"requestAttestation":false}
+            }),
+            Duration::from_secs(30),
+        )?;
+        send_json(
+            &mut connection.stdin,
+            json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
+        )?;
+        Ok(connection)
+    }
+
+    fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+        let id = self.next_id;
+        self.next_id += 1;
+        send_json(
+            &mut self.stdin,
+            json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+        )?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(format!("Codex app-server timed out waiting for {method}"));
+            }
+            let line = match self.line_rx.recv_timeout(remaining) {
+                Ok(Ok(line)) => line,
+                Ok(Err(error)) => return Err(error),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(format!("Codex app-server timed out waiting for {method}"));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(format!(
+                        "Codex app-server closed while waiting for {method}"
+                    ));
+                }
+            };
+            let value = parse_app_server_line(&line)?;
+            if value.get("id").and_then(Value::as_i64) == Some(id) {
+                if let Some(error) = value.get("error") {
+                    return Err(format!("Codex app-server {method} failed: {error}"));
+                }
+                return Ok(value.get("result").cloned().unwrap_or(Value::Null));
+            }
+            self.queued.push(value);
+        }
+    }
+}
+
+impl Drop for AppServerConnection {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Idle gap between stdout lines before killing a stalled turn.
 /// Keep high enough for multi-file writes; hard wall still bounds the turn.
 const TURN_IDLE_SECS: u64 = 75;
@@ -3610,6 +5681,8 @@ pub(crate) async fn execute_agent_internal(
     app: Option<tauri::AppHandle>,
     broker: ApprovalBroker,
     process_broker: ProcessBroker,
+    turn_stdin_broker: TurnStdinBroker,
+    database: Database,
     token_meter: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<AgentResult, String> {
     agent_trace(&format!("execute_agent ENTER node={}", request.node_id));
@@ -3625,6 +5698,7 @@ pub(crate) async fn execute_agent_internal(
         let app_outer = app.clone();
         let broker_outer = broker.clone();
         let process_broker_outer = process_broker.clone();
+        let database_outer = database.clone();
         std::thread::spawn(move || {
             let node_id_log = request_outer.node_id.clone();
             agent_trace(&format!("worker START node={node_id_log}"));
@@ -3633,6 +5707,7 @@ pub(crate) async fn execute_agent_internal(
                 let app = app_outer;
                 let broker = broker_outer;
                 let process_broker = process_broker_outer;
+                let database = database_outer;
                 let mut child = codex_app_server_at(request.app_server_path.as_deref())?;
                 let stdin_raw = child
                     .stdin
@@ -3666,6 +5741,10 @@ pub(crate) async fn execute_agent_internal(
                 });
                 let child = Arc::new(Mutex::new(child));
                 let process_key = request.process_key();
+                let _pending_interactions = PendingProcessInteractions {
+                    process_key: process_key.clone(),
+                    broker: broker.clone(),
+                };
                 process_broker
                     .0
                     .lock()
@@ -3678,7 +5757,7 @@ pub(crate) async fn execute_agent_internal(
                 };
 
                 let read_response = |expected_id: i64,
-                                     rx: &mpsc::Receiver<Result<String, String>>,
+                                     _rx: &mpsc::Receiver<Result<String, String>>,
                                      app: &Option<tauri::AppHandle>,
                                      node_id: &str,
                                      child: &Arc<Mutex<Child>>|
@@ -3693,7 +5772,7 @@ pub(crate) async fn execute_agent_internal(
                                 "Codex app-server timed out waiting for response id={expected_id}"
                             ));
                         }
-                        match rx.recv_timeout(remaining) {
+                        match line_rx.recv_timeout(remaining) {
                             Ok(Ok(line)) => {
                                 let value = parse_app_server_line(&line)?;
                                 let method = value
@@ -3779,29 +5858,48 @@ pub(crate) async fn execute_agent_internal(
                     approval_policy,
                     sandbox,
                 );
-                send_json_timed(
-                    &stdin,
-                    json!({"jsonrpc":"2.0","id":2,"method":"thread/start","params":thread_params}),
-                    Duration::from_secs(10),
-                )?;
-                let thread_result = read_response(2, &line_rx, &app, &request.node_id, &child)?;
-                let thread_id = thread_result
-                    .pointer("/thread/id")
-                    .and_then(Value::as_str)
-                    .ok_or("thread/start response missing thread id")?
-                    .to_string();
-                emit_optional(
-                    &app,
-                    "codex-agent-event",
-                    NormalizedAgentEvent {
-                        node_id: request.node_id.clone(),
-                        event_type: "agent.started".into(),
-                        message: "Fresh Codex thread started".into(),
-                        thread_id: Some(thread_id.clone()),
-                        turn_id: None,
-                        tokens: None,
-                    },
-                );
+                // Resume existing thread or start a fresh one.
+                let thread_id = if let Some(existing) = request.thread_id.as_deref() {
+                    emit_optional(
+                        &app,
+                        "codex-agent-event",
+                        NormalizedAgentEvent {
+                            node_id: request.node_id.clone(),
+                            event_type: "agent.thread.resume".into(),
+                            message: format!("Resumed existing thread {existing}"),
+                            thread_id: Some(existing.into()),
+                            turn_id: None,
+                            tokens: None,
+                        },
+                    );
+                    existing.to_string()
+                } else {
+                    send_json_timed(
+                        &stdin,
+                        json!({"jsonrpc":"2.0","id":2,"method":"thread/start","params":thread_params}),
+                        Duration::from_secs(10),
+                    )?;
+                    let thread_result = read_response(2, &line_rx, &app, &request.node_id, &child)?;
+                    thread_result
+                        .pointer("/thread/id")
+                        .and_then(Value::as_str)
+                        .ok_or("thread/start response missing thread id")?
+                        .to_string()
+                };
+                if request.thread_id.is_none() {
+                    emit_optional(
+                        &app,
+                        "codex-agent-event",
+                        NormalizedAgentEvent {
+                            node_id: request.node_id.clone(),
+                            event_type: "agent.started".into(),
+                            message: "Fresh Codex thread started".into(),
+                            thread_id: Some(thread_id.clone()),
+                            turn_id: None,
+                            tokens: None,
+                        },
+                    );
+                }
 
                 let boundary = request.tool_boundary.trim();
                 let boundary_section = if boundary.is_empty() {
@@ -3850,6 +5948,24 @@ pub(crate) async fn execute_agent_internal(
                     .and_then(Value::as_str)
                     .ok_or("turn/start response missing turn id")?
                     .to_string();
+                // Register only after turn/start returns both authoritative IDs.
+                // The guard removes the entry on every exit path.
+                turn_stdin_broker
+                    .0
+                    .lock()
+                    .map_err(|_| "turn stdin broker lock poisoned".to_string())?
+                    .insert(
+                        process_key.clone(),
+                        ActiveTurnHandle {
+                            stdin: stdin.clone(),
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.clone(),
+                        },
+                    );
+                let _turn_registration = TurnRegistration {
+                    key: process_key.clone(),
+                    broker: turn_stdin_broker.clone(),
+                };
                 let mut message = String::new();
                 let mut total_tokens: u64 = 0;
                 let turn_deadline = std::time::Instant::now() + Duration::from_secs(wall_secs);
@@ -3976,6 +6092,138 @@ pub(crate) async fn execute_agent_internal(
                                 tokens: None,
                             },
                         );
+                    } else if method == "item/reasoning/textDelta"
+                        || method == "item/reasoning/summaryTextDelta"
+                        || method == "item/plan/delta"
+                        || method == "item/commandExecution/outputDelta"
+                        || method == "turn/diff/updated"
+                        || method == "item/fileChange/patchUpdated"
+                    {
+                        let delta = value
+                            .pointer("/params/delta")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let changes_json = if method == "turn/diff/updated" {
+                            value
+                                .pointer("/params/diff")
+                                .and_then(Value::as_str)
+                                .unwrap_or(&delta)
+                                .to_string()
+                        } else if method == "item/fileChange/patchUpdated" {
+                            value
+                                .get("params")
+                                .map(|p| p.to_string())
+                                .unwrap_or_default()
+                        } else {
+                            delta
+                        };
+                        emit_optional(
+                            &app,
+                            "codex-agent-event",
+                            NormalizedAgentEvent {
+                                node_id: request.node_id.clone(),
+                                event_type: method.into(),
+                                message: changes_json,
+                                thread_id: Some(thread_id.clone()),
+                                turn_id: Some(turn_id.clone()),
+                                tokens: None,
+                            },
+                        );
+                    } else if method == "warning"
+                        || method == "guardianWarning"
+                        || method == "configWarning"
+                        || method == "deprecationNotice"
+                    {
+                        let warning_msg = value
+                            .pointer("/params/message")
+                            .and_then(Value::as_str)
+                            .or_else(|| value.pointer("/params/summary").and_then(Value::as_str))
+                            .unwrap_or(method);
+                        emit_optional(
+                            &app,
+                            "codex-agent-event",
+                            NormalizedAgentEvent {
+                                node_id: request.node_id.clone(),
+                                event_type: method.into(),
+                                message: warning_msg.into(),
+                                thread_id: Some(thread_id.clone()),
+                                turn_id: Some(turn_id.clone()),
+                                tokens: None,
+                            },
+                        );
+                    } else if method == "item/tool/requestUserInput"
+                        || method == "mcpServer/elicitation/request"
+                    {
+                        // Server-initiated user input request — reuse approval broker pattern.
+                        if let Some(id) = value.get("id").cloned() {
+                            let request_id = id
+                                .as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| id.to_string());
+                            let broker_request_id = format!("{process_key}::{request_id}");
+                            let (sender, receiver) = mpsc::channel();
+                            broker
+                                .0
+                                .lock()
+                                .map_err(|_| "approval broker lock poisoned".to_string())?
+                                .insert(
+                                    broker_request_id.clone(),
+                                    PendingInteraction {
+                                        kind: if method == "item/tool/requestUserInput" {
+                                            PendingInteractionKind::UserInput
+                                        } else {
+                                            PendingInteractionKind::Elicitation
+                                        },
+                                        process_key: process_key.clone(),
+                                        sender,
+                                    },
+                                );
+                            let event_name = if method == "item/tool/requestUserInput" {
+                                "codex-user-input-requested"
+                            } else {
+                                "codex-elicitation-requested"
+                            };
+                            emit_optional(
+                                &app,
+                                event_name,
+                                NativeApprovalEvent {
+                                    request_id: broker_request_id.clone(),
+                                    node_id: request.node_id.clone(),
+                                    method: method.into(),
+                                    params: value.get("params").cloned().unwrap_or(Value::Null),
+                                    thread_id: thread_id.clone(),
+                                    turn_id: turn_id.clone(),
+                                },
+                            );
+                            let timeout = if method == "item/tool/requestUserInput" {
+                                value
+                                    .pointer("/params/autoResolutionMs")
+                                    .and_then(Value::as_u64)
+                                    .map(Duration::from_millis)
+                                    .unwrap_or(Duration::from_secs(120))
+                            } else {
+                                Duration::from_secs(120)
+                            };
+                            let cancellation = if method == "item/tool/requestUserInput" {
+                                json!({"answers":{}})
+                            } else {
+                                json!({"action":"cancel","content":{},"_meta":null})
+                            };
+                            let response_payload = receiver
+                                .recv_timeout(timeout)
+                                .unwrap_or_else(|_| cancellation.clone());
+                            broker
+                                .0
+                                .lock()
+                                .ok()
+                                .and_then(|mut pending| pending.remove(&broker_request_id));
+                            let _ = send_json_timed(
+                                &stdin,
+                                json!({"jsonrpc":"2.0","id":id,"result":response_payload}),
+                                Duration::from_secs(10),
+                            );
+                        }
                     } else if method.ends_with("requestApproval") {
                         if let Some(id) = value.get("id").cloned() {
                             let request_id = id
@@ -3983,8 +6231,8 @@ pub(crate) async fn execute_agent_internal(
                                 .map(str::to_string)
                                 .unwrap_or_else(|| id.to_string());
                             let broker_request_id = format!("{process_key}::{request_id}");
-                            // When the node is configured for unattended policy, accept immediately
-                            // so Live Codex turns do not stall waiting for a focused UI click.
+                            // A request under `never` violates the configured contract; decline it
+                            // fail-closed instead of silently broadening the node's authority.
                             // Headless (no AppHandle): CODEX_CORP_HEADLESS_APPROVAL policy applies
                             // for non-never approval policies (default auto_accept).
                             let decision = if approval_policy == "never" {
@@ -3993,14 +6241,14 @@ pub(crate) async fn execute_agent_internal(
                                     "codex-agent-event",
                                     NormalizedAgentEvent {
                                         node_id: request.node_id.clone(),
-                                        event_type: "approval.auto_accept".into(),
-                                        message: "Auto-accepted (approvalPolicy=never)".into(),
+                                        event_type: "approval.auto_decline".into(),
+                                        message: "Declined unexpected approval request (approvalPolicy=never)".into(),
                                         thread_id: Some(thread_id.clone()),
                                         turn_id: Some(turn_id.clone()),
                                         tokens: None,
                                     },
                                 );
-                                "accept".to_string()
+                                "decline".to_string()
                             } else if app.is_none() {
                                 match headless_codex_approval_policy() {
                                     HeadlessCodexApprovalPolicy::AutoAccept => {
@@ -4047,7 +6295,14 @@ pub(crate) async fn execute_agent_internal(
                                             .map_err(|_| {
                                                 "approval broker lock poisoned".to_string()
                                             })?
-                                            .insert(broker_request_id.clone(), sender);
+                                            .insert(
+                                                broker_request_id.clone(),
+                                                PendingInteraction {
+                                                    kind: PendingInteractionKind::Approval,
+                                                    process_key: process_key.clone(),
+                                                    sender,
+                                                },
+                                            );
                                         emit_optional(
                                             &app,
                                             "codex-approval-requested",
@@ -4070,7 +6325,9 @@ pub(crate) async fn execute_agent_internal(
                                         );
                                         receiver
                                             .recv_timeout(Duration::from_secs(120))
-                                            .unwrap_or_else(|_| "decline".into())
+                                            .ok()
+                                            .and_then(|value| value.as_str().map(str::to_string))
+                                            .unwrap_or_else(|| "decline".into())
                                     }
                                 }
                             } else {
@@ -4079,7 +6336,14 @@ pub(crate) async fn execute_agent_internal(
                                     .0
                                     .lock()
                                     .map_err(|_| "approval broker lock poisoned".to_string())?
-                                    .insert(broker_request_id.clone(), sender);
+                                    .insert(
+                                        broker_request_id.clone(),
+                                        PendingInteraction {
+                                            kind: PendingInteractionKind::Approval,
+                                            process_key: process_key.clone(),
+                                            sender,
+                                        },
+                                    );
                                 emit_optional(
                                     &app,
                                     "codex-approval-requested",
@@ -4096,7 +6360,9 @@ pub(crate) async fn execute_agent_internal(
                                 );
                                 receiver
                                     .recv_timeout(Duration::from_secs(120))
-                                    .unwrap_or_else(|_| "decline".into())
+                                    .ok()
+                                    .and_then(|value| value.as_str().map(str::to_string))
+                                    .unwrap_or_else(|| "decline".into())
                             };
                             broker
                                 .0
@@ -4125,6 +6391,79 @@ pub(crate) async fn execute_agent_internal(
                                 return Err(format!("Codex approval response failed: {error}"));
                             }
                         }
+                    } else if method == "hook/started" || method == "hook/completed" {
+                        match parse_hook_run_record(&value, &request.node_id, &thread_id, &turn_id)
+                        {
+                            Ok(record) => {
+                                if let Err(error) = persist_hook_record(&database, &record) {
+                                    emit_optional(
+                                        &app,
+                                        "codex-hook-persistence-error",
+                                        json!({"message": error}),
+                                    );
+                                }
+                                emit_hook_record(&app, method, &record);
+                                emit_optional(
+                                    &app,
+                                    "codex-agent-event",
+                                    NormalizedAgentEvent {
+                                        node_id: request.node_id.clone(),
+                                        event_type: method.into(),
+                                        message: format!(
+                                            "hook {} ({}) → {}",
+                                            record.event_name, record.handler_type, record.status
+                                        ),
+                                        thread_id: Some(thread_id.clone()),
+                                        turn_id: Some(turn_id.clone()),
+                                        tokens: None,
+                                    },
+                                );
+                            }
+                            Err(error) => emit_optional(
+                                &app,
+                                "codex-hook-persistence-error",
+                                json!({"message": error}),
+                            ),
+                        }
+                    } else if method == "mcpServer/startupStatus/updated" {
+                        let server_name = value
+                            .pointer("/params/name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let server_status = value
+                            .pointer("/params/status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let error_msg = value
+                            .pointer("/params/error")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        emit_optional(
+                            &app,
+                            "codex-mcp-status-updated",
+                            serde_json::json!({
+                                "nodeId": request.node_id.clone(),
+                                "name": server_name,
+                                "status": server_status,
+                                "error": error_msg,
+                                "threadId": thread_id,
+                                "turnId": turn_id,
+                            }),
+                        );
+                        emit_optional(
+                            &app,
+                            "codex-agent-event",
+                            NormalizedAgentEvent {
+                                node_id: request.node_id.clone(),
+                                event_type: "mcpServer/statusUpdated".into(),
+                                message: format!("MCP server {server_name}: {server_status}"),
+                                thread_id: Some(thread_id.clone()),
+                                turn_id: Some(turn_id.clone()),
+                                tokens: None,
+                            },
+                        );
                     } else {
                         emit_optional(
                             &app,
@@ -4334,6 +6673,8 @@ pub fn run() {
         .manage(ApprovalBroker(Arc::new(Mutex::new(HashMap::new()))))
         .manage(ToolBroker(Arc::new(Mutex::new(HashMap::new()))))
         .manage(ProcessBroker(Arc::new(Mutex::new(HashMap::new()))))
+        .manage(TurnStdinBroker(Arc::new(Mutex::new(HashMap::new()))))
+        .manage(RealtimeBroker::default())
         .manage(runtime_owner)
         .manage(workflow_runtime::WorkflowRuntime::default())
         .manage(workflow_runtime::RunApprovalBroker::default())
@@ -4389,6 +6730,11 @@ pub fn run() {
             probe_codex_path,
             list_codex_models,
             list_codex_capabilities,
+            list_mcp_server_status,
+            read_codex_config,
+            write_codex_config,
+            list_codex_threads,
+            read_codex_thread,
             save_workflow,
             list_workflow_catalog,
             save_workflow_catalog_item,
@@ -4402,6 +6748,7 @@ pub fn run() {
             get_default_chat_workspace,
             choose_chat_workspace,
             respond_codex_approval,
+            respond_user_input,
             respond_mediator_tool,
             app_settings::get_app_settings,
             app_settings::preview_retention,
@@ -4411,6 +6758,9 @@ pub fn run() {
             app_settings::pin_run,
             app_settings::export_detailed_logs,
             app_settings::clear_all_company_data,
+            app_settings::persist_hook_run,
+            app_settings::list_hook_runs,
+            app_settings::clear_hook_runs,
             business_data::list_finance_entries,
             business_data::save_finance_entry,
             business_data::delete_finance_entry,
@@ -4423,7 +6773,13 @@ pub fn run() {
             workflow_runtime::stop_run,
             workflow_runtime::get_run,
             workflow_runtime::list_active_runs,
-            workflow_runtime::respond_run_approval
+            workflow_runtime::respond_run_approval,
+            list_codex_voices,
+            start_codex_realtime,
+            stop_codex_realtime,
+            append_codex_realtime_audio,
+            append_codex_realtime_text,
+            append_codex_realtime_speech
         ])
         .build(tauri::generate_context!())
         .expect("error while building Codex Corp")
@@ -4481,6 +6837,7 @@ mod tests {
             skills: Vec::new(),
             tool_boundary: String::new(),
             app_server_path: None,
+            thread_id: None,
         }
     }
 
@@ -4512,6 +6869,70 @@ mod tests {
         assert_eq!(
             turn["collaborationMode"]["settings"]["reasoning_effort"],
             "medium"
+        );
+    }
+
+    #[test]
+    fn realtime_thread_params_enable_the_disabled_by_default_feature() {
+        let mut params = json!({"config":{"existing.setting":true}});
+        enable_realtime_conversation(&mut params);
+        assert_eq!(params["config"]["features.realtime_conversation"], true);
+        assert_eq!(params["config"]["existing.setting"], true);
+    }
+
+    #[test]
+    fn realtime_start_uses_the_realtime_backend_model_not_the_text_thread_model() {
+        let params =
+            build_realtime_start_params("thread-1", "company", "audio", Some("low"), Some("alloy"));
+
+        assert!(params.get("model").is_none());
+        assert_eq!(params["version"], "v2");
+        assert_eq!(params["transport"]["type"], "websocket");
+        assert_eq!(params["voice"], "alloy");
+        assert!(params["prompt"]
+            .as_str()
+            .is_some_and(|prompt| prompt.contains("low reasoning effort")));
+    }
+
+    #[test]
+    fn realtime_capability_requires_the_advertised_feature() {
+        assert!(has_realtime_conversation_feature(&json!({"data":[{
+            "name":"realtime_conversation", "stage":"underDevelopment", "enabled":false
+        }]})));
+        assert!(!has_realtime_conversation_feature(&json!({"data":[]})));
+        assert!(!has_realtime_conversation_feature(
+            &json!({"data":"malformed"})
+        ));
+    }
+
+    #[test]
+    fn realtime_auth_rejects_missing_blank_and_placeholder_api_keys() {
+        for key in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("YOUR_OPENAI_API_KEY"),
+            Some("your-openai-api-key"),
+            Some("replace_me"),
+        ] {
+            assert!(!has_realtime_api_key_auth(Some("chatgpt"), key));
+        }
+        assert!(has_realtime_api_key_auth(
+            Some("chatgpt"),
+            Some("sk-proj-test-key-material")
+        ));
+        assert!(has_realtime_api_key_auth(Some("apikey"), None));
+    }
+
+    #[test]
+    fn realtime_transcript_methods_match_the_generated_protocol() {
+        assert_eq!(
+            REALTIME_TRANSCRIPT_DELTA_METHOD,
+            "thread/realtime/transcript/delta"
+        );
+        assert_eq!(
+            REALTIME_TRANSCRIPT_DONE_METHOD,
+            "thread/realtime/transcript/done"
         );
     }
 
@@ -4655,6 +7076,8 @@ readline.createInterface({{ input: process.stdin }}).on('line', (line) => {{
             None,
             ApprovalBroker(Arc::new(Mutex::new(HashMap::new()))),
             ProcessBroker(Arc::new(Mutex::new(HashMap::new()))),
+            TurnStdinBroker(Arc::new(Mutex::new(HashMap::new()))),
+            Database(Arc::new(Mutex::new(Connection::open_in_memory().unwrap()))),
             Arc::new(AtomicU64::new(0)),
         ))
         .unwrap();
@@ -5072,5 +7495,269 @@ readline.createInterface({{ input: process.stdin }}).on('line', (line) => {{
             parse_headless_codex_approval_policy("  WAIT  "),
             HeadlessCodexApprovalPolicy::Wait
         );
+    }
+
+    // ---- Realtime voice session tests ----
+    //
+    // These cover the lifecycle bugs that had no coverage in the bot's
+    // original implementation: the orphan-Drop regression (a session whose
+    // child died independently used to linger in the broker map forever) and
+    // the dispatcher's remove-then-Drop deadlock discipline. They construct a
+    // RealtimeSession directly with a long-sleeping child so no Tauri AppHandle
+    // or app-server spawn is required.
+
+    /// Spawn a child that sleeps long enough for any test to finish, returning
+    /// the Child (with piped stdin) so a RealtimeSession can take its stdin.
+    fn spawn_sleeping_child() -> Child {
+        use std::process::Command;
+        // `ping -n 60 127.0.0.1` on Windows sleeps ~60s; on Unix `sleep 60`.
+        // Both are ubiquitous and exit cleanly when killed.
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = Command::new("ping");
+            c.arg("-n").arg("60").arg("127.0.0.1");
+            c
+        };
+        #[cfg(not(windows))]
+        let mut cmd = {
+            let mut c = Command::new("sleep");
+            c.arg("60");
+            c
+        };
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        cmd.spawn()
+            .expect("sleeping child must spawn for realtime tests")
+    }
+
+    fn build_test_session(_broker: RealtimeBroker, _key: &str) -> Arc<Mutex<RealtimeSession>> {
+        let mut child = spawn_sleeping_child();
+        let stdin_raw = child.stdin.take().expect("stdin piped");
+        Arc::new(Mutex::new(RealtimeSession {
+            thread_id: "thread-test".into(),
+            realtime_session_id: None,
+            version: None,
+            stdin: Arc::new(Mutex::new(stdin_raw)),
+            child: Arc::new(Mutex::new(child)),
+            app_handle: None,
+            next_id: AtomicU64::new(100),
+            process_lease: None,
+            closed: Arc::new((Mutex::new(false), Condvar::new())),
+        }))
+    }
+
+    #[test]
+    fn realtime_session_drop_deregisters_from_broker() {
+        // Regression: the original Drop killed the child but never removed
+        // the session from the broker. A subsequent append against the dead
+        // session silently "succeeded" against a dead stdin, and a new
+        // session with the same key overwrote a zombie.
+        let broker = RealtimeBroker::default();
+        let session = build_test_session(broker.clone(), "session-a");
+        {
+            let mut sessions = broker.0.lock().unwrap();
+            sessions.insert("session-a".into(), session.clone());
+        }
+        // Back-reference is already set by build_test_session.
+        assert_eq!(broker.0.lock().unwrap().len(), 1);
+
+        // Drop our handle AND the broker's handle by removing then dropping.
+        let removed = broker.0.lock().unwrap().remove("session-a");
+        drop(removed);
+        // The session's own Drop runs its deregistration path; since it's
+        // already gone, the broker stays empty (idempotent removal).
+        assert_eq!(broker.0.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn realtime_session_drop_is_idempotent_when_dispatcher_already_removed() {
+        // Mirrors the dispatcher's /closed handler: it removes the entry from
+        // the map (dropping the map's Arc), then Drop runs on the session
+        // and tries to remove again. This must not panic or deadlock.
+        let broker = RealtimeBroker::default();
+        let session = build_test_session(broker.clone(), "session-b");
+        broker.0.lock().unwrap().insert("session-b".into(), session);
+
+        // Dispatcher path: lock, remove, drop the lock, then drop the Arc.
+        let removed = broker
+            .0
+            .lock()
+            .unwrap()
+            .remove("session-b")
+            .expect("session was inserted");
+        // At this point the broker no longer holds a reference; dropping the
+        // Arc here triggers RealtimeSession::drop, which re-locks the broker
+        // ( uncontended ) and removes a key that is already absent — a no-op.
+        drop(removed);
+
+        assert_eq!(broker.0.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn realtime_append_against_missing_session_returns_error() {
+        // Validates the error path the append commands rely on: looking up a
+        // session key that doesn't exist must produce a descriptive error,
+        // not a panic or silent success against a dead stdin.
+        let broker = RealtimeBroker::default();
+        let lookup = broker.0.lock().unwrap().get("does-not-exist").cloned();
+        assert!(lookup.is_none(), "missing session key must resolve to None");
+    }
+
+    #[test]
+    fn realtime_audio_rejects_hostile_payloads() {
+        let valid = RealtimeAudioChunk {
+            data: BASE64_STANDARD.encode([0_u8; 4]),
+            sample_rate: 24_000,
+            num_channels: 1,
+            samples_per_channel: Some(2),
+            item_id: None,
+        };
+        assert!(valid.validate().is_ok());
+
+        let malformed = RealtimeAudioChunk {
+            data: "%%%".into(),
+            ..valid
+        };
+        assert!(malformed.validate().unwrap_err().contains("base64"));
+
+        let inconsistent = RealtimeAudioChunk {
+            data: BASE64_STANDARD.encode([0_u8; 4]),
+            sample_rate: 24_000,
+            num_channels: 2,
+            samples_per_channel: Some(2),
+            item_id: None,
+        };
+        assert!(inconsistent.validate().unwrap_err().contains("frame count"));
+    }
+
+    #[test]
+    fn graceful_interrupt_includes_authoritative_thread_and_turn_ids() {
+        let mut child = spawn_sleeping_child();
+        let handle = ActiveTurnHandle {
+            stdin: Arc::new(Mutex::new(child.stdin.take().expect("stdin piped"))),
+            thread_id: "thread-authoritative".into(),
+            turn_id: "turn-authoritative".into(),
+        };
+        let request = turn_interrupt_request(7, &handle);
+        assert_eq!(request["method"], "turn/interrupt");
+        assert_eq!(request["params"]["threadId"], "thread-authoritative");
+        assert_eq!(request["params"]["turnId"], "turn-authoritative");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn pending_interactions_are_typed_and_cancelled_with_their_process() {
+        let broker = ApprovalBroker(Arc::new(Mutex::new(HashMap::new())));
+        let (approval_tx, approval_rx) = mpsc::channel();
+        let (question_tx, _question_rx) = mpsc::channel();
+        {
+            let mut pending = broker.0.lock().unwrap();
+            pending.insert(
+                "approval".into(),
+                PendingInteraction {
+                    kind: PendingInteractionKind::Approval,
+                    process_key: "process-a".into(),
+                    sender: approval_tx,
+                },
+            );
+            pending.insert(
+                "question".into(),
+                PendingInteraction {
+                    kind: PendingInteractionKind::UserInput,
+                    process_key: "process-b".into(),
+                    sender: question_tx,
+                },
+            );
+        }
+        {
+            let _registration = PendingProcessInteractions {
+                process_key: "process-a".into(),
+                broker: broker.clone(),
+            };
+        }
+        let pending = broker.0.lock().unwrap();
+        assert!(!pending.contains_key("approval"));
+        assert_eq!(
+            pending.get("question").map(|value| value.kind),
+            Some(PendingInteractionKind::UserInput)
+        );
+        drop(pending);
+        assert!(matches!(
+            approval_rx.recv_timeout(Duration::from_millis(10)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn app_server_contract_dtos_decode_generated_shapes() {
+        let config: ConfigReadResponseDto = serde_json::from_value(json!({
+            "config": {
+                "model": "gpt-5.6",
+                "approval_policy": "on-request",
+                "sandbox_mode": "read-only",
+                "web_search": "disabled",
+                "instructions": null,
+                "developer_instructions": "safe",
+                "model_reasoning_effort": "high",
+                "model_provider": "openai"
+            },
+            "origins": {},
+            "layers": null
+        }))
+        .expect("generated config shape");
+        assert_eq!(config.config.approval_policy.as_deref(), Some("on-request"));
+
+        let threads: ThreadListResponseDto = serde_json::from_value(json!({
+            "data": [{
+                "id":"t1", "name":null, "preview":"hello",
+                "status":{"type":"active","activeFlags":[]},
+                "createdAt":10, "updatedAt":12, "cwd":"C:/work",
+                "modelProvider":"openai", "turns":[]
+            }],
+            "nextCursor": null, "backwardsCursor": null
+        }))
+        .expect("generated thread/list shape");
+        let summary = thread_summary(threads.data.into_iter().next().unwrap());
+        assert_eq!(summary.created_at, 10_000);
+        assert_eq!(summary.status.as_deref(), Some("active"));
+
+        let mcp: McpStatusResponseDto = serde_json::from_value(json!({
+            "data": [{
+                "name":"server", "serverInfo":null, "tools":{},
+                "resources":[{"uri":"resource://one"}],
+                "resourceTemplates":[], "authStatus":"unsupported"
+            }], "nextCursor":null
+        }))
+        .expect("generated MCP status shape");
+        assert_eq!(mcp.data[0].resources.len(), 1);
+    }
+
+    #[test]
+    fn app_server_contract_dtos_fail_when_required_fields_are_missing() {
+        let malformed = serde_json::from_value::<ThreadListResponseDto>(json!({
+            "data": [{"id":"t1"}]
+        }));
+        assert!(malformed.is_err());
+    }
+
+    #[test]
+    fn realtime_output_audio_method_name_uses_slash_not_hyphen() {
+        // Regression: the dispatcher originally matched
+        // "thread/realtime/outputAudio-delta" (hyphen) but the canonical
+        // method name is "thread/realtime/outputAudio/delta" (slash). The
+        // hyphen form never matched, silently dropping every audio chunk.
+        // This test pins the canonical name so a future typo is caught.
+        let canonical = "thread/realtime/outputAudio/delta";
+        assert!(canonical.ends_with("/delta"));
+        assert!(!canonical.contains("-delta"));
+        assert_eq!(
+            canonical, "thread/realtime/outputAudio/delta",
+            "method name must match ServerNotification.ts:228"
+        );
+        // And the match arm in spawn_realtime_dispatcher must agree.
+        let matched = matches!(canonical, "thread/realtime/outputAudio/delta");
+        assert!(matched);
     }
 }

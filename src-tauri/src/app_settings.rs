@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, types::ToSql, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tauri::Manager;
@@ -99,7 +99,25 @@ pub(crate) fn initialize(connection: &Connection) -> Result<(), String> {
                 completed_at TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_run_events_run_id ON run_events(run_id);
-            CREATE INDEX IF NOT EXISTS idx_node_attempts_run_id ON node_attempts(run_id);",
+            CREATE INDEX IF NOT EXISTS idx_node_attempts_run_id ON node_attempts(run_id);
+            CREATE TABLE IF NOT EXISTS hook_runs (
+                id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                turn_id TEXT,
+                node_id TEXT NOT NULL,
+                event_name TEXT NOT NULL,
+                handler_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                source TEXT,
+                status_message TEXT,
+                started_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                duration_ms INTEGER,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch('subsec') * 1000)
+            );
+            CREATE INDEX IF NOT EXISTS idx_hook_runs_thread_id ON hook_runs(thread_id);
+            CREATE INDEX IF NOT EXISTS idx_hook_runs_node_id ON hook_runs(node_id);
+            CREATE INDEX IF NOT EXISTS idx_hook_runs_started_at ON hook_runs(started_at);",
         )
         .map_err(|error| error.to_string())?;
     for statement in [
@@ -111,6 +129,8 @@ pub(crate) fn initialize(connection: &Connection) -> Result<(), String> {
         "ALTER TABLE run_events ADD COLUMN sequence INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE run_events ADD COLUMN level TEXT NOT NULL DEFAULT 'info'",
         "ALTER TABLE run_events ADD COLUMN attempt_id TEXT",
+        "CREATE TABLE IF NOT EXISTS hook_runs (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, turn_id TEXT, node_id TEXT NOT NULL, event_name TEXT NOT NULL, handler_type TEXT NOT NULL, status TEXT NOT NULL, source TEXT, status_message TEXT, started_at TEXT NOT NULL, completed_at TEXT, duration_ms INTEGER, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+        "CREATE INDEX IF NOT EXISTS idx_hook_runs_started_at ON hook_runs(started_at)",
     ] {
         let _ = connection.execute(statement, []);
     }
@@ -202,9 +222,6 @@ pub(crate) fn cleanup(
     settings: &AppSettings,
 ) -> Result<usize, String> {
     let ids = affected_run_ids(connection, settings)?;
-    if ids.is_empty() {
-        return Ok(0);
-    }
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
@@ -219,6 +236,19 @@ pub(crate) fn cleanup(
             .execute(
                 "DELETE FROM run_checkpoints WHERE run_id=?1",
                 params![run_id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    if settings.retention_mode != "forever" {
+        let cutoff = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64)
+            .saturating_sub(i64::from(settings.retention_days) * 86_400_000);
+        transaction
+            .execute(
+                "DELETE FROM hook_runs WHERE CAST(started_at AS INTEGER) < ?1",
+                params![cutoff],
             )
             .map_err(|error| error.to_string())?;
     }
@@ -378,11 +408,29 @@ pub(crate) fn export_detailed_logs(database: tauri::State<'_, Database>) -> Resu
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
+    let mut hooks_statement = connection
+        .prepare("SELECT id,thread_id,turn_id,node_id,event_name,handler_type,status,source,status_message,started_at,completed_at,duration_ms FROM hook_runs ORDER BY CAST(started_at AS INTEGER),id")
+        .map_err(|error| error.to_string())?;
+    let hooks = hooks_statement
+        .query_map([], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?, "threadId": row.get::<_, String>(1)?,
+                "turnId": row.get::<_, Option<String>>(2)?, "nodeId": row.get::<_, String>(3)?,
+                "eventName": row.get::<_, String>(4)?, "handlerType": row.get::<_, String>(5)?,
+                "status": row.get::<_, String>(6)?, "source": row.get::<_, Option<String>>(7)?,
+                "statusMessage": row.get::<_, Option<String>>(8)?, "startedAt": row.get::<_, i64>(9)?,
+                "completedAt": row.get::<_, Option<i64>>(10)?, "durationMs": row.get::<_, Option<i64>>(11)?,
+            }))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
     serde_json::to_string_pretty(&serde_json::json!({
         "schemaVersion": "codex-corp.logs.v1",
         "exportedAtUnix": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
         "runs": runs,
         "events": events,
+        "hookRuns": hooks,
     }))
     .map_err(|error| error.to_string())
 }
@@ -401,6 +449,7 @@ pub(crate) fn clear_all_company_data(database: tauri::State<'_, Database>) -> Re
              DELETE FROM node_attempts;
              DELETE FROM run_checkpoints;
              DELETE FROM run_events;
+             DELETE FROM hook_runs;
              DELETE FROM schedule_firings;
              DELETE FROM runs;
              DELETE FROM chat_stores;
@@ -419,6 +468,126 @@ pub(crate) fn clear_directory(path: &Path) -> Result<(), String> {
         std::fs::remove_dir_all(path).map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct HookRunRecord {
+    pub id: String,
+    pub thread_id: String,
+    pub turn_id: Option<String>,
+    pub node_id: String,
+    pub event_name: String,
+    pub handler_type: String,
+    pub status: String,
+    pub source: Option<String>,
+    pub status_message: Option<String>,
+    pub started_at: i64,
+    pub completed_at: Option<i64>,
+    pub duration_ms: Option<i64>,
+}
+
+#[tauri::command]
+pub(crate) fn persist_hook_run(
+    record: HookRunRecord,
+    database: tauri::State<'_, Database>,
+) -> Result<(), String> {
+    let connection = database
+        .0
+        .lock()
+        .map_err(|_| "database lock poisoned".to_string())?;
+    persist_hook_run_with_connection(&connection, &record)
+}
+
+pub(crate) fn persist_hook_run_with_connection(
+    connection: &Connection,
+    record: &HookRunRecord,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT INTO hook_runs (id, thread_id, turn_id, node_id, event_name, handler_type, status, source, status_message, started_at, completed_at, duration_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+             ON CONFLICT(id) DO UPDATE SET
+               thread_id=excluded.thread_id, turn_id=COALESCE(excluded.turn_id,hook_runs.turn_id),
+               node_id=excluded.node_id, event_name=excluded.event_name,
+               handler_type=excluded.handler_type, status=excluded.status,
+               source=COALESCE(excluded.source,hook_runs.source),
+               status_message=COALESCE(excluded.status_message,hook_runs.status_message),
+               completed_at=COALESCE(excluded.completed_at,hook_runs.completed_at),
+               duration_ms=COALESCE(excluded.duration_ms,hook_runs.duration_ms)",
+            params![
+                &record.id,
+                &record.thread_id,
+                &record.turn_id,
+                &record.node_id,
+                &record.event_name,
+                &record.handler_type,
+                &record.status,
+                &record.source,
+                &record.status_message,
+                record.started_at,
+                record.completed_at,
+                record.duration_ms,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn list_hook_runs(
+    node_id: Option<String>,
+    limit: Option<u32>,
+    database: tauri::State<'_, Database>,
+) -> Result<Vec<HookRunRecord>, String> {
+    let connection = database
+        .0
+        .lock()
+        .map_err(|_| "database lock poisoned".to_string())?;
+    let limit = limit.unwrap_or(50).min(500);
+    let mut params: Vec<Box<dyn ToSql>> = Vec::new();
+    let sql = if let Some(ref nid) = node_id {
+        params.push(Box::new(nid.clone()));
+        params.push(Box::new(limit));
+        "SELECT id, thread_id, turn_id, node_id, event_name, handler_type, status, source, status_message, started_at, completed_at, duration_ms FROM hook_runs WHERE node_id=?1 ORDER BY CAST(started_at AS INTEGER) DESC LIMIT ?2"
+    } else {
+        params.push(Box::new(limit));
+        "SELECT id, thread_id, turn_id, node_id, event_name, handler_type, status, source, status_message, started_at, completed_at, duration_ms FROM hook_runs ORDER BY CAST(started_at AS INTEGER) DESC LIMIT ?1"
+    };
+    let params_refs: Vec<&dyn ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let mut stmt = connection.prepare(sql).map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map(params_refs.as_slice(), |row| {
+            Ok(HookRunRecord {
+                id: row.get(0)?,
+                thread_id: row.get(1)?,
+                turn_id: row.get(2)?,
+                node_id: row.get(3)?,
+                event_name: row.get(4)?,
+                handler_type: row.get(5)?,
+                status: row.get(6)?,
+                source: row.get(7)?,
+                status_message: row.get(8)?,
+                started_at: row.get(9)?,
+                completed_at: row.get(10)?,
+                duration_ms: row.get(11)?,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) fn clear_hook_runs(database: tauri::State<'_, Database>) -> Result<usize, String> {
+    let connection = database
+        .0
+        .lock()
+        .map_err(|_| "database lock poisoned".to_string())?;
+    let count = connection
+        .execute("DELETE FROM hook_runs", [])
+        .map_err(|error| error.to_string())?;
+    Ok(count)
 }
 
 #[cfg(test)]
@@ -543,5 +712,81 @@ mod tests {
         assert!(affected_run_ids(&connection, &AppSettings::default())
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn hook_lifecycle_upsert_preserves_start_and_adds_completion() {
+        let connection = retention_database();
+        let started = HookRunRecord {
+            id: "hook-1".into(),
+            thread_id: "thread-1".into(),
+            turn_id: Some("turn-1".into()),
+            node_id: "node-1".into(),
+            event_name: "afterTool".into(),
+            handler_type: "command".into(),
+            status: "running".into(),
+            source: Some("project".into()),
+            status_message: None,
+            started_at: 1_000,
+            completed_at: None,
+            duration_ms: None,
+        };
+        persist_hook_run_with_connection(&connection, &started).unwrap();
+        let completed = HookRunRecord {
+            status: "completed".into(),
+            started_at: 9_999,
+            completed_at: Some(1_250),
+            duration_ms: Some(250),
+            status_message: Some("ok".into()),
+            ..started
+        };
+        persist_hook_run_with_connection(&connection, &completed).unwrap();
+        let row = connection
+            .query_row(
+                "SELECT status,started_at,completed_at,duration_ms,source FROM hook_runs WHERE id='hook-1'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, String>(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            ("completed".into(), 1_000, 1_250, 250, "project".into())
+        );
+    }
+
+    #[test]
+    fn bounded_retention_removes_old_hooks_but_forever_preserves_them() {
+        let mut connection = retention_database();
+        connection.execute(
+            "INSERT INTO hook_runs(id,thread_id,node_id,event_name,handler_type,status,started_at) VALUES('old','t','n','e','command','completed',1)",
+            [],
+        ).unwrap();
+        cleanup(&mut connection, &AppSettings::default()).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM hook_runs", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        connection.execute(
+            "INSERT INTO hook_runs(id,thread_id,node_id,event_name,handler_type,status,started_at) VALUES('forever','t','n','e','command','completed',1)",
+            [],
+        ).unwrap();
+        cleanup(
+            &mut connection,
+            &AppSettings {
+                retention_mode: "forever".into(),
+                ..AppSettings::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM hook_runs", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 }

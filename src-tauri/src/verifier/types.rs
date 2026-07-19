@@ -74,20 +74,6 @@ pub fn content_hash_for(content: &str) -> String {
     format!("sha256:{hex}")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn content_hash_uses_sha256_prefix() {
-        let h = content_hash_for("export const x=1");
-        assert!(h.starts_with("sha256:"), "got {h}");
-        assert_eq!(h.len(), "sha256:".len() + 64);
-        assert_eq!(content_hash_for("export const x=1"), h);
-        assert_ne!(content_hash_for("export const x=2"), h);
-    }
-}
-
 /// Build host key: `{sourceNodeId}::{hostOrdinal}::{sanitizedName}`
 pub fn make_artifact_key(source_node_id: &str, host_ordinal: u32, name: &str) -> String {
     format!(
@@ -110,4 +96,18 @@ pub fn artifact_name(artifact: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_hash_uses_sha256_prefix() {
+        let h = content_hash_for("export const x=1");
+        assert!(h.starts_with("sha256:"), "got {h}");
+        assert_eq!(h.len(), "sha256:".len() + 64);
+        assert_eq!(content_hash_for("export const x=1"), h);
+        assert_ne!(content_hash_for("export const x=2"), h);
+    }
 }
