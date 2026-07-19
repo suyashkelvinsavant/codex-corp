@@ -170,12 +170,21 @@ export function buildDeliveryBundle(args: {
     residualRisks.push("empty_approval_artifact_set");
   }
 
+  const hasFailure = args.upstreamOutputs.some(
+    (item) =>
+      item.data.status === "failure" ||
+      item.data.status === "failed" ||
+      item.data.verdict === "fail" ||
+      item.data.verdict === "needs_revision",
+  );
+  const status = hasFailure ? "failed" : "success";
+
   const bundle: DeliveryBundle = {
     schemaVersion: "codex-corp.delivery.v3",
     generatedAt,
     mode: "preview",
     mission: args.mission,
-    status: "success",
+    status,
     execution: {
       isolatedThreads: true,
       approvalRequired: true,

@@ -6,12 +6,12 @@ import {
   resetDesktopCatalogCache,
 } from "./templates";
 import { flushDesktopChatSaves, resetDesktopChatCaches } from "./workflow-chat";
-
 export type AppSettings = {
   retentionMode: "bounded" | "forever";
   retentionDays: number;
   maxDetailedRuns: number;
   maxConcurrentCodexProcesses: number;
+  costPer1kTokensUsd: number;
 };
 
 type RetentionPreview = {
@@ -33,8 +33,8 @@ const defaults: AppSettings = {
   retentionDays: 30,
   maxDetailedRuns: 100,
   maxConcurrentCodexProcesses: 8,
+  costPer1kTokensUsd: 0.01,
 };
-
 const formatBytes = (bytes: number) => {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -141,7 +141,6 @@ export function DataLogSettings() {
   };
 
   const clearAll = async () => {
-    if (!desktop) return;
     if (
       !window.confirm(
         "Delete every workflow, chat, finance entry, dashboard briefing, run, detailed log, approval, artifact, and workspace? This cannot be undone.",
@@ -152,15 +151,19 @@ export function DataLogSettings() {
       !window.confirm("Final confirmation: clear all Codex Corp company data?")
     )
       return;
-    // Drain queued writes first so an older save cannot repopulate SQLite after
-    // the destructive transaction completes.
-    await Promise.all([flushDesktopCatalogWrites(), flushDesktopChatSaves()]);
-    await invoke("clear_all_company_data");
+    if (desktop) {
+      // Drain queued writes first so an older save cannot repopulate SQLite after
+      // the destructive transaction completes.
+      await Promise.all([flushDesktopCatalogWrites(), flushDesktopChatSaves()]);
+      await invoke("clear_all_company_data");
+    }
     for (const key of Object.keys(localStorage)) {
       if (key.startsWith("codex-corp")) localStorage.removeItem(key);
     }
-    resetDesktopCatalogCache();
-    resetDesktopChatCaches();
+    if (desktop) {
+      resetDesktopCatalogCache();
+      resetDesktopChatCaches();
+    }
     // Recreate all React/module state from the now-empty native source of truth.
     window.location.reload();
   };
@@ -250,6 +253,23 @@ export function DataLogSettings() {
             }
           />
         </label>
+        <label>
+          Estimated token cost ($/1K)
+          <input
+            type="number"
+            step="0.001"
+            min={0}
+            max={10}
+            disabled={!desktop || busy}
+            value={settings.costPer1kTokensUsd}
+            onChange={(event) =>
+              setSettings((current) => ({
+                ...current,
+                costPer1kTokensUsd: Number(event.target.value),
+              }))
+            }
+          />
+        </label>
       </div>
       {settings.retentionMode === "forever" ? (
         <p className="settings-warn">
@@ -313,7 +333,7 @@ export function DataLogSettings() {
         <button
           type="button"
           className="danger"
-          disabled={!desktop || busy}
+          disabled={busy}
           onClick={() => void clearAll()}
         >
           <Trash2 size={14} />

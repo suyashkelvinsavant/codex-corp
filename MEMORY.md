@@ -2,6 +2,23 @@
 
 This file records durable, repository-specific operational lessons. Keep entries factual, scoped, and actionable; `AGENTS.md` contains the corresponding mandatory rules.
 
+## 2026-07-18 — Local-only main holds headless MCP work (do not push yet)
+
+### State
+
+Local `main` contains the headless MCP server + completion verifier + related harness/UI work (merged from `feature/headless-mcp-server`, which was deleted locally and never pushed). Commits are intentionally **ahead of `origin/main`**.
+
+### Guardrails
+
+- Do **not** `git push` / IDE Sync / publish `main` until a deliberate publish decision.
+- Local config may set `branch.main.pushRemote=no_push` so a bare `git push` on `main` fails closed. To publish later: push with an explicit refspec, or reset `pushRemote` first.
+- Do **not** recreate or push a remote `feature/headless-mcp-server` “just to back up.”
+- Publishing `main` will ship the entire fat feature commit(s) together; rewrite history only if a subset must stay private, and only before first push.
+
+### Before production desktop ship from this main
+
+Still run the full Agents.md desktop verification sequence (`npm run build`, `npm test`, `cargo test`, `npm run desktop:build` with `custom-protocol`, launch the exact `release/Codex-Corp.exe`, confirm no `ERR_CONNECTION_REFUSED` / blank WebView). The local merge tests alone are not a release handoff.
+
 ## 2026-07-17 — Tauri release opened `127.0.0.1` instead of bundled assets
 
 ### Symptom

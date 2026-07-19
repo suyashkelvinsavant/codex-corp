@@ -2,7 +2,8 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::process::Command;
+
+use crate::platform_process::background_command;
 
 /// Built-in policy: native Tauri/Rust runtime ownership patterns.
 ///
@@ -138,7 +139,7 @@ fn union_policy_paths(tracked: Vec<String>, dirty: Vec<String>) -> Vec<String> {
 }
 
 fn git_ls_files(workspace: &Path) -> Option<Vec<String>> {
-    let tracked = Command::new("git")
+    let tracked = background_command("git")
         .args(["-C"])
         .arg(workspace)
         .args(["ls-files"])
@@ -157,7 +158,7 @@ fn git_ls_files(workspace: &Path) -> Option<Vec<String>> {
 }
 
 fn git_status_porcelain_paths(workspace: &Path) -> Option<Vec<String>> {
-    let output = Command::new("git")
+    let output = background_command("git")
         .args(["-C"])
         .arg(workspace)
         .args(["status", "--porcelain", "-uall"])

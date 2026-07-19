@@ -90,7 +90,9 @@ import "@fontsource/ibm-plex-mono/500.css";
 import "@fontsource/ibm-plex-mono/600.css";
 import { applyEdgeMapping, projectedToHandoffFields } from "./edge-mapping";
 import {
+  defaultNodeEffortForModel,
   defaultModelFromList,
+  defaultNodeModelFromList,
   displayNameForModel,
   effortsForModel,
   getLiveCodexModels,
@@ -121,6 +123,7 @@ import {
   readActiveWorkflowId,
   rehydrateRunRecord,
   RUNS_STORAGE_KEY,
+  serializeWorkflowSnapshot,
   shouldApplyAutoloadSnapshot,
   shouldAutosaveBeforeTemplateSwitch,
   shouldReplaceEdgesFromRun,
@@ -184,13 +187,13 @@ import {
   type MediatorQuestionAnswer,
 } from "./mediator-ui";
 import { appendStreamPreview, isAgentMessageDelta } from "./stream-display";
-import { modelDefault } from "./editor-defaults";
 import { Metric } from "./metric";
 import {
   PERSISTENCE_ERROR_EVENT,
   type PersistenceErrorDetail,
 } from "./persistence-events";
 import {
+  estimateTokenCostUsd,
   summarizePortfolioRuns,
   type PortfolioRunSummary,
 } from "./dashboard-finance";
@@ -710,6 +713,7 @@ function App() {
   const [catalogRevision, setCatalogRevision] = useState(0);
   const [catalogReady, setCatalogReady] = useState(() => !isTauri());
   const [architectInitialPrompt, setArchitectInitialPrompt] = useState("");
+  const [costPer1k, setCostPer1k] = useState<number | undefined>(undefined);
   const activeChatWorkspaceRef = useRef<string | null>(null);
 
   const {
@@ -922,7 +926,8 @@ function App() {
     [edges, lineage, selectedId],
   );
 
-  const snapshot = (): WorkflowSnapshot => structuredClone({ nodes, edges });
+  const snapshot = (): WorkflowSnapshot =>
+    structuredClone({ schemaVersion: 2, nodes, edges });
   const pushHistory = (value = snapshot()) => {
     historyPast.current.push(value);
     if (historyPast.current.length > 60) historyPast.current.shift();
@@ -1183,10 +1188,7 @@ function App() {
     template: ReturnType<typeof getTemplate>,
   ) => {
     saveCustomWorkflow(template);
-    const graphJson = JSON.stringify({
-      nodes: template.nodes,
-      edges: template.edges,
-    });
+    const graphJson = serializeWorkflowSnapshot(template.nodes, template.edges);
     if (isTauri())
       await invoke("save_workflow", {
         snapshot: {
@@ -1204,9 +1206,7 @@ function App() {
     req: Parameters<typeof handleMediatorTurn>[0],
   ) => {
     if (!isTauri())
-      throw new Error(
-        "Byte needs the Codex Corp desktop app with Live Codex.",
-      );
+      throw new Error("Byte needs the Codex Corp desktop app with Live Codex.");
     if (!codexInfo.compatible)
       throw new Error(
         codexInfo.incompatibilityReason ||
@@ -1275,8 +1275,7 @@ function App() {
             input: toCodexUserInputs(req.text, req.attachments),
             fallbackTranscript: req.history
               .map(
-                (m) =>
-                  `${m.role === "user" ? "Operator" : "Byte"}: ${m.text}`,
+                (m) => `${m.role === "user" ? "Operator" : "Byte"}: ${m.text}`,
               )
               .join("\n\n"),
             contextDigest: `${buildArchitectContextDigest()}${await architectContextExtras()}`,
@@ -1577,6 +1576,7 @@ function App() {
     const id = `${pack.kind}-${crypto.randomUUID()}`;
     const i = nodes.length;
     const inst = instantiatePack(pack);
+    const defaultModel = defaultNodeModelFromList(codexModels);
     setNodes((ns) => [
       ...ns,
       {
@@ -1591,8 +1591,8 @@ function App() {
           role: inst.role,
           kind: inst.kind,
           status: "idle",
-          model: defaultModelFromList(codexModels) || modelDefault,
-          effort: "low",
+          model: defaultModel,
+          effort: defaultNodeEffortForModel(codexModels, defaultModel),
           tools: inst.tools,
           skills: inst.skills,
           connectorTools: [],
@@ -1608,8 +1608,8 @@ function App() {
             inst.kind === "creative"
               ? ["Creative Studio ready"]
               : ["Draft node created"],
-          maxRevisions: 2,
-          completionCriteria: inst.completionCriteria ?? defaultPlatformCriteria(),
+          completionCriteria:
+            inst.completionCriteria ?? defaultPlatformCriteria(),
           maxRetries: 2,
           timeoutSeconds: 120,
           sandboxProfile: inst.sandboxProfile,
@@ -1648,10 +1648,14 @@ function App() {
     const nodeRole = defaultRoleForKind(kind, role);
     const packInst =
       isSpecialist && role
-        ? instantiatePackForRole(role, kind === "creative" ? "creative" : "agent")
+        ? instantiatePackForRole(
+            role,
+            kind === "creative" ? "creative" : "agent",
+          )
         : isSpecialist && kind === "creative"
           ? instantiatePackForRole("Creative", "creative")
           : null;
+    const defaultModel = defaultNodeModelFromList(codexModels);
     const specialist = packInst
       ? ensureSpecialistQuality({
           kind: packInst.kind,
@@ -1687,20 +1691,20 @@ function App() {
           y: 120 + (i % 4) * 150,
         },
         data: {
-          label: specialist?.packId
-            ? (packInst?.label ?? label)
-            : label,
+          label: specialist?.packId ? (packInst?.label ?? label) : label,
           role: specialist ? (packInst?.role ?? nodeRole) : nodeRole,
           kind,
           status: kind === "note" ? "draft" : "idle",
           model: isSpecialist
-            ? defaultModelFromList(codexModels) || modelDefault
+            ? defaultModel
             : kind === "approval"
               ? "Human"
               : kind === "output"
                 ? "Collector"
                 : "Control",
-          effort: "low",
+          effort: isSpecialist
+            ? defaultNodeEffortForModel(codexModels, defaultModel)
+            : "low",
           tools: specialist
             ? specialist.tools
             : kind === "creative"
@@ -1774,7 +1778,6 @@ function App() {
               : kind === "creative"
                 ? ["Creative Studio ready"]
                 : ["Draft node created"],
-          maxRevisions: 2,
           completionCriteria: isSpecialist
             ? defaultPlatformCriteria()
             : undefined,
@@ -1876,6 +1879,7 @@ function App() {
     nextEdges: FlowEdge[],
     nextWorkflowId: string,
     label: string,
+    migrationNotices: string[] = [],
   ) => {
     setWorkflowId(nextWorkflowId);
     const meta = getTemplate(nextWorkflowId);
@@ -1897,6 +1901,9 @@ function App() {
     setSelectedId(focus);
     setSelectedEdge(null);
     setSaved(label);
+    migrationNotices.forEach((notice) =>
+      emit(notice, "workflow.snapshot.migrated", undefined, "warning"),
+    );
   };
 
   const persistWorkflowMetadata = (patch: {
@@ -1953,7 +1960,7 @@ function App() {
       );
       if (!confirmed) return false;
     }
-    const graphJson = JSON.stringify({ nodes, edges });
+    const graphJson = serializeWorkflowSnapshot(nodes, edges);
     const template = getTemplate(workflowId);
     saveCustomWorkflow({
       ...template,
@@ -2033,6 +2040,7 @@ function App() {
       w.edges,
       workflowId,
       isTauri() ? "Loaded from SQLite" : "Loaded locally",
+      w.migrationNotices,
     );
     emit("Workflow reopened", "workflow.loaded");
   };
@@ -2127,14 +2135,19 @@ function App() {
     // Persist the canvas we are leaving so unsaved edits are not discarded.
     if (shouldAutosaveBeforeTemplateSwitch(leavingId, nextId, running)) {
       try {
-        const graphJson = JSON.stringify({ nodes, edges });
+        const graphJson = serializeWorkflowSnapshot(nodes, edges);
         const leaving = getTemplate(leavingId);
         await saveWorkflowMutation.mutateAsync({
           id: leavingId,
           name: leaving.name,
           graphJson,
           workspacePath: activeChatWorkspaceRef.current,
-          templateJson: JSON.stringify({ ...leaving, nodes, edges }),
+          templateJson: JSON.stringify({
+            ...leaving,
+            schemaVersion: 2,
+            nodes,
+            edges,
+          }),
         });
         emit(
           `Auto-saved · ${leaving.name} before template switch`,
@@ -2165,6 +2178,7 @@ function App() {
           saved.edges,
           nextId,
           isTauri() ? "Loaded from SQLite" : "Loaded locally",
+          saved.migrationNotices,
         );
         await loadRunHistoryFor(nextId);
         emit(`Switched to saved · ${template.name}`, "workflow.template");
@@ -2206,13 +2220,26 @@ function App() {
     await switchTemplate(template.id, "editor");
   };
 
-  /** Builtin template → new user workflow copy under Workflows + open editor. */
-  const useTemplateAsWorkflow = async (templateId: string) => {
+  /** Instantiate a catalog template as an independently owned user workflow. */
+  const instantiateTemplateAsWorkflow = async (
+    templateId: string,
+    mode: "editor" | "chat",
+  ) => {
     if (running) return;
     const source = getTemplate(templateId);
     const instance = createWorkflowFromTemplate(source);
     await persistArchitectWorkflow(instance);
-    await switchTemplate(instance.id, "editor");
+    await switchTemplate(instance.id, mode);
+  };
+
+  /** Built-ins are immutable blueprints, so chat must operate on a user-owned copy. */
+  const openCatalogChat = async (templateId: string) => {
+    const source = getTemplate(templateId);
+    if (source.templateOrigin === "built-in") {
+      await instantiateTemplateAsWorkflow(templateId, "chat");
+      return;
+    }
+    await switchTemplate(templateId, "chat");
   };
 
   const validate = async () => {
@@ -2220,7 +2247,7 @@ function App() {
     if (isTauri())
       try {
         const nativeProblems = await invoke<typeof found>("validate_workflow", {
-          graphJson: JSON.stringify({ nodes, edges }),
+          graphJson: serializeWorkflowSnapshot(nodes, edges),
         });
         const known = new Set(found.map((problem) => problem.id));
         found = [
@@ -2686,18 +2713,15 @@ function App() {
   // that still have empty model so canvas, persistence, and runs agree.
   useEffect(() => {
     if (!codexModels.length) return;
-    const def = defaultModelFromList(codexModels);
+    const def = defaultNodeModelFromList(codexModels);
     if (!def) return;
     setNodes((ns) => {
       let changed = false;
       const next = ns.map((node) => {
         if (!isSpecialistKind(node.data.kind)) return node;
-        if (!needsLiveModelDefault(node.data.model)) return node;
+        if (!needsLiveModelDefault(node.data.model, codexModels)) return node;
         changed = true;
-        const efforts = effortsForModel(codexModels, def);
-        const effort = efforts.includes(node.data.effort)
-          ? node.data.effort
-          : (efforts[0] ?? node.data.effort);
+        const effort = defaultNodeEffortForModel(codexModels, def);
         return {
           ...node,
           data: { ...node.data, model: def, effort },
@@ -2762,6 +2786,9 @@ function App() {
             setNodes(snapshot.nodes);
             setEdges(snapshot.edges);
             setSaved(isTauri() ? "Loaded from SQLite" : "Loaded locally");
+            snapshot.migrationNotices?.forEach((notice) =>
+              emit(notice, "workflow.snapshot.migrated", undefined, "warning"),
+            );
             emit(
               isTauri()
                 ? `Restored workflow from SQLite · ${getTemplate(activeId).name}`
@@ -2827,12 +2854,33 @@ function App() {
       } catch {
         if (!cancelled) setPortfolioRunSummaries([]);
       }
+      try {
+        if (isTauri()) {
+          const settings = await invoke<any>("get_app_settings");
+          if (!cancelled && settings && typeof settings.costPer1kTokensUsd === "number") {
+            setCostPer1k(settings.costPer1kTokensUsd);
+          }
+        }
+      } catch {
+        /* keep default */
+      }
       if (!cancelled) setCatalogReady(true);
     };
     void bootstrap();
     return () => {
       cancelled = true;
     };
+  }, []);
+  useEffect(() => {
+    const onSettingsChanged = (event: Event) => {
+      const settings = (event as CustomEvent).detail;
+      if (settings && typeof settings.costPer1kTokensUsd === "number") {
+        setCostPer1k(settings.costPer1kTokensUsd);
+      }
+    };
+    window.addEventListener("codex-corp:settings-changed", onSettingsChanged);
+    return () =>
+      window.removeEventListener("codex-corp:settings-changed", onSettingsChanged);
   }, []);
   useEffect(() => {
     const onPersistenceError = (event: Event) => {
@@ -2988,7 +3036,9 @@ function App() {
           const summary =
             typeof diag.summary === "string" ? diag.summary : undefined;
           const data =
-            diag.data && typeof diag.data === "object" && !Array.isArray(diag.data)
+            diag.data &&
+            typeof diag.data === "object" &&
+            !Array.isArray(diag.data)
               ? (diag.data as Record<string, unknown>)
               : undefined;
           const artifacts = Array.isArray(diag.artifacts)
@@ -3006,13 +3056,14 @@ function App() {
                       // (+ artifact meta without file bodies). Full content stays in node_executions.
                       ...(payload.eventType === "node.attempt.completed"
                         ? {
-                            ...(summary !== undefined ? { output: summary } : {}),
+                            ...(summary !== undefined
+                              ? { output: summary }
+                              : {}),
                             ...(data !== undefined
                               ? {
                                   structuredOutput: {
                                     ...(typeof node.data.structuredOutput ===
-                                      "object" &&
-                                    node.data.structuredOutput
+                                      "object" && node.data.structuredOutput
                                       ? node.data.structuredOutput
                                       : {}),
                                     ...data,
@@ -3020,7 +3071,10 @@ function App() {
                                 }
                               : {}),
                             ...(artifacts !== undefined
-                              ? { artifacts: artifacts as typeof node.data.artifacts }
+                              ? {
+                                  artifacts:
+                                    artifacts as typeof node.data.artifacts,
+                                }
                               : {}),
                           }
                         : {}),
@@ -3033,11 +3087,24 @@ function App() {
         }
         const runEvent: RunEvent = {
           id: `${payload.runId}:${payload.sequence}`,
-          at: new Date().toISOString(),
+          at: payload.at,
           type: payload.eventType,
           message: payload.message,
           nodeId: payload.nodeId,
           level: payload.level,
+          attemptId: payload.attemptId,
+          itemType:
+            typeof payload.diagnostics?.itemType === "string"
+              ? payload.diagnostics.itemType
+              : undefined,
+          status:
+            typeof payload.diagnostics?.status === "string"
+              ? payload.diagnostics.status
+              : payload.level,
+          elapsedMs:
+            typeof payload.diagnostics?.elapsedMs === "number"
+              ? payload.diagnostics.elapsedMs
+              : undefined,
         };
         eventsRef.current = [...eventsRef.current, runEvent];
         setEvents(eventsRef.current);
@@ -3300,13 +3367,13 @@ function App() {
             portfolioRunSummaries={portfolioRunSummaries}
             codexInfo={codexInfo}
             onOpenChat={(id) => {
-              void switchTemplate(id, "chat");
+              void openCatalogChat(id);
             }}
             onEditWorkflow={(id) => {
               void switchTemplate(id, "editor");
             }}
             onUseTemplate={(id) => {
-              void useTemplateAsWorkflow(id);
+              void instantiateTemplateAsWorkflow(id, "editor");
             }}
             onDeleteWorkflow={(id) => {
               void (async () => {
@@ -4016,6 +4083,14 @@ function App() {
                     nodes.find((node) => node.id === connection.source),
                   )
                   .filter((node): node is FlowNode => Boolean(node))}
+                inboundEdges={edges.filter(
+                  (edge) => edge.target === selected.id,
+                )}
+                workflowInput={
+                  nodes.find((node) => node.data.kind === "input")?.data
+                    .output ?? ""
+                }
+                events={events}
                 downstream={
                   edges.filter((e) => e.source === selected.id).length
                 }
@@ -4263,7 +4338,10 @@ function App() {
                     />
                     <Metric
                       label="Estimated cost"
-                      value="Subscription runtime (Codex CLI)"
+                      value={`$${estimateTokenCostUsd(
+                        nodes.reduce((s, n) => s + n.data.tokens, 0),
+                        costPer1k
+                      ).toFixed(2)}`}
                     />
                   </div>
                 )}

@@ -2,17 +2,12 @@ import { useEffect, useRef, useState, type CSSProperties } from "react";
 import type { RunRecord } from "./model";
 import bytePet from "../assets/pets/byte-spritesheet.webp";
 
-type PetState = "idle" | "running" | "waiting" | "error" | "success";
-
-const PET_ANIMATIONS: Record<PetState, { row: number; frames: number }> = {
-  idle: { row: 0, frames: 6 },
-  running: { row: 1, frames: 8 },
-  waiting: { row: 3, frames: 4 },
-  error: { row: 5, frames: 8 },
-  success: { row: 8, frames: 6 },
-};
-
-const PET_FRAME_INTERVAL_MS = 1000; // 1 FPS
+import {
+  type PetState,
+  PET_ANIMATIONS,
+  PET_FRAME_INTERVAL_MS,
+  PET_COPY,
+} from "./shared/pet-config";
 
 export function HomePet({ running, runHistory, onOpenArchitect }: { running: boolean; runHistory: RunRecord[]; onOpenArchitect: (initialPrompt?: string) => void }) {
   const [asking, setAsking] = useState(false);
@@ -70,7 +65,7 @@ export function HomePet({ running, runHistory, onOpenArchitect }: { running: boo
     "--pet-row": `${(animation.row / 10) * 100}%`,
     backgroundImage: `url(${bytePet})`,
   } as CSSProperties;
-  const copy: Record<PetState, string> = { idle: "Byte is dreaming up workflows…", running: "Byte is on the case!", waiting: "Psst—need a workflow?", error: "Hmm… something tripped me up.", success: "Company mission accomplished!" };
+  const copy = PET_COPY;
   return <aside className={`home-pet state-${state}`} aria-label={`Byte: ${copy[state]}`}>
     <button className="home-pet-bubble" onClick={() => onOpenArchitect()}>{copy[state]}</button>
     <div className="home-pet-playground">

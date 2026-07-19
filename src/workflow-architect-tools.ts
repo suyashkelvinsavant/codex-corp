@@ -1,5 +1,6 @@
 import { MarkerType } from "@xyflow/react";
 import { defaultPlatformCriteria } from "./completion-criteria";
+import { DEFAULT_NODE_EFFORT, DEFAULT_NODE_MODEL_ID } from "./codex-models";
 import { validateWorkflow } from "./graph";
 import { kindPopColor } from "./kind-colors";
 import type { FlowEdge, FlowNode, Kind } from "./model";
@@ -343,8 +344,10 @@ function makeNodes(rawNodes: any[]): FlowNode[] {
         role,
         kind,
         status: kind === "input" ? "completed" : "idle",
-        model: raw.model || "",
-        effort: raw.effort || "low",
+        model:
+          raw.model || (isSpecialistKind(kind) ? DEFAULT_NODE_MODEL_ID : ""),
+        effort:
+          raw.effort || (isSpecialistKind(kind) ? DEFAULT_NODE_EFFORT : "low"),
         tools: isSpecialistKind(kind) ? quality.tools : raw.tools || [],
         skills: isSpecialistKind(kind) ? quality.skills : raw.skills || [],
         prompt: isSpecialistKind(kind) ? quality.prompt : raw.prompt || "",

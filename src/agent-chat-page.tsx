@@ -399,7 +399,19 @@ export function AgentChatPage({
         });
       }
     };
-    rec.onerror = () => setListening(false);
+    rec.onerror = (event: unknown) => {
+      const ev = event as { error: string; message?: string };
+      setListening(false);
+      if (ev.error === "not-allowed") {
+        setAttachError(
+          "Microphone permission denied. Enable microphone access in Windows/OS Settings -> Privacy -> Microphone for the app.",
+        );
+      } else if (ev.error === "no-speech") {
+        // No speech detected, silently stop listening
+      } else {
+        setAttachError(`Voice dictation error: ${ev.error || "unknown"}`);
+      }
+    };
     rec.onend = () => setListening(false);
     recognitionRef.current = rec;
     return () => {

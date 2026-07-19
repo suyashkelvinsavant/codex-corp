@@ -41,7 +41,6 @@ const node = (id: string, kind: Kind = "agent"): FlowNode => ({
     tokens: 0,
     trace: [],
     color: "#fff",
-    maxRevisions: 2,
   },
 });
 const edge = (
@@ -246,6 +245,18 @@ describe("workflow graph core", () => {
       [edge("input", "agent"), edge("agent", "out")],
     );
     expect(problems.some((p) => p.id.includes("criterion-command"))).toBe(true);
+  });
+
+  it("rejects parseable JSON that is not a valid JSON Schema", () => {
+    const agent = node("agent");
+    agent.data.inputSchema = JSON.stringify({ type: "not-a-json-schema-type" });
+    const problems = validateWorkflow(
+      [node("input", "input"), agent, node("out", "output")],
+      [edge("input", "agent"), edge("agent", "out")],
+    );
+    expect(
+      problems.some((problem) => problem.id === "input-schema-agent"),
+    ).toBe(true);
   });
 
   it("auto-layout finishes on standard-edge design loops (no UI freeze)", () => {

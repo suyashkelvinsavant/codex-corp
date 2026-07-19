@@ -106,15 +106,12 @@ export type AgentData = {
   artifacts?: Artifact[];
   requiresApproval?: boolean;
   revisions?: number;
-  maxRevisions?: number;
   retries?: number;
   maxRetries?: number;
   timeoutSeconds?: number;
-  memoryMode?: "none" | "workflow" | "persistent";
-  workspacePolicy?: "isolated" | "workflow" | "custom";
+  workspacePolicy?: "isolated" | "workflow";
   approvalPolicy?: "on-request" | "untrusted" | "never";
   sandboxProfile?: "read-only" | "workspace-write";
-  environmentVariables?: string[];
   condition?: string;
   conditionRule?: ConditionRule;
   /** Skills selected from the live Codex connector inventory. */
@@ -145,6 +142,8 @@ export type AgentData = {
    * Injected into system prompt; evaluated after each run.
    */
   completionCriteria?: CompletionCriterion[];
+  /** Force all enabled criteria to behave as required hard gates. */
+  hardCriteriaGate?: boolean;
   /** Last post-run evaluation of completionCriteria. */
   criteriaEvaluation?: CriterionEvaluation[];
   color: string;
@@ -180,8 +179,11 @@ export type FlowNode = Node<AgentData>;
 export type FlowEdge = Edge<EdgeData>;
 
 export type WorkflowSnapshot = {
+  schemaVersion?: 2;
   nodes: FlowNode[];
   edges: FlowEdge[];
+  /** Ephemeral notices produced while upgrading an older persisted snapshot. */
+  migrationNotices?: string[];
 };
 
 export type ValidationProblem = {
@@ -200,6 +202,10 @@ export type RunEvent = {
   nodeId?: string;
   edgeId?: string;
   level?: "info" | "warning" | "error";
+  attemptId?: string;
+  itemType?: string;
+  status?: string;
+  elapsedMs?: number;
 };
 
 export type ApprovalRequest = {

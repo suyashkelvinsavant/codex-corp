@@ -4,6 +4,9 @@
  * No mock / deterministic entries in the picker.
  */
 
+export const DEFAULT_NODE_MODEL_ID = "gpt-5.6-luna";
+export const DEFAULT_NODE_EFFORT = "medium";
+
 export type CodexModelOption = {
   id: string;
   model: string;
@@ -15,11 +18,37 @@ export type CodexModelOption = {
   defaultEffort: string | null;
 };
 
-/** Default from a live list: isDefault entry, else first, else empty string. */
+/** Default from a live list: connector default, then first, then empty string. */
 export function defaultModelFromList(models: CodexModelOption[]): string {
   const hit = models.find((m) => m.isDefault) ?? models[0];
   if (!hit) return "";
   return hit.id || hit.model || "";
+}
+
+/** Specialist-node preference, falling back to the connector's live default. */
+export function defaultNodeModelFromList(models: CodexModelOption[]): string {
+  const hit = models.find(
+    (m) =>
+      normalizeStoredModelId(m.id) === DEFAULT_NODE_MODEL_ID ||
+      normalizeStoredModelId(m.model) === DEFAULT_NODE_MODEL_ID ||
+      normalizeStoredModelId(m.displayName) === DEFAULT_NODE_MODEL_ID,
+  );
+  if (!hit) return defaultModelFromList(models);
+  return hit.id || hit.model || "";
+}
+
+/** Preferred effort when supported, then the model's live default, then first. */
+export function defaultNodeEffortForModel(
+  models: CodexModelOption[],
+  modelId: string,
+): string {
+  const options = effortsForModel(models, modelId);
+  if (options.includes(DEFAULT_NODE_EFFORT)) return DEFAULT_NODE_EFFORT;
+  const hit = models.find((m) => m.id === modelId || m.model === modelId);
+  if (hit?.defaultEffort && options.includes(hit.defaultEffort)) {
+    return hit.defaultEffort;
+  }
+  return options[0] ?? DEFAULT_NODE_EFFORT;
 }
 
 export function displayNameForModel(
@@ -79,9 +108,20 @@ export function sanitizeModelList(
   return cleaned;
 }
 
-/** True when stored model is empty or stripped mock/demo — needs live default. */
-export function needsLiveModelDefault(raw: string | undefined | null): boolean {
-  return !normalizeStoredModelId(raw ?? "");
+/** True when a stored model is empty, fake, or absent from a supplied live list. */
+export function needsLiveModelDefault(
+  raw: string | undefined | null,
+  models?: CodexModelOption[],
+): boolean {
+  const normalized = normalizeStoredModelId(raw ?? "");
+  if (!normalized) return true;
+  if (!models) return false;
+  return !models.some(
+    (model) =>
+      normalizeStoredModelId(model.id) === normalized ||
+      normalizeStoredModelId(model.model) === normalized ||
+      normalizeStoredModelId(model.displayName) === normalized,
+  );
 }
 
 /**
@@ -100,7 +140,9 @@ export function getLiveCodexModels(): CodexModelOption[] {
   return liveCodexModels;
 }
 
-export function subscribeLiveCodexModels(onStoreChange: () => void): () => void {
+export function subscribeLiveCodexModels(
+  onStoreChange: () => void,
+): () => void {
   liveCodexModelsListeners.add(onStoreChange);
   return () => {
     liveCodexModelsListeners.delete(onStoreChange);

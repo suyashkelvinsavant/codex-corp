@@ -13,6 +13,70 @@ export const WORKFLOW_ID = "software-company";
 export const WORKFLOW_STORAGE_KEY = "codex-corp-workflow";
 export const ACTIVE_WORKFLOW_KEY = "codex-corp-active-workflow";
 export const RUNS_STORAGE_KEY = "codex-corp-runs";
+export const WORKFLOW_SCHEMA_VERSION = 2 as const;
+
+/** Serialize every current workflow write with an explicit schema version. */
+export function serializeWorkflowSnapshot(
+  nodes: FlowNode[],
+  edges: FlowEdge[],
+): string {
+  return JSON.stringify({
+    schemaVersion: WORKFLOW_SCHEMA_VERSION,
+    nodes,
+    edges,
+  });
+}
+
+type LegacyAgentData = Omit<FlowNode["data"], "workspacePolicy"> & {
+  memoryMode?: unknown;
+  environmentVariables?: unknown;
+  maxRevisions?: unknown;
+  workspacePolicy?: "isolated" | "workflow" | "custom";
+};
+
+export function normalizeWorkflowSnapshot(
+  snapshot: WorkflowSnapshot,
+): WorkflowSnapshot {
+  const isLegacySnapshot = snapshot.schemaVersion !== WORKFLOW_SCHEMA_VERSION;
+  const resetLegacyApproval =
+    isLegacySnapshot &&
+    snapshot.nodes.some(
+      (node) =>
+        (node.data.kind === "agent" || node.data.kind === "creative") &&
+        node.data.requiresApproval === true,
+    );
+  return {
+    schemaVersion: WORKFLOW_SCHEMA_VERSION,
+    nodes: snapshot.nodes.map((node) => {
+      const legacy = node.data as LegacyAgentData;
+      const {
+        memoryMode: _memoryMode,
+        environmentVariables: _environmentVariables,
+        maxRevisions: _maxRevisions,
+        ...data
+      } = legacy;
+      return {
+        ...node,
+        data: {
+          ...data,
+          workspacePolicy:
+            legacy.workspacePolicy === "workflow" ? "workflow" : "isolated",
+          // Before schema v2 this flag was decorative. Do not silently turn an
+          // old saved graph into a blocking post-node approval workflow.
+          ...(isLegacySnapshot ? { requiresApproval: false } : {}),
+        },
+      } as FlowNode;
+    }),
+    edges: snapshot.edges,
+    ...(resetLegacyApproval
+      ? {
+          migrationNotices: [
+            "Legacy specialist approval flags were reset because they were not runtime gates before workflow schema v2.",
+          ],
+        }
+      : {}),
+  };
+}
 
 /** Per-template browser storage key; software-company keeps the legacy key. */
 export function workflowStorageKey(workflowId: string): string {
@@ -63,14 +127,25 @@ export function parseWorkflowSnapshot(
 ): WorkflowSnapshot | null {
   if (!raw?.trim()) return null;
   try {
-    const parsed = JSON.parse(raw) as Partial<WorkflowSnapshot>;
+    const parsed = JSON.parse(raw) as Partial<WorkflowSnapshot> & {
+      schemaVersion?: unknown;
+    };
     if (!Array.isArray(parsed.nodes) || !Array.isArray(parsed.edges))
       return null;
     if (!parsed.nodes.length) return null;
-    return {
+    if (
+      parsed.schemaVersion !== undefined &&
+      parsed.schemaVersion !== WORKFLOW_SCHEMA_VERSION
+    ) {
+      // A newer writer may have different semantics. Fail closed instead of
+      // silently applying the legacy migration and destroying unknown fields.
+      return null;
+    }
+    return normalizeWorkflowSnapshot({
+      schemaVersion: parsed.schemaVersion,
       nodes: parsed.nodes as FlowNode[],
       edges: parsed.edges as FlowEdge[],
-    };
+    });
   } catch {
     return null;
   }

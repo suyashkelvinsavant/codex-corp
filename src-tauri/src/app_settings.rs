@@ -4,16 +4,20 @@ use std::path::Path;
 use tauri::Manager;
 
 use crate::{app_data_dir, Database};
-
 const SETTINGS_KEY: &str = "runtime";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+fn default_cost_rate() -> f64 {
+    0.01
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AppSettings {
     pub retention_mode: String,
     pub retention_days: u32,
     pub max_detailed_runs: u32,
     pub max_concurrent_codex_processes: u32,
+    #[serde(default = "default_cost_rate")]
+    pub cost_per_1k_tokens_usd: f64,
 }
 
 impl Default for AppSettings {
@@ -23,6 +27,7 @@ impl Default for AppSettings {
             retention_days: 30,
             max_detailed_runs: 100,
             max_concurrent_codex_processes: 8,
+            cost_per_1k_tokens_usd: 0.01,
         }
     }
 }
@@ -40,6 +45,9 @@ impl AppSettings {
         }
         if !(1..=16).contains(&self.max_concurrent_codex_processes) {
             return Err("maxConcurrentCodexProcesses must be between 1 and 16".into());
+        }
+        if self.cost_per_1k_tokens_usd < 0.0 || self.cost_per_1k_tokens_usd > 10.0 {
+            return Err("costPer1kTokensUsd must be between 0.0 and 10.0".into());
         }
         Ok(())
     }

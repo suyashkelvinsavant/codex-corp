@@ -207,7 +207,15 @@ struct RuntimeNodeData {
     #[serde(default = "default_workspace")]
     workspace_policy: String,
     #[serde(default)]
+    input_schema: Option<String>,
+    #[serde(default)]
     output_schema: Option<String>,
+    #[serde(default = "default_timeout_seconds")]
+    timeout_seconds: u64,
+    #[serde(default)]
+    requires_approval: bool,
+    #[serde(default)]
+    hard_criteria_gate: bool,
     #[serde(default)]
     condition_rule: Option<ConditionRule>,
     #[serde(default)]
@@ -232,6 +240,9 @@ fn default_sandbox() -> String {
 }
 fn default_workspace() -> String {
     "isolated".into()
+}
+fn default_timeout_seconds() -> u64 {
+    120
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -477,6 +488,17 @@ fn now_isoish() -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".into())
 }
 
+fn event_item_type(event_type: &str) -> &'static str {
+    match event_type.split('.').next().unwrap_or_default() {
+        "node" => "node",
+        "approval" => "approval",
+        "verification" => "verification",
+        "edge" => "edge",
+        "run" | "workflow" => "run",
+        _ => "runtime",
+    }
+}
+
 fn emit_event(
     context: &RunContext,
     event_type: &str,
@@ -487,6 +509,17 @@ fn emit_event(
     diagnostics: Value,
 ) {
     let sequence = context.sequence.fetch_add(1, Ordering::SeqCst) + 1;
+    let mut safe_diagnostics = crate::redact_sensitive(diagnostics);
+    if let Value::Object(fields) = &mut safe_diagnostics {
+        fields
+            .entry("itemType".to_string())
+            .or_insert_with(|| json!(event_item_type(event_type)));
+    } else {
+        safe_diagnostics = json!({
+            "itemType": event_item_type(event_type),
+            "detail": safe_diagnostics,
+        });
+    }
     let event = WorkflowRunEvent {
         run_id: context.run_id.clone(),
         node_id: node_id.map(str::to_string),
@@ -496,7 +529,7 @@ fn emit_event(
         level: level.into(),
         at: now_isoish(),
         message: message.into(),
-        diagnostics: crate::redact_sensitive(diagnostics),
+        diagnostics: safe_diagnostics,
     };
     if let Ok(connection) = context.database.0.lock() {
         let event_json = serde_json::to_string(&event).unwrap_or_else(|_| "{}".into());
@@ -691,9 +724,10 @@ fn required_criteria_failure(
     criteria: &[RuntimeCriterion],
     output: &RuntimeOutput,
     context: &RunContext,
+    hard_criteria_gate: bool,
 ) -> Option<String> {
     for criterion in criteria {
-        let required = criterion.platform || criterion.enforcement == "required";
+        let required = hard_criteria_gate || criterion.platform || criterion.enforcement == "required";
         if !required || (!criterion.enabled && !criterion.platform) {
             continue;
         }
@@ -1016,38 +1050,132 @@ fn resolve_artifact_content_hash(stored: Option<&str>, content: &str) -> String 
 }
 
 fn tool_policy(node: &RuntimeNode) -> Result<(String, String), String> {
+    let sandbox_profile = match node.data.permission_profile.as_deref() {
+        Some(profile) if profile.contains("read-only") => "read-only".to_string(),
+        Some(_) => "workspace-write".to_string(),
+        None => node.data.sandbox_profile.clone(),
+    };
     let write_selected = node
         .data
         .tools
         .iter()
         .any(|tool| tool.to_ascii_lowercase().contains("write"));
-    if write_selected
-        && node.data.permission_profile.is_none()
-        && node.data.sandbox_profile == "read-only"
-    {
+    if write_selected && sandbox_profile == "read-only" {
         return Err(format!(
             "{} selects write capability with a read-only sandbox",
             node.data.label
         ));
     }
-    if write_selected
-        && node
-            .data
-            .permission_profile
-            .as_deref()
-            .is_some_and(|profile| profile.contains("read-only"))
-    {
-        return Err(format!(
-            "{} selects write capability with a read-only permission profile",
-            node.data.label
-        ));
+    Ok((sandbox_profile, node.data.approval_policy.clone()))
+}
+
+fn resolve_json_path(root: &Value, path: &str) -> Option<Value> {
+    let mut current = root;
+    for segment in path.strip_prefix("$.")?.split('.') {
+        let (key, index) = if let Some(open) = segment.find('[') {
+            let close = segment.strip_suffix(']')?;
+            (
+                &segment[..open],
+                Some(close[open + 1..].parse::<usize>().ok()?),
+            )
+        } else {
+            (segment, None)
+        };
+        current = current.get(key)?;
+        if let Some(index) = index {
+            current = current.get(index)?;
+        }
     }
-    let sandbox = if write_selected {
-        "workspace-write".to_string()
-    } else {
-        "read-only".to_string()
+    Some(current.clone())
+}
+
+fn mapped_output(output: &RuntimeOutput, mapping: Option<&HashMap<String, String>>) -> Value {
+    let full = json!({
+        "status": output.status,
+        "summary": output.summary,
+        "data": output.data,
+        "artifacts": output.artifacts,
+        "threadId": output.thread_id,
+    });
+    let Some(mapping) = mapping.filter(|mapping| !mapping.is_empty()) else {
+        return full;
     };
-    Ok((sandbox, node.data.approval_policy.clone()))
+    let mut projected = serde_json::Map::new();
+    for (field, path) in mapping {
+        if field.trim().is_empty() {
+            continue;
+        }
+        projected.insert(
+            field.clone(),
+            resolve_json_path(&full, path).unwrap_or(Value::Null),
+        );
+    }
+    Value::Object(projected)
+}
+
+fn compose_specialist_input(
+    context: &RunContext,
+    node: &RuntimeNode,
+    revision_feedback: &str,
+) -> Result<Value, String> {
+    let mission = context
+        .graph
+        .nodes
+        .iter()
+        .find(|candidate| candidate.data.kind == "input")
+        .and_then(|candidate| candidate.data.output.clone())
+        .unwrap_or_default();
+    let outputs = context
+        .outputs
+        .lock()
+        .map_err(|_| "outputs lock poisoned".to_string())?;
+    let upstream_outputs = context
+        .graph
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.target == node.id
+                && edge
+                    .data
+                    .as_ref()
+                    .map(|data| data.edge_type.as_str())
+                    .unwrap_or("standard")
+                    != "revision"
+        })
+        .filter_map(|edge| {
+            outputs.get(&edge.source).map(|output| {
+                json!({
+                    "sourceNodeId": edge.source,
+                    "edgeId": edge.id,
+                    "payload": mapped_output(
+                        output,
+                        edge.data.as_ref().and_then(|data| data.mapping.as_ref()),
+                    ),
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let revision_feedback = if revision_feedback.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![json!({"message": revision_feedback.trim()})]
+    };
+    Ok(json!({
+        "workflowInput": mission,
+        "upstreamOutputs": upstream_outputs,
+        "revisionFeedback": revision_feedback,
+    }))
+}
+
+fn validate_json_schema(raw: &str, instance: &Value, label: &str) -> Result<(), String> {
+    let schema: Value = serde_json::from_str(raw)
+        .map_err(|error| format!("invalid {label} JSON Schema: {error}"))?;
+    let validator = jsonschema::validator_for(&schema)
+        .map_err(|error| format!("invalid {label} JSON Schema: {error}"))?;
+    if let Err(error) = validator.validate(instance) {
+        return Err(format!("{label} schema validation failed: {error}"));
+    }
+    Ok(())
 }
 
 fn connector_capability_instructions(node: &RuntimeNode) -> String {
@@ -1104,20 +1232,15 @@ async fn specialist_once(
     if context.stop.load(Ordering::SeqCst) {
         return Err("run interrupted".into());
     }
-    let upstream: Vec<Value> = context
-        .outputs
-        .lock()
-        .map_err(|_| "outputs lock poisoned".to_string())?
-        .values()
-        .map(|output| serde_json::to_value(output).unwrap_or(Value::Null))
-        .collect();
-    let mission = context
-        .graph
-        .nodes
-        .iter()
-        .find(|candidate| candidate.data.kind == "input")
-        .and_then(|candidate| candidate.data.output.clone())
-        .unwrap_or_default();
+    let composed_input = compose_specialist_input(context, node, extra_instruction)?;
+    if let Some(input_schema) = node.data.input_schema.as_deref() {
+        validate_json_schema(input_schema, &composed_input, "input")?;
+    }
+    let mission = composed_input
+        .get("workflowInput")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     let schema = node
         .data
         .output_schema
@@ -1145,11 +1268,8 @@ async fn specialist_once(
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n");
-    let user_input = if extra_instruction.trim().is_empty() {
-        mission.clone()
-    } else {
-        format!("{mission}\n\n{extra_instruction}")
-    };
+    let user_input = serde_json::to_string_pretty(&composed_input)
+        .map_err(|error| format!("failed to compose authorized input: {error}"))?;
     let request = AgentRequest {
         node_id: node.id.clone(),
         run_id: Some(context.run_id.clone()),
@@ -1160,7 +1280,7 @@ async fn specialist_once(
         base_instructions,
         developer_instructions,
         user_input,
-        upstream_outputs: upstream,
+        upstream_outputs: Vec::new(),
         approval_policy,
         sandbox_profile,
         permission_profile: node.data.permission_profile.clone(),
@@ -1171,9 +1291,12 @@ async fn specialist_once(
             .target_workspace
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned()),
+        timeout_seconds: node.data.timeout_seconds.clamp(10, 1800),
         output_schema: schema,
         tools: node.data.tools.clone(),
+        skills: node.data.skills.clone(),
         tool_boundary: "Tool selections are enforced through the host sandbox and approval policy where supported. CLI-internal tool granularity remains governed by Codex.".into(),
+        app_server_path: None,
     };
     let started = SystemTime::now();
     let token_meter = Arc::new(AtomicU64::new(0));
@@ -1193,6 +1316,18 @@ async fn specialist_once(
     match result {
         Ok(result) => {
             let mut output: RuntimeOutput = result.into();
+            if let Some(output_schema) = node.data.output_schema.as_deref() {
+                validate_json_schema(
+                    output_schema,
+                    &json!({
+                        "status": output.status,
+                        "summary": output.summary,
+                        "data": output.data,
+                        "artifacts": output.artifacts,
+                    }),
+                    "output",
+                )?;
+            }
             // Host materialize: assign hostOrdinal + artifactKey + contentHash
             let previous = context
                 .outputs
@@ -1237,7 +1372,7 @@ async fn specialist_once(
                 } else {
                     evaluate_criterion(criterion, &output, context)
                 };
-                let enforcement = if criterion.platform || criterion.enforcement == "required" {
+                let enforcement = if node.data.hard_criteria_gate || criterion.platform || criterion.enforcement == "required" {
                     "required"
                 } else {
                     "advisory"
@@ -1822,7 +1957,7 @@ async fn execute_specialist_with_revision(
     let mut reason = if output.status == "needs_revision" {
         Some(output.summary.clone())
     } else {
-        required_criteria_failure(&node.data.completion_criteria, &output, context)
+        required_criteria_failure(&node.data.completion_criteria, &output, context, node.data.hard_criteria_gate)
     };
     let Some(edge) = revision_edge else {
         if let Some(reason) = reason {
@@ -1883,7 +2018,7 @@ async fn execute_specialist_with_revision(
         reason = if output.status == "needs_revision" {
             Some(output.summary.clone())
         } else {
-            required_criteria_failure(&node.data.completion_criteria, &output, context)
+            required_criteria_failure(&node.data.completion_criteria, &output, context, node.data.hard_criteria_gate)
         };
     }
     Err(format!(
@@ -1893,8 +2028,13 @@ async fn execute_specialist_with_revision(
     ))
 }
 
-async fn approval_node(context: &RunContext, node: &RuntimeNode) -> Result<RuntimeOutput, String> {
-    let request_id = format!("{}::{}::approval", context.run_id, node.id);
+async fn await_operator_approval(
+    context: &RunContext,
+    node: &RuntimeNode,
+    gate: &str,
+    detail: &str,
+) -> Result<String, String> {
+    let request_id = format!("{}::{}::{gate}", context.run_id, node.id);
     let (sender, receiver) = mpsc::channel();
     context
         .run_approvals
@@ -1910,7 +2050,7 @@ async fn approval_node(context: &RunContext, node: &RuntimeNode) -> Result<Runti
                 request_id: request_id.clone(),
                 node_id: node.id.clone(),
                 title: node.data.label.clone(),
-                detail: "Review the completed required work before releasing delivery.".into(),
+                detail: detail.into(),
             },
         );
     } else {
@@ -1939,11 +2079,11 @@ async fn approval_node(context: &RunContext, node: &RuntimeNode) -> Result<Runti
     if let Ok(connection) = context.database.0.lock() {
         let _ = connection.execute(
             "INSERT OR REPLACE INTO approvals(id,run_id,node_id,request_json,decision) VALUES(?1,?2,?3,?4,NULL)",
-            params![request_id,context.run_id,node.id,json!({"title":node.data.label,"detail":"Review required work before release"}).to_string()],
+            params![request_id,context.run_id,node.id,json!({"title":node.data.label,"detail":detail,"gate":gate}).to_string()],
         );
     }
     let stop = context.stop.clone();
-    let decision_result = tauri::async_runtime::spawn_blocking(move || {
+    let wait_result = tauri::async_runtime::spawn_blocking(move || {
         wait_for_approval(
             &receiver,
             &stop,
@@ -1952,7 +2092,7 @@ async fn approval_node(context: &RunContext, node: &RuntimeNode) -> Result<Runti
         )
     })
     .await
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| error.to_string());
     // Always remove the broker entry, including timeout, cancellation, and
     // sender-disconnect paths. Stale approvals must never be actionable.
     context
@@ -1961,8 +2101,20 @@ async fn approval_node(context: &RunContext, node: &RuntimeNode) -> Result<Runti
         .lock()
         .ok()
         .and_then(|mut pending| pending.remove(&request_id));
-    let decision = decision_result?;
     update_run_status(&context.database, &context.run_id, "running", None, true);
+    let decision_result = wait_result?;
+    let decision = match decision_result {
+        Ok(decision) => decision,
+        Err(error) => {
+            if let Ok(connection) = context.database.0.lock() {
+                let _ = connection.execute(
+                    "UPDATE approvals SET decision=?2 WHERE id=?1",
+                    params![request_id, error],
+                );
+            }
+            return Err(error);
+        }
+    };
     if !decision {
         if let Ok(connection) = context.database.0.lock() {
             let _ = connection.execute(
@@ -1978,6 +2130,17 @@ async fn approval_node(context: &RunContext, node: &RuntimeNode) -> Result<Runti
             params![request_id],
         );
     }
+    Ok(request_id)
+}
+
+async fn approval_node(context: &RunContext, node: &RuntimeNode) -> Result<RuntimeOutput, String> {
+    let request_id = await_operator_approval(
+        context,
+        node,
+        "approval",
+        "Review the completed required work before releasing delivery.",
+    )
+    .await?;
     // Freeze approved artifact (key,hash) pairs onto approval output only.
     // Cannot re-derive from artifacts table after revision DELETE+reinsert.
     let outputs_snapshot = context
@@ -2098,7 +2261,19 @@ async fn execute_node(context: &RunContext, node: &RuntimeNode) -> Result<Runtim
         return Err("run interrupted".into());
     }
     match node.data.kind.as_str() {
-        "agent" | "creative" => execute_specialist_with_revision(context, node).await,
+        "agent" | "creative" => {
+            let output = execute_specialist_with_revision(context, node).await?;
+            if node.data.requires_approval {
+                await_operator_approval(
+                    context,
+                    node,
+                    "post-node-approval",
+                    "Review this specialist's verified output before downstream work is released.",
+                )
+                .await?;
+            }
+            Ok(output)
+        }
         "approval" => approval_node(context, node).await,
         "merge" => Ok(RuntimeOutput {
             status: "success".into(),
@@ -3353,6 +3528,10 @@ mod tests {
                 approval_policy: default_approval(),
                 sandbox_profile: default_sandbox(),
                 workspace_policy: default_workspace(),
+                input_schema: None,
+                timeout_seconds: default_timeout_seconds(),
+                requires_approval: false,
+                hard_criteria_gate: false,
                 output_schema: None,
                 condition_rule: None,
                 cron_expression: None,
@@ -3414,6 +3593,10 @@ mod tests {
                 // Ignored because the live named profile is authoritative.
                 sandbox_profile: "read-only".into(),
                 workspace_policy: default_workspace(),
+                input_schema: None,
+                timeout_seconds: default_timeout_seconds(),
+                requires_approval: false,
+                hard_criteria_gate: false,
                 output_schema: None,
                 condition_rule: None,
                 cron_expression: None,
@@ -3854,6 +4037,72 @@ mod tests {
     }
 
     #[test]
+    fn normalized_event_item_types_are_explicit() {
+        assert_eq!(event_item_type("node.attempt.completed"), "node");
+        assert_eq!(event_item_type("approval.requested"), "approval");
+        assert_eq!(event_item_type("verification.failed"), "verification");
+        assert_eq!(event_item_type("unexpected.event"), "runtime");
+    }
+
+    #[test]
+    fn specialist_input_is_direct_mapped_and_revision_scoped() {
+        let mut context = sample_run_context(None);
+        context.graph = serde_json::from_value(json!({
+            "nodes": [
+                {"id":"input","data":{"label":"Input","role":"Input","kind":"input","output":"mission"}},
+                {"id":"a","data":{"label":"A","role":"A","kind":"agent"}},
+                {"id":"unrelated","data":{"label":"Secret","role":"Secret","kind":"agent"}},
+                {"id":"review","data":{"label":"Review","role":"Review","kind":"agent"}},
+                {"id":"target","data":{"label":"Target","role":"Target","kind":"agent"}}
+            ],
+            "edges": [
+                {"id":"mapped","source":"a","target":"target","data":{"edgeType":"standard","mapping":{"score":"$.data.score"}}},
+                {"id":"other","source":"unrelated","target":"review","data":{"edgeType":"standard"}},
+                {"id":"revision","source":"review","target":"target","data":{"edgeType":"revision"}}
+            ]
+        })).unwrap();
+        context.outputs.lock().unwrap().extend([
+            (
+                "a".into(),
+                sample_output("success", "done", json!({"score":7})),
+            ),
+            (
+                "unrelated".into(),
+                sample_output("success", "secret", json!({"score":99})),
+            ),
+        ]);
+        let target = context
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.id == "target")
+            .unwrap();
+        let composed = compose_specialist_input(&context, target, "fix this").unwrap();
+        assert_eq!(composed["workflowInput"], "mission");
+        assert_eq!(composed["upstreamOutputs"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            composed["upstreamOutputs"][0]["payload"],
+            json!({"score":7})
+        );
+        assert_eq!(
+            composed["revisionFeedback"],
+            json!([{"message":"fix this"}])
+        );
+        assert!(!composed.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn json_schema_validation_rejects_contract_mismatches() {
+        let schema = r#"{"type":"object","required":["workflowInput"],"properties":{"workflowInput":{"type":"string"}}}"#;
+        assert!(validate_json_schema(schema, &json!({"workflowInput":"ok"}), "input").is_ok());
+        assert!(
+            validate_json_schema(schema, &json!({"workflowInput":7}), "input")
+                .unwrap_err()
+                .contains("schema validation failed")
+        );
+    }
+
+    #[test]
     fn evaluate_host_io_criteria_fail_closed_without_workspace() {
         // Belt-and-suspenders: evaluate path never falls back to process CWD.
         // Command runner must not spawn when workspace is missing.
@@ -3945,6 +4194,10 @@ mod tests {
                 approval_policy: default_approval(),
                 sandbox_profile: default_sandbox(),
                 workspace_policy: default_workspace(),
+                input_schema: None,
+                timeout_seconds: default_timeout_seconds(),
+                requires_approval: false,
+                hard_criteria_gate: false,
                 output_schema: None,
                 condition_rule: None,
                 cron_expression: None,

@@ -2,27 +2,20 @@ import { describe, expect, it } from "vitest";
 import {
   advisoryAllowList,
   formatLiveToolBoundaryBlock,
-  isMcpToolLabel,
-  mcpStatusLabel,
   permissionGrantLabel,
   toolsUiHelperText,
 } from "./tool-boundary";
 
 describe("tool boundary honesty", () => {
-  it("classifies MCP labels and strips them from the advisory allow-list", () => {
-    expect(isMcpToolLabel("MCP servers")).toBe(true);
-    expect(isMcpToolLabel("Shell")).toBe(false);
+  it("strips legacy MCP labels from the advisory allow-list", () => {
     expect(
       advisoryAllowList(["Shell", "MCP servers", "Web search", "  "]),
     ).toEqual(["Shell", "Web search"]);
   });
 
-  it("labels grants as advisory for Live Codex (MCP never connected)", () => {
+  it("labels visible grants as advisory for Live Codex", () => {
     expect(permissionGrantLabel("Shell", false)).toBe("denied");
     expect(permissionGrantLabel("Shell", true)).toBe("advisory");
-    expect(permissionGrantLabel("MCP servers", true)).toBe("not connected");
-    expect(mcpStatusLabel(["Shell"])).toBe("Not selected");
-    expect(mcpStatusLabel(["MCP servers"])).toBe("Selected · not connected");
   });
 
   it("formats a Live boundary block with allow-list and disclaimers", () => {
@@ -36,12 +29,15 @@ describe("tool boundary honesty", () => {
     expect(block).toContain("Preferred tools only: Shell, Workspace write");
     expect(block).not.toMatch(/Preferred tools only:.*MCP/);
     expect(block).toContain("Approval policy: on-request");
-    expect(block).toContain("NOT connected");
+    expect(block).not.toMatch(/MCP servers/i);
   });
 
-  it("uses Live-only UI helper copy (no mode flag)", () => {
-    expect(toolsUiHelperText()).toMatch(/advisory allow-list/i);
-    expect(toolsUiHelperText()).toMatch(/MCP is not connected/i);
+  it("labels choices as preferences and identifies the real boundary", () => {
+    expect(toolsUiHelperText()).toMatch(/execution preferences/i);
+    expect(toolsUiHelperText()).toMatch(/not per-tool access controls/i);
+    expect(toolsUiHelperText()).toMatch(
+      /sandbox.*permission profile.*approval policy/i,
+    );
     expect(toolsUiHelperText()).not.toMatch(/Demo mode/i);
   });
 });

@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_NODE_EFFORT,
+  DEFAULT_NODE_MODEL_ID,
+  defaultNodeEffortForModel,
   defaultModelFromList,
+  defaultNodeModelFromList,
   displayNameForModel,
   effortsForModel,
   needsLiveModelDefault,
@@ -37,6 +41,30 @@ describe("codex models helpers (connector-driven, no hardcoded catalog)", () => 
     expect(defaultModelFromList(fixtureModels)).toBe("model-b");
     expect(defaultModelFromList([fixtureModels[0]!])).toBe("model-a");
     expect(defaultModelFromList([])).toBe("");
+  });
+
+  it("prefers GPT-5.6 Luna from the live catalog with medium effort", () => {
+    const luna = {
+      ...fixtureModels[0]!,
+      id: DEFAULT_NODE_MODEL_ID,
+      model: DEFAULT_NODE_MODEL_ID,
+      displayName: "GPT-5.6 Luna",
+      supportedEfforts: ["low", "medium", "high"],
+      defaultEffort: "low",
+    };
+    const models = [...fixtureModels, luna];
+    expect(defaultModelFromList(models)).toBe("model-b");
+    expect(defaultNodeModelFromList(models)).toBe(DEFAULT_NODE_MODEL_ID);
+    expect(defaultNodeEffortForModel(models, luna.id)).toBe(
+      DEFAULT_NODE_EFFORT,
+    );
+  });
+
+  it("falls back safely when Luna or medium is unavailable", () => {
+    expect(defaultModelFromList(fixtureModels)).toBe("model-b");
+    expect(defaultNodeModelFromList(fixtureModels)).toBe("model-b");
+    expect(defaultNodeModelFromList([])).toBe("");
+    expect(defaultNodeEffortForModel(fixtureModels, "model-b")).toBe("high");
   });
 
   it("effortsForModel uses list entry or generic effort fallback", () => {
@@ -90,5 +118,7 @@ describe("codex models helpers (connector-driven, no hardcoded catalog)", () => 
     expect(needsLiveModelDefault("Mock / deterministic")).toBe(true);
     expect(needsLiveModelDefault(undefined)).toBe(true);
     expect(needsLiveModelDefault("model-b")).toBe(false);
+    expect(needsLiveModelDefault("model-b", fixtureModels)).toBe(false);
+    expect(needsLiveModelDefault("gpt-5.6-luna", fixtureModels)).toBe(true);
   });
 });

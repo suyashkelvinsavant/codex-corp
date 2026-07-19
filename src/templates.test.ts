@@ -47,10 +47,18 @@ describe("workflow catalog", () => {
       ]),
     );
     const software = getTemplate("software-company-v1");
-    expect(software.nodes.some((n) => n.data.packId === "product-manager")).toBe(
-      true,
-    );
+    expect(
+      software.nodes.some((n) => n.data.packId === "product-manager"),
+    ).toBe(true);
     expect(software.nodes.some((n) => n.data.baseInstructions)).toBe(true);
+    expect(
+      software.nodes
+        .filter((node) => node.data.kind === "agent")
+        .every(
+          (node) =>
+            node.data.model === "gpt-5.6-luna" && node.data.effort === "medium",
+        ),
+    ).toBe(true);
     expect(isTemplateId(DEFAULT_TEMPLATE_ID)).toBe(false);
     expect(getTemplate("missing")).toMatchObject({
       id: DEFAULT_TEMPLATE_ID,

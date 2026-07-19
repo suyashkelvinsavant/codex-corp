@@ -13,6 +13,7 @@ use super::host::McpHost;
 use super::socket_addr;
 use super::transport;
 use super::McpServerConfig;
+use crate::platform_process::background_command;
 use crate::{app_data_dir, mcp_stop_file_path};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -320,7 +321,7 @@ pub(crate) fn restrict_file_permissions(path: &Path) {
 
 #[cfg(windows)]
 fn current_windows_sid() -> Option<String> {
-    let output = std::process::Command::new("whoami")
+    let output = background_command("whoami")
         .args(["/user", "/fo", "csv", "/nh"])
         .output()
         .ok()?;
@@ -349,7 +350,7 @@ fn restrict_windows_acl(path: &Path, directory: bool) {
     } else {
         format!("*{sid}:F")
     };
-    let status = std::process::Command::new("icacls")
+    let status = background_command("icacls")
         .arg(path)
         .args(["/inheritance:r", "/grant:r", &grant])
         .stdout(std::process::Stdio::null())
@@ -369,8 +370,7 @@ fn process_alive(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        use std::process::Command;
-        let output = Command::new("tasklist")
+        let output = background_command("tasklist")
             .args(["/FI", &format!("PID eq {pid}"), "/NH"])
             .output();
         match output {
@@ -447,7 +447,7 @@ fn hard_kill_pid(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("taskkill")
+        let _ = background_command("taskkill")
             .args(["/PID", &pid.to_string(), "/F"])
             .output();
         // Brief settle so tasklist reflects exit.
@@ -811,7 +811,7 @@ mod tests {
         assert_eq!(fs::read(&file).unwrap(), b"secret");
 
         let _sid = current_windows_sid().expect("current SID");
-        let output = std::process::Command::new("icacls")
+        let output = background_command("icacls")
             .arg(&file)
             .output()
             .expect("icacls query");

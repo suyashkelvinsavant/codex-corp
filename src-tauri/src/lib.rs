@@ -1,8 +1,6 @@
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-#[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
 use std::{
     collections::HashMap,
     io::{BufRead, BufReader, Write},
@@ -23,6 +21,7 @@ mod business_data;
 mod chat_data;
 pub(crate) mod codex_turn;
 pub mod mcp_server;
+mod platform_process;
 mod runtime_ownership;
 mod verifier;
 mod workflow_runtime;
@@ -242,6 +241,8 @@ struct GraphNodeData {
     cron_timezone: Option<String>,
     #[serde(default)]
     completion_criteria: Vec<GraphCriterion>,
+    #[serde(default = "default_agent_timeout_seconds")]
+    timeout_seconds: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -368,14 +369,26 @@ struct AgentRequest {
     workspace_policy: String,
     #[serde(default)]
     target_workspace: Option<String>,
+    #[serde(default = "default_agent_timeout_seconds")]
+    timeout_seconds: u64,
     #[serde(default)]
     output_schema: Option<Value>,
     /// Selected tool labels from the UI (advisory; not a hard app-server ACL).
     #[serde(default)]
     tools: Vec<String>,
+    /// Saved Codex skills. These are resolved against the executing app-server.
+    #[serde(default)]
+    skills: Vec<String>,
     /// Preformatted tool-boundary disclaimer appended to the turn prompt.
     #[serde(default)]
     tool_boundary: String,
+    /// Internal subprocess seam used by the fake app-server integration harness.
+    #[serde(skip)]
+    app_server_path: Option<PathBuf>,
+}
+
+fn default_agent_timeout_seconds() -> u64 {
+    120
 }
 
 impl AgentRequest {
@@ -401,6 +414,68 @@ fn normalized_personality(value: Option<&str>) -> &'static str {
         Some("pragmatic") => "pragmatic",
         _ => "none",
     }
+}
+
+fn resolve_agent_working_directory(request: &AgentRequest) -> PathBuf {
+    let run_workspace = request.run_id.as_deref().unwrap_or("legacy");
+    if request.workspace_policy == "workflow" {
+        request
+            .target_workspace
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                app_data_dir()
+                    .join("workspaces")
+                    .join(run_workspace)
+                    .join("workflow-shared")
+            })
+    } else {
+        app_data_dir()
+            .join("workspaces")
+            .join(run_workspace)
+            .join(&request.node_id)
+            .join(request.attempt_id.as_deref().unwrap_or("legacy"))
+    }
+}
+
+/// Skill discovery must cover the same process cwd used by the capability
+/// picker plus the concrete execution and operator-selected workspaces.
+fn skill_discovery_cwds(request: &AgentRequest, workspace: &Path) -> Vec<String> {
+    let mut cwds = Vec::<String>::new();
+    let mut push_unique = |path: PathBuf| {
+        let value = path.to_string_lossy().into_owned();
+        let duplicate = cwds.iter().any(|existing| {
+            if cfg!(windows) {
+                existing.eq_ignore_ascii_case(&value)
+            } else {
+                existing == &value
+            }
+        });
+        if !duplicate {
+            cwds.push(value);
+        }
+    };
+    push_unique(workspace.to_path_buf());
+    if let Some(target) = request
+        .target_workspace
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        push_unique(PathBuf::from(target));
+    }
+    if let Ok(inventory_cwd) = std::env::current_dir() {
+        push_unique(inventory_cwd);
+    }
+    cwds
+}
+
+fn outer_agent_deadline_seconds(wall_seconds: u64) -> u64 {
+    // The inner turn deadline owns normal timeout reporting and child cleanup.
+    // This outer deadline is only a deadlock safety net and must fire later.
+    wall_seconds.saturating_add(30)
 }
 
 /// Apply dual instruction surfaces to app-server thread params (omit empty base).
@@ -430,6 +505,14 @@ fn build_agent_thread_start_params(
         "ephemeral":true,
         "personality":personality
     });
+    if let Some(root) = request
+        .target_workspace
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        params["runtimeWorkspaceRoots"] = json!([root]);
+    }
     apply_instruction_params(
         &mut params,
         &request.base_instructions,
@@ -456,11 +539,14 @@ fn build_agent_turn_start_params(
     model: &str,
     composed: &str,
     output_schema: Value,
+    skill_inputs: &[Value],
 ) -> Value {
     let personality = normalized_personality(request.personality.as_deref());
+    let mut input = skill_inputs.to_vec();
+    input.push(json!({"type":"text","text":composed,"text_elements":[]}));
     let mut params = json!({
         "threadId":thread_id,
-        "input":[{"type":"text","text":composed,"text_elements":[]}],
+        "input":input,
         "model":model,
         "effort":request.effort,
         "personality":personality,
@@ -477,6 +563,45 @@ fn build_agent_turn_start_params(
         });
     }
     params
+}
+
+fn resolve_skill_inputs(result: &Value, selected: &[String]) -> Result<Vec<Value>, String> {
+    if selected.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut available = HashMap::<String, String>::new();
+    for entry in result
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for skill in entry
+            .get("skills")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(name) = skill.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if skill.get("enabled").and_then(Value::as_bool) == Some(false) {
+                continue;
+            }
+            if let Some(path) = skill.get("path").and_then(Value::as_str) {
+                available.insert(name.to_string(), path.to_string());
+            }
+        }
+    }
+    selected
+        .iter()
+        .map(|name| {
+            available
+                .get(name)
+                .map(|path| json!({"type":"skill","name":name,"path":path}))
+                .ok_or_else(|| format!("Saved skill '{name}' is not available in this workspace"))
+        })
+        .collect()
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -833,14 +958,15 @@ fn is_npm_codex_shim(path: &Path) -> bool {
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    matches!(name.as_str(), "codex.cmd" | "codex.ps1" | "codex")
-        || (name == "codex.exe"
-            && path
-                .parent()
-                .and_then(|p| p.file_name())
-                .and_then(|s| s.to_str())
-                .map(|s| s.eq_ignore_ascii_case("npm"))
-                .unwrap_or(false))
+    let is_bare_name = path.components().count() == 1;
+    let is_in_npm_dir = path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("npm"));
+    (matches!(name.as_str(), "codex.cmd" | "codex.ps1" | "codex")
+        && (is_bare_name || is_in_npm_dir))
+        || (name == "codex.exe" && is_in_npm_dir)
 }
 
 fn prepare_command(command: &mut Command) {
@@ -856,12 +982,8 @@ fn prepare_command(command: &mut Command) {
             }
         }
     }
-    #[cfg(target_os = "windows")]
-    {
-        // Avoid hanging / flashing consoles when the host is a windowed (GUI) process.
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
+    // Avoid hanging / flashing consoles when the host is a windowed (GUI) process.
+    platform_process::hide_console_window(command);
 }
 
 fn command_for_codex(path: &Path, args: &[&str]) -> Command {
@@ -869,12 +991,9 @@ fn command_for_codex(path: &Path, args: &[&str]) -> Command {
     // that make discover_codex report found=false while CLI works in a terminal.
     #[cfg(target_os = "windows")]
     {
-        let use_node_entry = is_npm_codex_shim(path)
-            || path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("ps1"))
-                .unwrap_or(false);
+        // Only the known npm shim may be replaced by the global codex.js entry.
+        // Explicit custom .cmd/.ps1 paths must remain authoritative.
+        let use_node_entry = is_npm_codex_shim(path);
         if use_node_entry {
             if let (Some(node), Some(js)) = (find_node_exe(), npm_codex_js()) {
                 let mut command = Command::new(node);
@@ -900,7 +1019,19 @@ fn command_for_codex(path: &Path, args: &[&str]) -> Command {
         // .cmd / .bat need cmd.exe so PATH/node resolution matches interactive shell.
         if ext == "cmd" || ext == "bat" {
             let mut command = Command::new("cmd.exe");
-            let mut cmdline = format!("\"{}\"", path.display());
+            let displayed = path.to_string_lossy();
+            // `cmd.exe /c` treats metacharacters as syntax even without spaces.
+            // Quote only when required: `/s` has special handling for a command
+            // beginning with quotes, while simple no-space paths work unquoted.
+            let needs_quotes = displayed.chars().any(|character| {
+                character.is_whitespace()
+                    || matches!(character, '&' | '|' | '<' | '>' | '(' | ')' | '^')
+            });
+            let mut cmdline = if needs_quotes {
+                format!("\"{displayed}\"")
+            } else {
+                displayed.into_owned()
+            };
             for arg in args {
                 cmdline.push(' ');
                 if arg.contains(' ') {
@@ -922,8 +1053,10 @@ fn command_for_codex(path: &Path, args: &[&str]) -> Command {
     command
 }
 
-pub(crate) fn codex_app_server() -> Result<Child, String> {
-    let path = active_codex_path();
+fn codex_app_server_at(path_override: Option<&Path>) -> Result<Child, String> {
+    let path = path_override
+        .map(Path::to_path_buf)
+        .unwrap_or_else(active_codex_path);
     // stderr must NOT be piped-and-unread: a full OS pipe buffer deadlocks the
     // app-server after tool work (files written) while it still emits logs.
     command_for_codex(&path, &["app-server", "--stdio"])
@@ -937,6 +1070,10 @@ pub(crate) fn codex_app_server() -> Result<Child, String> {
                 path.display()
             )
         })
+}
+
+pub(crate) fn codex_app_server() -> Result<Child, String> {
+    codex_app_server_at(None)
 }
 
 /// Collect version text from a process output (stdout preferred, stderr fallback).
@@ -1272,6 +1409,19 @@ fn validate_graph(graph: &GraphSnapshot) -> Vec<GraphProblem> {
                 format!("model-{}", node.id),
                 format!(
                     "{} needs a Codex model (Config → Model, or Refresh models).",
+                    node.data.label
+                ),
+                Some(node.id.clone()),
+                None,
+            ));
+        }
+        if (node.data.kind == "agent" || node.data.kind == "creative")
+            && !(10..=1800).contains(&node.data.timeout_seconds)
+        {
+            problems.push(problem(
+                format!("timeout-{}", node.id),
+                format!(
+                    "{} timeout must be between 10 and 1800 seconds.",
                     node.data.label
                 ),
                 Some(node.id.clone()),
@@ -3432,10 +3582,6 @@ fn read_until_response_silent(
     }
 }
 
-/// Overall wall-clock budget for one Live Codex specialist turn (includes
-/// initialize + thread/start + turn body). Fail closed so the workflow can
-/// reach a durable terminal state instead of hanging the desktop forever.
-const EXECUTE_AGENT_WALL_SECS: u64 = 180;
 /// Idle gap between stdout lines before killing a stalled turn.
 /// Keep high enough for multi-file writes; hard wall still bounds the turn.
 const TURN_IDLE_SECS: u64 = 75;
@@ -3467,6 +3613,9 @@ pub(crate) async fn execute_agent_internal(
     token_meter: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<AgentResult, String> {
     agent_trace(&format!("execute_agent ENTER node={}", request.node_id));
+    let wall_secs = request.timeout_seconds.clamp(10, 1800);
+    let timeout_process_key = request.process_key();
+    let timeout_broker = process_broker.clone();
     // Outer hard deadline: even if the inner body deadlocks, the invoke returns.
     let work = tauri::async_runtime::spawn_blocking(move || {
         let node_for_log = request.node_id.clone();
@@ -3484,7 +3633,7 @@ pub(crate) async fn execute_agent_internal(
                 let app = app_outer;
                 let broker = broker_outer;
                 let process_broker = process_broker_outer;
-                let mut child = codex_app_server()?;
+                let mut child = codex_app_server_at(request.app_server_path.as_deref())?;
                 let stdin_raw = child
                     .stdin
                     .take()
@@ -3596,27 +3745,21 @@ pub(crate) async fn execute_agent_internal(
                     Duration::from_secs(10),
                 )?;
 
-                let run_workspace = request.run_id.as_deref().unwrap_or("legacy");
-                let workspace = if let Some(target) = request
-                    .target_workspace
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
-                    PathBuf::from(target)
-                } else if request.workspace_policy == "workflow" {
-                    app_data_dir()
-                        .join("workspaces")
-                        .join(run_workspace)
-                        .join("workflow-shared")
-                } else {
-                    app_data_dir()
-                        .join("workspaces")
-                        .join(run_workspace)
-                        .join(&request.node_id)
-                        .join(request.attempt_id.as_deref().unwrap_or("legacy"))
-                };
+                let workspace = resolve_agent_working_directory(&request);
                 std::fs::create_dir_all(&workspace).map_err(|error| error.to_string())?;
+                let skill_cwds = skill_discovery_cwds(&request, &workspace);
+                let skill_inputs = if request.skills.is_empty() {
+                    Vec::new()
+                } else {
+                    send_json_timed(
+                        &stdin,
+                        json!({"jsonrpc":"2.0","id":10,"method":"skills/list","params":{"cwds":skill_cwds,"forceReload":false}}),
+                        Duration::from_secs(10),
+                    )?;
+                    let skills_result =
+                        read_response(10, &line_rx, &app, &request.node_id, &child)?;
+                    resolve_skill_inputs(&skills_result, &request.skills)?
+                };
                 // Pass model id through as provided by model/list (no mock aliases).
                 let model = normalize_model_id(&request.model);
                 let approval_policy = match request.approval_policy.as_str() {
@@ -3694,6 +3837,7 @@ pub(crate) async fn execute_agent_internal(
                     &model,
                     &composed,
                     output_schema,
+                    &skill_inputs,
                 );
                 send_json_timed(
                     &stdin,
@@ -3708,15 +3852,7 @@ pub(crate) async fn execute_agent_internal(
                     .to_string();
                 let mut message = String::new();
                 let mut total_tokens: u64 = 0;
-                // Hard wall-clock kill so a stalled turn always frees the invoke.
-                // Never wait() while holding the mutex — that deadlocks kill paths.
-                let watchdog_child = Arc::clone(&child);
-                std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_secs(EXECUTE_AGENT_WALL_SECS));
-                    kill_app_server_child(&watchdog_child);
-                });
-                let turn_deadline =
-                    std::time::Instant::now() + Duration::from_secs(EXECUTE_AGENT_WALL_SECS);
+                let turn_deadline = std::time::Instant::now() + Duration::from_secs(wall_secs);
                 loop {
                     let idle = Duration::from_secs(TURN_IDLE_SECS)
                         .min(turn_deadline.saturating_duration_since(std::time::Instant::now()));
@@ -4049,7 +4185,8 @@ pub(crate) async fn execute_agent_internal(
             ));
             let _ = done_tx.send(result);
         });
-        let hard = Duration::from_secs(EXECUTE_AGENT_WALL_SECS + 30);
+        let hard_secs = outer_agent_deadline_seconds(wall_secs);
+        let hard = Duration::from_secs(hard_secs);
         let out = match done_rx.recv_timeout(hard) {
             Ok(result) => {
                 agent_trace(&format!(
@@ -4060,9 +4197,17 @@ pub(crate) async fn execute_agent_internal(
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 agent_trace(&format!("spawn_blocking HARD_DEADLINE node={node_for_log}"));
+                if let Some(child) = timeout_broker
+                    .0
+                    .lock()
+                    .ok()
+                    .and_then(|processes| processes.get(&timeout_process_key).cloned())
+                {
+                    kill_app_server_child(&child);
+                }
                 Err(format!(
                     "execute_agent hard-deadline ({}s) exceeded",
-                    EXECUTE_AGENT_WALL_SECS + 30
+                    hard_secs
                 ))
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -4292,6 +4437,8 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn mcp_auto_start_parse_defaults_and_opt_out() {
@@ -4328,9 +4475,12 @@ mod tests {
             personality: Some("pragmatic".into()),
             workspace_policy: "isolated".into(),
             target_workspace: None,
+            timeout_seconds: 120,
             output_schema: None,
             tools: Vec::new(),
+            skills: Vec::new(),
             tool_boundary: String::new(),
+            app_server_path: None,
         }
     }
 
@@ -4356,12 +4506,195 @@ mod tests {
             "gpt-test",
             "input",
             default_agent_output_schema(),
+            &[],
         );
         assert_eq!(turn["collaborationMode"]["mode"], "plan");
         assert_eq!(
             turn["collaborationMode"]["settings"]["reasoning_effort"],
             "medium"
         );
+    }
+
+    #[test]
+    fn outer_agent_deadline_keeps_cleanup_slack() {
+        assert_eq!(outer_agent_deadline_seconds(10), 40);
+        assert_eq!(outer_agent_deadline_seconds(1800), 1830);
+    }
+
+    #[test]
+    fn isolated_workspace_keeps_selected_run_root_out_of_cwd() {
+        let mut request = capability_request();
+        request.target_workspace = Some("C:/operator-selected-workspace".into());
+        let cwd = resolve_agent_working_directory(&request);
+        assert_ne!(cwd, PathBuf::from("C:/operator-selected-workspace"));
+        assert!(cwd.ends_with(Path::new("run-1/planner/attempt-1")));
+
+        let thread =
+            build_agent_thread_start_params(&request, "gpt-test", &cwd, "never", "read-only");
+        assert_eq!(thread["cwd"], json!(cwd));
+        assert_eq!(
+            thread["runtimeWorkspaceRoots"],
+            json!(["C:/operator-selected-workspace"])
+        );
+        let skill_cwds = skill_discovery_cwds(&request, &cwd);
+        assert!(skill_cwds
+            .iter()
+            .any(|candidate| candidate == &cwd.to_string_lossy()));
+        assert!(skill_cwds
+            .iter()
+            .any(|candidate| candidate == "C:/operator-selected-workspace"));
+        let inventory_cwd = std::env::current_dir().unwrap();
+        assert!(skill_cwds
+            .iter()
+            .any(|candidate| candidate == &inventory_cwd.to_string_lossy()));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn custom_cmd_paths_are_quoted_for_cmd_metacharacters() {
+        let command = command_for_codex(
+            Path::new(r"C:\Tools\Codex&Preview\codex.cmd"),
+            &["app-server", "--stdio"],
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            vec![
+                "/d",
+                "/s",
+                "/c",
+                r#""C:\Tools\Codex&Preview\codex.cmd" app-server --stdio"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn selected_skills_become_real_app_server_inputs() {
+        let listed = json!({"data":[{"skills":[
+            {"name":"imagegen","path":"C:/skills/imagegen/SKILL.md","enabled":true},
+            {"name":"disabled","path":"C:/skills/disabled/SKILL.md","enabled":false}
+        ]}]});
+        let inputs = resolve_skill_inputs(&listed, &["imagegen".into()]).unwrap();
+        assert_eq!(
+            inputs,
+            vec![json!({"type":"skill","name":"imagegen","path":"C:/skills/imagegen/SKILL.md"})]
+        );
+        assert!(resolve_skill_inputs(&listed, &["missing".into()])
+            .unwrap_err()
+            .contains("not available"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn fake_app_server_captures_execution_contract_end_to_end() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "codex-corp-fake-app-server-{}-{unique}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        let log_path = root.join("requests.jsonl");
+        let script_path = root.join("fake-app-server.cjs");
+        let command_path = root.join("fake-codex.cmd");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let log_literal = serde_json::to_string(&log_path.to_string_lossy()).unwrap();
+        let skill_path = root.join("skills").join("imagegen").join("SKILL.md");
+        let skill_literal = serde_json::to_string(&skill_path.to_string_lossy()).unwrap();
+        let script = format!(
+            r#"const fs = require('fs');
+const readline = require('readline');
+const logPath = {log_literal};
+const skillPath = {skill_literal};
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\n');
+readline.createInterface({{ input: process.stdin }}).on('line', (line) => {{
+  const request = JSON.parse(line);
+  fs.appendFileSync(logPath, JSON.stringify(request) + '\n');
+  if (request.method === 'initialize') send({{ jsonrpc:'2.0', id:request.id, result:{{}} }});
+  else if (request.method === 'skills/list') send({{ jsonrpc:'2.0', id:request.id, result:{{ data:[{{ skills:[{{ name:'imagegen', path:skillPath, enabled:true }}] }}] }} }});
+  else if (request.method === 'thread/start') send({{ jsonrpc:'2.0', id:request.id, result:{{ thread:{{ id:'thread-fake' }} }} }});
+  else if (request.method === 'turn/start') {{
+    send({{ jsonrpc:'2.0', id:request.id, result:{{ turn:{{ id:'turn-fake' }} }} }});
+    send({{ jsonrpc:'2.0', method:'item/completed', params:{{ item:{{ type:'agentMessage', text:'{{"status":"success","summary":"fake done","data":{{"payload":"{{}}"}},"artifacts":[]}}' }} }} }});
+    send({{ jsonrpc:'2.0', method:'turn/completed', params:{{ turn:{{ id:'turn-fake' }} }} }});
+  }}
+}});"#
+        );
+        std::fs::write(&script_path, script).unwrap();
+        let node = find_node_exe().expect("Node.js is required for the fake app-server harness");
+        std::fs::write(
+            &command_path,
+            format!(
+                "@echo off\r\n\"{}\" \"{}\" %*\r\n",
+                node.display(),
+                script_path.display()
+            ),
+        )
+        .unwrap();
+
+        let mut request = capability_request();
+        request.model = "gpt-5.6-luna".into();
+        request.effort = "medium".into();
+        request.permission_profile = None;
+        request.sandbox_profile = "workspace-write".into();
+        request.approval_policy = "never".into();
+        request.workspace_policy = "workflow".into();
+        request.target_workspace = Some(workspace.to_string_lossy().into_owned());
+        request.timeout_seconds = 10;
+        request.output_schema = Some(default_agent_output_schema());
+        request.skills = vec!["imagegen".into()];
+        request.tools = vec!["Shell".into()];
+        request.app_server_path = Some(command_path);
+        let result = tauri::async_runtime::block_on(execute_agent_internal(
+            request,
+            None,
+            ApprovalBroker(Arc::new(Mutex::new(HashMap::new()))),
+            ProcessBroker(Arc::new(Mutex::new(HashMap::new()))),
+            Arc::new(AtomicU64::new(0)),
+        ))
+        .unwrap();
+        assert_eq!(result.summary, "fake done");
+
+        let requests = std::fs::read_to_string(&log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let thread = requests
+            .iter()
+            .find(|request| request["method"] == "thread/start")
+            .unwrap();
+        assert_eq!(thread["params"]["model"], "gpt-5.6-luna");
+        assert_eq!(thread["params"]["approvalPolicy"], "never");
+        assert_eq!(thread["params"]["sandbox"], "workspace-write");
+        assert_eq!(
+            thread["params"]["cwd"],
+            workspace.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            thread["params"]["runtimeWorkspaceRoots"][0],
+            workspace.to_string_lossy().as_ref()
+        );
+        assert_eq!(thread["params"]["baseInstructions"], "Plan carefully");
+        assert_eq!(
+            thread["params"]["developerInstructions"],
+            "Stay on mission."
+        );
+        let turn = requests
+            .iter()
+            .find(|request| request["method"] == "turn/start")
+            .unwrap();
+        assert_eq!(turn["params"]["effort"], "medium");
+        assert_eq!(turn["params"]["collaborationMode"]["mode"], "plan");
+        assert_eq!(turn["params"]["input"][0]["type"], "skill");
+        assert_eq!(turn["params"]["input"][0]["name"], "imagegen");
+        assert!(turn["params"]["outputSchema"].is_object());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -4402,6 +4735,7 @@ mod tests {
             "gpt-test",
             "input",
             default_agent_output_schema(),
+            &[],
         );
         assert!(turn.get("collaborationMode").is_none());
     }

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import {
   BarChart3,
   DollarSign,
@@ -39,18 +40,23 @@ export function DashboardsPage({
   const [revision, setRevision] = useState(0);
   const [finance, setFinance] = useState<FinanceEntry[]>([]);
   const [feedback, setFeedback] = useState<DashboardFeedback[]>([]);
+  const [costPer1k, setCostPer1k] = useState<number | undefined>(undefined);
   useEffect(() => {
     let cancelled = false;
     void Promise.all([
       listFinanceEntriesPersisted(),
       listDashboardFeedbackPersisted(),
-    ]).then(([nextFinance, nextFeedback]) => {
+      isTauri() ? invoke<any>("get_app_settings").catch(() => null) : Promise.resolve(null),
+    ]).then(([nextFinance, nextFeedback, settings]) => {
       if (!cancelled) {
         setFinance(nextFinance);
         setFeedback(nextFeedback);
         setBriefing(
           (current) => current || nextFeedback[0]?.operatorMessage || "",
         );
+        if (settings && typeof settings.costPer1kTokensUsd === "number") {
+          setCostPer1k(settings.costPer1kTokensUsd);
+        }
       }
     });
     return () => {
@@ -59,8 +65,8 @@ export function DashboardsPage({
   }, [revision]);
   const snapshot = useMemo(
     () =>
-      aggregateDashboard(runHistory, finance, undefined, portfolioRunSummaries),
-    [runHistory, finance, portfolioRunSummaries],
+      aggregateDashboard(runHistory, finance, costPer1k, portfolioRunSummaries),
+    [runHistory, finance, costPer1k, portfolioRunSummaries],
   );
   const workflows = useMemo(
     () => listWorkflows({ includeDrafts: true }),
@@ -150,8 +156,11 @@ export function DashboardsPage({
             <div>
               <h3>Per-workflow burn & P&amp;L</h3>
               <p>
-                Tokens from all persisted runs · cost is a rough $0.01/1K-token
-                estimate and is not included in entered expenses
+                Tokens from all persisted runs · cost is a rough {
+                  costPer1k !== undefined
+                    ? `$${costPer1k.toFixed(3)}`
+                    : "$0.01"
+                }/1K-token estimate and is not included in entered expenses
               </p>
             </div>
           </header>

@@ -1,4 +1,5 @@
 import type { FlowEdge, FlowNode, ValidationProblem } from "./model";
+import { jsonSchemaDefinitionError } from "./json-schema";
 import { isSpecialistKind } from "./model";
 import { validateConditionRule } from "./condition-rules";
 import { isValidCronExpression, isValidCronTimezone } from "./cron-trigger";
@@ -87,6 +88,32 @@ export function validateWorkflow(
     });
 
   for (const node of nodes) {
+    if (node.data.kind === "agent" || node.data.kind === "creative") {
+      const timeout = node.data.timeoutSeconds ?? 120;
+      if (!Number.isFinite(timeout) || timeout < 10 || timeout > 1800) {
+        problems.push({
+          id: `timeout-${node.id}`,
+          severity: "error",
+          nodeId: node.id,
+          message: `${node.data.label} timeout must be between 10 and 1800 seconds.`,
+        });
+      }
+      const readOnly =
+        node.data.permissionProfile?.includes("read-only") ||
+        (!node.data.permissionProfile &&
+          node.data.sandboxProfile === "read-only");
+      if (
+        readOnly &&
+        node.data.tools.some((tool) => tool.toLowerCase().includes("write"))
+      ) {
+        problems.push({
+          id: `write-boundary-${node.id}`,
+          severity: "error",
+          nodeId: node.id,
+          message: `${node.data.label} cannot prefer write capability under a read-only boundary.`,
+        });
+      }
+    }
     if (node.data.kind === "cron") {
       if (!isValidCronExpression(node.data.cronExpression ?? "")) {
         problems.push({
@@ -320,16 +347,14 @@ export function validateWorkflow(
       ["input", node.data.inputSchema],
       ["output", node.data.outputSchema],
     ] as const) {
-      if (!schema) continue;
-      try {
-        const parsed = JSON.parse(schema);
-        if (!parsed || parsed.type !== "object") throw new Error();
-      } catch {
+      if (!schema?.trim()) continue;
+      const error = jsonSchemaDefinitionError(schema);
+      if (error) {
         problems.push({
           id: `${label}-schema-${node.id}`,
           severity: "error",
           nodeId: node.id,
-          message: `${node.data.label} has an invalid ${label} JSON Schema.`,
+          message: `${node.data.label} has an invalid ${label} JSON Schema: ${error}.`,
         });
       }
     }

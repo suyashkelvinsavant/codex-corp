@@ -144,6 +144,36 @@ Output contract
     expect(builder?.data.prompt.toLowerCase()).not.toBe("todo");
   });
 
+  it("defaults newly added specialist nodes to GPT-5.6 Luna medium", async () => {
+    let saved: WorkflowTemplate | undefined;
+    const result = await executeWorkflowArchitectTool(
+      "workflow_add_node",
+      {
+        id: "software-company",
+        node: {
+          id: "researcher-2",
+          label: "Researcher 2",
+          role: "Researcher",
+          kind: "agent",
+          prompt:
+            "Research the assigned question, verify claims against primary sources, document uncertainty, and return concise evidence with source attribution for downstream specialists.",
+        },
+      },
+      {
+        save: (workflow) => {
+          saved = workflow;
+        },
+        remove: vi.fn(),
+        open: vi.fn(),
+      },
+    );
+
+    expect(result.success).toBe(true);
+    const node = saved?.nodes.find((item) => item.id === "researcher-2");
+    expect(node?.data.model).toBe("gpt-5.6-luna");
+    expect(node?.data.effort).toBe("medium");
+  });
+
   it("requires confirmation before deleting a workflow or node", async () => {
     const actions = { save: vi.fn(), remove: vi.fn(), open: vi.fn() };
     const workflow = await executeWorkflowArchitectTool(

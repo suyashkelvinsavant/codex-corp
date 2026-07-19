@@ -4,6 +4,7 @@ import {
   parseRunRecords,
   parseWorkflowSnapshot,
   rehydrateRunRecord,
+  serializeWorkflowSnapshot,
   shouldApplyAutoloadSnapshot,
   shouldAutosaveBeforeTemplateSwitch,
   shouldReplaceEdgesFromRun,
@@ -43,7 +44,61 @@ describe("persistence helpers", () => {
     expect(good?.nodes).toHaveLength(1);
     expect(parseWorkflowSnapshot(null)).toBeNull();
     expect(parseWorkflowSnapshot("{")).toBeNull();
-    expect(parseWorkflowSnapshot(JSON.stringify({ nodes: [], edges: [] }))).toBeNull();
+    expect(
+      parseWorkflowSnapshot(JSON.stringify({ nodes: [], edges: [] })),
+    ).toBeNull();
+  });
+
+  it("normalizes legacy specialist settings without changing revision edges", () => {
+    const legacy = node("agent");
+    Object.assign(legacy.data, {
+      memoryMode: "persistent",
+      environmentVariables: ["SECRET"],
+      maxRevisions: 9,
+      workspacePolicy: "custom",
+      requiresApproval: true,
+    });
+    const snapshot = parseWorkflowSnapshot(
+      JSON.stringify({
+        nodes: [legacy],
+        edges: [
+          {
+            id: "revision",
+            source: "review",
+            target: "agent",
+            data: { edgeType: "revision", maxRevisions: 4 },
+          },
+        ],
+      }),
+    );
+    expect(snapshot?.schemaVersion).toBe(2);
+    expect(snapshot?.nodes[0].data.workspacePolicy).toBe("isolated");
+    expect(snapshot?.nodes[0].data).not.toHaveProperty("memoryMode");
+    expect(snapshot?.nodes[0].data).not.toHaveProperty("environmentVariables");
+    expect(snapshot?.nodes[0].data).not.toHaveProperty("maxRevisions");
+    expect(snapshot?.nodes[0].data.requiresApproval).toBe(false);
+    expect(snapshot?.migrationNotices).toHaveLength(1);
+    expect(snapshot?.edges[0].data?.maxRevisions).toBe(4);
+  });
+
+  it("preserves the durable approval gate in schema-version 2 snapshots", () => {
+    const specialist = node("agent");
+    specialist.data.requiresApproval = true;
+    const snapshot = parseWorkflowSnapshot(
+      JSON.stringify({ schemaVersion: 2, nodes: [specialist], edges: [] }),
+    );
+    expect(snapshot?.nodes[0].data.requiresApproval).toBe(true);
+    expect(snapshot?.migrationNotices).toBeUndefined();
+  });
+
+  it("serializes current snapshots as v2 and rejects unknown future versions", () => {
+    const raw = serializeWorkflowSnapshot([node("agent")], []);
+    expect(JSON.parse(raw).schemaVersion).toBe(2);
+    expect(
+      parseWorkflowSnapshot(
+        JSON.stringify({ schemaVersion: 3, nodes: [node("agent")], edges: [] }),
+      ),
+    ).toBeNull();
   });
 
   it("builds persisted run nodes with statuses, structured data, and artifacts", () => {
@@ -53,7 +108,11 @@ describe("persistence helpers", () => {
       node("output", "output"),
     ];
     const outputs = {
-      input: { summary: "Mission text", data: { isolated: true }, artifacts: [] },
+      input: {
+        summary: "Mission text",
+        data: { isolated: true },
+        artifacts: [],
+      },
       builder: {
         summary: "Built app",
         data: { modules: ["CaptureShell"] },
@@ -81,7 +140,12 @@ describe("persistence helpers", () => {
       },
     };
     const completed = new Set(["input", "builder", "output"]);
-    const snapshot = buildPersistedRunNodes(base, outputs, completed, new Set());
+    const snapshot = buildPersistedRunNodes(
+      base,
+      outputs,
+      completed,
+      new Set(),
+    );
     const byId = Object.fromEntries(snapshot.map((n) => [n.id, n]));
     expect(byId.builder.data.status).toBe("completed");
     expect(byId.builder.data.output).toBe("Built app");
@@ -89,7 +153,9 @@ describe("persistence helpers", () => {
       modules: ["CaptureShell"],
     });
     expect(byId.builder.data.artifacts?.[0]?.name).toBe("app-shell.tsx");
-    expect(byId.output.data.artifacts?.[0]?.content).toContain("specialistHandoffs");
+    expect(byId.output.data.artifacts?.[0]?.content).toContain(
+      "specialistHandoffs",
+    );
     expect(byId.builder.data.threadId).toBe("019f-live-builder-thread");
   });
 
@@ -105,7 +171,8 @@ describe("persistence helpers", () => {
               id: "d",
               name: "delivery-bundle.json",
               kind: "json",
-              content: '{"schemaVersion":"codex-corp.delivery.v1","mission":"m"}',
+              content:
+                '{"schemaVersion":"codex-corp.delivery.v1","mission":"m"}',
             },
           ],
         },
@@ -196,18 +263,33 @@ describe("persistence helpers", () => {
 
   it("autosaves only when leaving a different idle template", () => {
     expect(
-      shouldAutosaveBeforeTemplateSwitch("software-company", "idea-validation", false),
+      shouldAutosaveBeforeTemplateSwitch(
+        "software-company",
+        "idea-validation",
+        false,
+      ),
     ).toBe(true);
     expect(
-      shouldAutosaveBeforeTemplateSwitch("software-company", "software-company", false),
+      shouldAutosaveBeforeTemplateSwitch(
+        "software-company",
+        "software-company",
+        false,
+      ),
     ).toBe(false);
     expect(
-      shouldAutosaveBeforeTemplateSwitch("software-company", "idea-validation", true),
+      shouldAutosaveBeforeTemplateSwitch(
+        "software-company",
+        "idea-validation",
+        true,
+      ),
     ).toBe(false);
   });
 
   it("builds a clean timeline baseline for template switches", () => {
-    const baseline = templateSwitchBaselineEvents("Conditional launch review", "t0");
+    const baseline = templateSwitchBaselineEvents(
+      "Conditional launch review",
+      "t0",
+    );
     expect(baseline).toHaveLength(1);
     expect(baseline[0].type).toBe("workflow.template");
     expect(baseline[0].message).toContain("Conditional launch review");

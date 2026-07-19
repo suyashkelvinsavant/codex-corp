@@ -1,4 +1,5 @@
 import type { FlowEdge, FlowNode, Kind } from "../model";
+import { DEFAULT_NODE_EFFORT, DEFAULT_NODE_MODEL_ID } from "../codex-models";
 import { defaultPlatformCriteria } from "../completion-criteria";
 import { kindPopColor } from "../kind-colors";
 import { instantiatePackById } from "./instantiate";
@@ -110,8 +111,8 @@ function packNode(
       role: inst.role,
       kind: inst.kind,
       status: "idle",
-      model: "",
-      effort: "low",
+      model: DEFAULT_NODE_MODEL_ID,
+      effort: DEFAULT_NODE_EFFORT,
       tools: inst.tools,
       skills: inst.skills,
       packId: inst.packId,
@@ -123,7 +124,6 @@ function packNode(
       duration: "—",
       tokens: 0,
       trace: ["Template seed"],
-      maxRevisions: 2,
       maxRetries: 2,
       timeoutSeconds: 120,
       completionCriteria: inst.completionCriteria ?? defaultPlatformCriteria(),

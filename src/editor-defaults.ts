@@ -1,6 +1,3 @@
-/** Empty until live Codex model/list provides a default. */
-export const modelDefault = "";
-
 export const defaultInputSchema = JSON.stringify(
   {
     type: "object",

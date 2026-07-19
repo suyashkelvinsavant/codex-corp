@@ -24,13 +24,13 @@ import {
   X,
 } from "lucide-react";
 import {
-  defaultModelFromList,
+  defaultNodeEffortForModel,
+  defaultNodeModelFromList,
   effortsForModel,
   normalizeStoredModelId,
   type CodexModelOption,
 } from "./codex-models";
 import {
-  mcpStatusLabel,
   permissionGrantLabel,
   STANDARD_TOOL_LABELS,
   toolsUiHelperText,
@@ -65,10 +65,18 @@ import {
   constraintsToTextarea,
 } from "./mission-context";
 import { defaultOutputSchemaJson as defaultOutputSchema } from "./agent-output-schema";
-import { defaultInputSchema, modelDefault } from "./editor-defaults";
-import type { AgentData, Artifact, FlowEdge, FlowNode, Kind } from "./model";
+import { defaultInputSchema } from "./editor-defaults";
+import type {
+  AgentData,
+  Artifact,
+  FlowEdge,
+  FlowNode,
+  Kind,
+  RunEvent,
+} from "./model";
 import { Metric } from "./metric";
 import { CONTROL_KINDS, controlKindLabel, statusText } from "./node-display";
+import { composeSpecialistInputPreview } from "./specialist-input";
 
 const ConnectorRuntimePanel = lazy(() =>
   import("./connector-runtime-panel").then((module) => ({
@@ -104,6 +112,9 @@ export function NodeInspector({
   upstream,
   upstreamNodes,
   revisionNodes,
+  inboundEdges,
+  workflowInput,
+  events,
   downstream,
   run,
   duplicate,
@@ -124,6 +135,9 @@ export function NodeInspector({
   upstream: number;
   upstreamNodes: FlowNode[];
   revisionNodes: FlowNode[];
+  inboundEdges: FlowEdge[];
+  workflowInput: string;
+  events: RunEvent[];
   downstream: number;
   run: () => void;
   duplicate: () => void;
@@ -131,6 +145,7 @@ export function NodeInspector({
   interrupt: () => void;
 }) {
   const d = node.data;
+  const nodeEvents = events.filter((event) => event.nodeId === node.id);
   const modelId = normalizeStoredModelId(d.model);
   const effortOptions = effortsForModel(availableModels, modelId);
 
@@ -151,6 +166,9 @@ export function NodeInspector({
         upstream={upstream}
         upstreamNodes={upstreamNodes}
         revisionNodes={revisionNodes}
+        inboundEdges={inboundEdges}
+        workflowInput={workflowInput}
+        events={events}
         downstream={downstream}
         run={run}
         duplicate={duplicate}
@@ -278,17 +296,17 @@ export function NodeInspector({
   ];
   const resetConfiguration = () =>
     update({
-      model: defaultModelFromList(availableModels) || modelDefault,
-      effort: "low",
+      model: defaultNodeModelFromList(availableModels),
+      effort: defaultNodeEffortForModel(
+        availableModels,
+        defaultNodeModelFromList(availableModels),
+      ),
       timeoutSeconds: 120,
       maxRetries: 2,
-      maxRevisions: 2,
-      memoryMode: "none",
       workspacePolicy: "isolated",
       sandboxProfile: "workspace-write",
       approvalPolicy: "on-request",
       requiresApproval: false,
-      environmentVariables: [],
       inputSchema: defaultInputSchema,
       outputSchema: defaultOutputSchema,
     });
@@ -378,10 +396,7 @@ export function NodeInspector({
                 label="Retry count"
                 value={`${d.retries ?? 0} / ${d.maxRetries ?? 2}`}
               />
-              <Metric
-                label="Revision count"
-                value={`${d.revisions || 0} / ${d.maxRevisions ?? 2}`}
-              />
+              <Metric label="Revision count" value={String(d.revisions || 0)} />
             </Section>
           </>
         )}
@@ -422,6 +437,8 @@ export function NodeInspector({
               criteria={d.completionCriteria}
               evaluation={resolveCriteriaEvaluation(d)}
               onChange={(completionCriteria) => update({ completionCriteria })}
+              hardCriteriaGate={d.hardCriteriaGate}
+              onGateChange={(hardCriteriaGate) => update({ hardCriteriaGate })}
             />
           </>
         )}
@@ -470,24 +487,12 @@ export function NodeInspector({
             <Section title="Composed context">
               <pre>
                 {JSON.stringify(
-                  {
-                    nodeId: node.id,
-                    thread: "fresh",
-                    model: d.model,
-                    reasoningEffort: d.effort,
-                    upstreamOutputs: upstreamNodes.map((source) => ({
-                      nodeId: source.id,
-                      summary: source.data.output ?? null,
-                      data: source.data.structuredOutput ?? null,
-                      artifacts: source.data.artifacts ?? [],
-                    })),
-                    revisionFeedback: revisionNodes.map((source) => ({
-                      nodeId: source.id,
-                      feedback: source.data.output ?? null,
-                    })),
-                    memory: "none",
-                    tools: d.tools,
-                  },
+                  composeSpecialistInputPreview(
+                    workflowInput,
+                    node.id,
+                    upstreamNodes,
+                    inboundEdges,
+                  ),
                   null,
                   2,
                 )}
@@ -619,21 +624,29 @@ export function NodeInspector({
                 label="Approval policy"
                 value={d.approvalPolicy ?? "On request"}
               />
-              <Metric label="MCP servers" value={mcpStatusLabel(d.tools)} />
               <Metric
                 label="Tool enforcement"
                 value="Advisory prompt + app-server sandbox/approvals"
               />
             </Section>
             <Section title="Tool-call history">
-              {d.trace.filter((item) => /tool|shell|command|file/i.test(item))
-                .length ? (
-                d.trace
-                  .filter((item) => /tool|shell|command|file/i.test(item))
-                  .map((item, index) => (
-                    <div className="artifact-row" key={`${item}-${index}`}>
+              {nodeEvents.filter((item) =>
+                /tool|shell|command|file/i.test(`${item.type} ${item.message}`),
+              ).length ? (
+                nodeEvents
+                  .filter((item) =>
+                    /tool|shell|command|file/i.test(
+                      `${item.type} ${item.message}`,
+                    ),
+                  )
+                  .map((item) => (
+                    <div className="artifact-row" key={item.id}>
                       <Terminal size={13} />
-                      {item}
+                      {item.message}
+                      <small>
+                        {item.itemType ?? item.type} ·{" "}
+                        {item.status ?? item.level ?? "recorded"}
+                      </small>
                     </div>
                   ))
               ) : (
@@ -645,15 +658,28 @@ export function NodeInspector({
         {tab === "trace" && (
           <Section title="Execution trace">
             <div className="trace">
-              {d.trace.map((t, i) => (
-                <div key={`${t}-${i}`}>
-                  <span className={i === d.trace.length - 1 ? "active" : ""} />
+              {nodeEvents.map((event, i) => (
+                <div key={event.id}>
+                  <span
+                    className={i === nodeEvents.length - 1 ? "active" : ""}
+                  />
                   <div>
-                    <b>{t}</b>
-                    <small>{i * 180}ms</small>
+                    <b>{event.message}</b>
+                    <small>
+                      {new Date(event.at).toLocaleTimeString()} ·{" "}
+                      {event.elapsedMs !== undefined
+                        ? `${event.elapsedMs}ms · `
+                        : ""}
+                      {event.status ?? event.level ?? event.type}
+                    </small>
                   </div>
                 </div>
               ))}
+              {!nodeEvents.length && (
+                <p className="helper">
+                  No runtime events recorded for this node.
+                </p>
+              )}
             </div>
           </Section>
         )}
@@ -788,22 +814,7 @@ export function NodeInspector({
                 </select>
               </label>
               <label>
-                Memory mode
-                <select
-                  value={d.memoryMode ?? "none"}
-                  onChange={(e) =>
-                    update({
-                      memoryMode: e.target.value as AgentData["memoryMode"],
-                    })
-                  }
-                >
-                  <option value="none">None — isolated</option>
-                  <option value="workflow">Workflow scoped</option>
-                  <option value="persistent">Selected persistent memory</option>
-                </select>
-              </label>
-              <label>
-                Working-directory policy
+                Working directory (sandbox remains authoritative)
                 <select
                   value={d.workspacePolicy ?? "isolated"}
                   onChange={(e) =>
@@ -813,10 +824,20 @@ export function NodeInspector({
                     })
                   }
                 >
-                  <option value="isolated">Unique node workspace</option>
-                  <option value="workflow">Shared workflow workspace</option>
-                  <option value="custom">Custom allowed workspace</option>
+                  <option value="isolated">
+                    Isolated node attempt directory
+                  </option>
+                  <option value="workflow">
+                    Run-selected workflow directory
+                  </option>
                 </select>
+                {(d.workspacePolicy ?? "isolated") === "isolated" && (
+                  <small>
+                    Uses an app-managed node/attempt directory. The run-selected
+                    workspace remains available only as an authorized runtime
+                    root; it does not become this node's working directory.
+                  </small>
+                )}
               </label>
               <label>
                 Timeout (seconds)
@@ -842,18 +863,6 @@ export function NodeInspector({
                   }
                 />
               </label>
-              <label>
-                Maximum revisions
-                <input
-                  type="number"
-                  min="0"
-                  max="10"
-                  value={d.maxRevisions ?? 2}
-                  onChange={(e) =>
-                    update({ maxRevisions: Number(e.target.value) })
-                  }
-                />
-              </label>
               <label className="toggle-row">
                 <input
                   type="checkbox"
@@ -862,22 +871,7 @@ export function NodeInspector({
                     update({ requiresApproval: e.target.checked })
                   }
                 />
-                Require approval before downstream execution
-              </label>
-              <label>
-                Environment-variable names
-                <textarea
-                  value={(d.environmentVariables ?? []).join("\n")}
-                  placeholder="API_BASE_URL\nPROJECT_ID"
-                  onChange={(e) =>
-                    update({
-                      environmentVariables: e.target.value
-                        .split(/\r?\n/)
-                        .map((name) => name.trim())
-                        .filter(Boolean),
-                    })
-                  }
-                />
+                Require durable operator approval after successful verification
               </label>
             </Section>
           </>
@@ -948,6 +942,9 @@ function CreativeNodeInspector({
   upstream,
   upstreamNodes,
   revisionNodes,
+  inboundEdges,
+  workflowInput,
+  events,
   downstream,
   run,
   duplicate,
@@ -968,6 +965,9 @@ function CreativeNodeInspector({
   upstream: number;
   upstreamNodes: FlowNode[];
   revisionNodes: FlowNode[];
+  inboundEdges: FlowEdge[];
+  workflowInput: string;
+  events: RunEvent[];
   downstream: number;
   run: () => void;
   duplicate: () => void;
@@ -975,6 +975,7 @@ function CreativeNodeInspector({
   interrupt: () => void;
 }) {
   const d = node.data;
+  const nodeEvents = events.filter((event) => event.nodeId === node.id);
   const modelId = normalizeStoredModelId(d.model);
   const effortOptions = effortsForModel(availableModels, modelId);
   const primary = resolveActiveSkill(d.skills, d.activeSkill);
@@ -982,18 +983,32 @@ function CreativeNodeInspector({
   const creativeTabs = [
     "overview",
     "skills",
+    "tools",
     "instructions",
     "context",
     "io",
     "trace",
     "config",
   ] as const;
-  const activeTab =
-    tab === "tools"
-      ? "skills"
-      : creativeTabs.includes(tab as (typeof creativeTabs)[number])
-        ? tab
-        : "overview";
+  const activeTab = creativeTabs.includes(tab as (typeof creativeTabs)[number])
+    ? tab
+    : "overview";
+  const resetConfiguration = () =>
+    update({
+      model: defaultNodeModelFromList(availableModels),
+      effort: defaultNodeEffortForModel(
+        availableModels,
+        defaultNodeModelFromList(availableModels),
+      ),
+      timeoutSeconds: 120,
+      maxRetries: 2,
+      workspacePolicy: "isolated",
+      sandboxProfile: "workspace-write",
+      approvalPolicy: "on-request",
+      requiresApproval: false,
+      inputSchema: defaultInputSchema,
+      outputSchema: defaultOutputSchema,
+    });
 
   const exportOutput = () => {
     const payload = JSON.stringify(
@@ -1110,6 +1125,11 @@ function CreativeNodeInspector({
                 update({ skills, activeSkill })
               }
             />
+          </>
+        )}
+
+        {activeTab === "tools" && (
+          <>
             <ConnectorToolPicker
               context={`${d.role} ${d.description} ${d.prompt}`}
               tools={capabilities.tools}
@@ -1118,6 +1138,34 @@ function CreativeNodeInspector({
               error={capabilitiesError}
               onChange={(connectorTools) => update({ connectorTools })}
             />
+            <Section title="Preferred capabilities">
+              {STANDARD_TOOL_LABELS.map((tool) => {
+                const granted = d.tools.some(
+                  (item) => item.toLowerCase() === tool.toLowerCase(),
+                );
+                return (
+                  <button
+                    className="permission"
+                    key={tool}
+                    onClick={() =>
+                      update({
+                        tools: granted
+                          ? d.tools.filter(
+                              (item) =>
+                                item.toLowerCase() !== tool.toLowerCase(),
+                            )
+                          : [...d.tools, tool],
+                      })
+                    }
+                  >
+                    <Wrench size={13} />
+                    <span>{tool}</span>
+                    <b>{permissionGrantLabel(tool, granted)}</b>
+                  </button>
+                );
+              })}
+              <p className="helper">{toolsUiHelperText()}</p>
+            </Section>
           </>
         )}
 
@@ -1155,6 +1203,8 @@ function CreativeNodeInspector({
               criteria={d.completionCriteria}
               evaluation={resolveCriteriaEvaluation(d)}
               onChange={(completionCriteria) => update({ completionCriteria })}
+              hardCriteriaGate={d.hardCriteriaGate}
+              onGateChange={(hardCriteriaGate) => update({ hardCriteriaGate })}
             />
           </>
         )}
@@ -1201,11 +1251,43 @@ function CreativeNodeInspector({
                 {composeCreativeSystemPrompt(d.prompt, d.skills, d.activeSkill)}
               </pre>
             </Section>
+            <Section title="Composed context">
+              <pre>
+                {JSON.stringify(
+                  composeSpecialistInputPreview(
+                    workflowInput,
+                    node.id,
+                    upstreamNodes,
+                    inboundEdges,
+                  ),
+                  null,
+                  2,
+                )}
+              </pre>
+            </Section>
           </>
         )}
 
         {activeTab === "io" && (
           <>
+            <Section title="Input contract">
+              <textarea
+                className="tall schema-editor"
+                value={d.inputSchema ?? defaultInputSchema}
+                onChange={(event) =>
+                  update({ inputSchema: event.target.value })
+                }
+              />
+            </Section>
+            <Section title="Output contract">
+              <textarea
+                className="tall schema-editor"
+                value={d.outputSchema ?? defaultOutputSchema}
+                onChange={(event) =>
+                  update({ outputSchema: event.target.value })
+                }
+              />
+            </Section>
             <Section title="Latest summary">
               <div className="output-card">
                 <span>{d.status}</span>
@@ -1238,15 +1320,28 @@ function CreativeNodeInspector({
         {activeTab === "trace" && (
           <Section title="Execution trace">
             <div className="trace">
-              {d.trace.map((t, i) => (
-                <div key={`${t}-${i}`}>
-                  <span className={i === d.trace.length - 1 ? "active" : ""} />
+              {nodeEvents.map((event, i) => (
+                <div key={event.id}>
+                  <span
+                    className={i === nodeEvents.length - 1 ? "active" : ""}
+                  />
                   <div>
-                    <b>{t}</b>
-                    <small>{i * 180}ms</small>
+                    <b>{event.message}</b>
+                    <small>
+                      {new Date(event.at).toLocaleTimeString()} ·{" "}
+                      {event.elapsedMs !== undefined
+                        ? `${event.elapsedMs}ms · `
+                        : ""}
+                      {event.status ?? event.level ?? event.type}
+                    </small>
                   </div>
                 </div>
               ))}
+              {!nodeEvents.length && (
+                <p className="helper">
+                  No runtime events recorded for this node.
+                </p>
+              )}
             </div>
           </Section>
         )}
@@ -1368,7 +1463,7 @@ function CreativeNodeInspector({
               <label>
                 Approval policy
                 <select
-                  value={d.approvalPolicy ?? "never"}
+                  value={d.approvalPolicy ?? "on-request"}
                   onChange={(e) =>
                     update({
                       approvalPolicy: e.target
@@ -1382,7 +1477,7 @@ function CreativeNodeInspector({
                 </select>
               </label>
               <label>
-                Working-directory policy
+                Working directory (sandbox remains authoritative)
                 <select
                   value={d.workspacePolicy ?? "isolated"}
                   onChange={(e) =>
@@ -1392,10 +1487,54 @@ function CreativeNodeInspector({
                     })
                   }
                 >
-                  <option value="isolated">Unique node workspace</option>
-                  <option value="workflow">Shared workflow workspace</option>
-                  <option value="custom">Custom allowed workspace</option>
+                  <option value="isolated">
+                    Isolated node attempt directory
+                  </option>
+                  <option value="workflow">
+                    Run-selected workflow directory
+                  </option>
                 </select>
+                {(d.workspacePolicy ?? "isolated") === "isolated" && (
+                  <small>
+                    Uses an app-managed node/attempt directory. The run-selected
+                    workspace remains available only as an authorized runtime
+                    root; it does not become this node's working directory.
+                  </small>
+                )}
+              </label>
+              <label>
+                Timeout (seconds)
+                <input
+                  type="number"
+                  min="10"
+                  max="1800"
+                  value={d.timeoutSeconds ?? 120}
+                  onChange={(event) =>
+                    update({ timeoutSeconds: Number(event.target.value) })
+                  }
+                />
+              </label>
+              <label>
+                Maximum retries
+                <input
+                  type="number"
+                  min="0"
+                  max="5"
+                  value={d.maxRetries ?? 2}
+                  onChange={(event) =>
+                    update({ maxRetries: Number(event.target.value) })
+                  }
+                />
+              </label>
+              <label className="toggle-row">
+                <input
+                  type="checkbox"
+                  checked={!!d.requiresApproval}
+                  onChange={(event) =>
+                    update({ requiresApproval: event.target.checked })
+                  }
+                />
+                Require durable operator approval after successful verification
               </label>
             </Section>
           </>
@@ -1409,6 +1548,13 @@ function CreativeNodeInspector({
         <button onClick={duplicate} aria-label="Duplicate creative node">
           <Copy size={14} />
           Duplicate
+        </button>
+        <button
+          onClick={resetConfiguration}
+          aria-label="Reset creative runtime configuration"
+        >
+          <RotateCcw size={14} />
+          Reset
         </button>
         {(d.status === "running" || d.status === "approval") && (
           <button onClick={interrupt} aria-label="Interrupt creative run">
@@ -2212,10 +2358,14 @@ function CompletionCriteriaEditor({
   criteria,
   evaluation,
   onChange,
+  hardCriteriaGate,
+  onGateChange,
 }: {
   criteria: CompletionCriterion[] | undefined;
   evaluation: CriterionEvaluation[] | undefined;
   onChange: (next: CompletionCriterion[]) => void;
+  hardCriteriaGate?: boolean;
+  onGateChange?: (gate: boolean) => void;
 }) {
   const list = ensureCompletionCriteria(criteria);
   const evalById = new Map((evaluation ?? []).map((e) => [e.id, e]));
@@ -2299,6 +2449,17 @@ function CompletionCriteriaEditor({
         evidence only. Post-run chips prefer{" "}
         <code>data.verification.results</code> (runtime SSOT).
       </p>
+      {onGateChange && (
+        <label className="criteria-hard-gate-toggle" style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.75rem", fontSize: "0.875rem", cursor: "pointer" }}>
+          <input
+            type="checkbox"
+            checked={hardCriteriaGate === true}
+            onChange={(e) => onGateChange(e.target.checked)}
+            data-testid="completion-criteria-hard-gate"
+          />
+          <span>Fail run on criteria mismatch (Hard Gate)</span>
+        </label>
+      )}
       <div className="criteria-list" data-testid="completion-criteria-list">
         {list.map((c) => {
           const ev = evalById.get(c.id);
@@ -2511,26 +2672,25 @@ function CompletionCriteriaEditor({
                   </p>
                 </div>
               )}
-              {!c.platform &&
-                (c.kind === "claim" || c.kind === "custom") && (
-                  <div className="criteria-config">
-                    <label>
-                      Evidence guidance (prompt-injected)
-                      <input
-                        value={c.instruction ?? c.label}
-                        onChange={(event) =>
-                          onChange(
-                            patchCriterion(list, c.id, {
-                              instruction: event.target.value,
-                            }),
-                          )
-                        }
-                        placeholder="Describe what evidence the specialist should cite"
-                        aria-label={`Claim guidance for: ${c.label}`}
-                      />
-                    </label>
-                  </div>
-                )}
+              {!c.platform && (c.kind === "claim" || c.kind === "custom") && (
+                <div className="criteria-config">
+                  <label>
+                    Evidence guidance (prompt-injected)
+                    <input
+                      value={c.instruction ?? c.label}
+                      onChange={(event) =>
+                        onChange(
+                          patchCriterion(list, c.id, {
+                            instruction: event.target.value,
+                          }),
+                        )
+                      }
+                      placeholder="Describe what evidence the specialist should cite"
+                      aria-label={`Claim guidance for: ${c.label}`}
+                    />
+                  </label>
+                </div>
+              )}
             </div>
           );
         })}

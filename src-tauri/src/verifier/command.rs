@@ -2,9 +2,13 @@
 
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::process::Command;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+use crate::platform_process::background_command;
 
 /// Allowlisted command templates (plan III.6).
 pub const COMMAND_TEMPLATES: &[&str] = &[
@@ -69,7 +73,7 @@ impl CommandRunner for ProcessCommandRunner {
             .canonicalize()
             .map_err(|e| format!("command cwd resolve failed: {e}"))?;
 
-        let mut cmd = Command::new(program);
+        let mut cmd = background_command(program);
         cmd.args(args)
             .current_dir(&cwd)
             .stdin(Stdio::null())
@@ -174,7 +178,7 @@ impl ProcessTreeGuard {
                 job.terminate();
             } else {
                 // Last-resort fallback when the parent process job policy rejects nesting.
-                let _ = Command::new("taskkill")
+                let _ = background_command("taskkill")
                     .args(["/PID", &child.id().to_string(), "/T", "/F"])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())

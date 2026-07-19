@@ -175,6 +175,50 @@ test("creates a blank workflow manually from the home screen", async ({
   });
 });
 
+test("opening chat for a builtin template creates a workflow copy", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.evaluate(() => localStorage.clear());
+  await page.reload();
+
+  await page.getByRole("tab", { name: "Templates", exact: true }).click();
+  const templateCard = page
+    .locator(".template-card")
+    .filter({ hasText: "Software company" });
+  await templateCard.getByRole("button", { name: "Open chat" }).click();
+
+  await expect(
+    page.getByRole("heading", { name: "Software company" }),
+  ).toBeVisible();
+  await expect(page.getByPlaceholder(/Message Byte/i)).toBeVisible();
+
+  const created = await page.evaluate(() => {
+    const workflows = JSON.parse(
+      localStorage.getItem("codex-corp-custom-workflows") ?? "[]",
+    );
+    return {
+      activeId: localStorage.getItem("codex-corp-active-workflow"),
+      workflows,
+    };
+  });
+  expect(created.workflows).toHaveLength(1);
+  expect(created.workflows[0]).toMatchObject({
+    id: created.activeId,
+    name: "Software company",
+    locked: false,
+    draft: false,
+  });
+  expect(created.workflows[0].id).not.toBe("software-company-v1");
+  expect(created.workflows[0].templateOrigin).toBeUndefined();
+
+  await page.getByRole("button", { name: "Back to overview" }).click();
+  await page.getByRole("tab", { name: "Workflows", exact: true }).click();
+  await expect(
+    page.locator(".workflow-card").filter({ hasText: "Software company" }),
+  ).toBeVisible();
+});
+
 test("builtin template + role catalog pack instantiate non-weak instructions", async ({
   page,
 }) => {
@@ -200,13 +244,14 @@ test("builtin template + role catalog pack instantiate non-weak instructions", a
   await expect(page.getByText("QA Engineer").first()).toBeVisible();
 
   // Place generic Agent → role catalog (B0 agent-drop path).
-  await page.locator(".library-item").filter({ hasText: /^Agent/ }).click();
+  await page
+    .locator(".library-item")
+    .filter({ hasText: /^Agent/ })
+    .click();
   const catalog = page.getByRole("dialog", { name: "Choose specialist role" });
   await expect(catalog).toBeVisible({ timeout: 10_000 });
   // Empty pack is last in the catalog (menuOrder).
-  await expect(
-    catalog.getByRole("button", { name: /^Empty/i }),
-  ).toBeVisible();
+  await expect(catalog.getByRole("button", { name: /^Empty/i })).toBeVisible();
   await expect(catalog.locator(".role-catalog-item").last()).toContainText(
     "Empty",
   );
@@ -518,26 +563,21 @@ test("saves workflow and auto-restores it after reload", async ({ page }) => {
   );
 });
 
-test("tools tab states tool grants as advisory/display-only and MCP as not connected", async ({
+test("tools tab labels capabilities as preferences and omits the obsolete MCP toggle", async ({
   page,
 }) => {
   await freshWorkspace(page);
   await page.locator('.react-flow__node[data-id="builder"]').click();
   await page.getByRole("button", { name: "tools", exact: true }).click();
   await expect(page.getByTestId("tools-boundary-helper")).toContainText(
-    /advisory allow-list|MCP is not connected/i,
+    /execution preferences.*not per-tool access controls/i,
   );
-  await page.getByRole("button", { name: /MCP servers/i }).click();
-  await expect(
-    page.getByRole("button", { name: /MCP servers/i }),
-  ).toContainText(/not connected/i);
-  await expect(page.getByText("Selected · not connected")).toBeVisible();
+  await expect(page.getByRole("button", { name: /MCP servers/i })).toHaveCount(0);
 });
 
-test("mission constraints, acceptance notes, and completion criteria are editable and persist", async (
-  { page },
-  testInfo,
-) => {
+test("mission constraints, acceptance notes, and completion criteria are editable and persist", async ({
+  page,
+}, testInfo) => {
   const pageErrors: string[] = [];
   page.on("pageerror", (error) => pageErrors.push(error.message));
   await freshWorkspace(page);

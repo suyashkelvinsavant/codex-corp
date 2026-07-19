@@ -353,7 +353,10 @@ export async function executeCompanyMediatorTool(
         }
         const selection = await ctx.actions.selectAppWorkspace(suggestedMode);
         if (!selection) {
-          return ok({ selected: false, reason: "Operator chose not to select a folder" });
+          return ok({
+            selected: false,
+            reason: "Operator chose not to select a folder",
+          });
         }
         return ok({ selected: true, ...selection });
       }
@@ -535,7 +538,6 @@ export async function executeCompanyMediatorTool(
             promptExcerpt: trunc(node.data.prompt ?? "", 800),
             revisions: node.data.revisions ?? 0,
             retries: node.data.retries ?? 0,
-            maxRevisions: node.data.maxRevisions,
             threadId: node.data.threadId,
             duration: node.data.duration,
             tokens: node.data.tokens,

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import {
+  AlertTriangle,
   CheckCircle2,
   ChevronDown,
   Cpu,
@@ -428,11 +429,17 @@ export function OverviewPage({
                               ) : null}
                             </div>
                           </div>
-                          <div className="workflow-card-meta" aria-label="Workflow stats">
+                          <div
+                            className="workflow-card-meta"
+                            aria-label="Workflow stats"
+                          >
                             <span className="workflow-card-stat">
                               <strong>{stats.nodeCount}</strong> nodes
                             </span>
-                            <span className="workflow-card-meta-sep" aria-hidden>
+                            <span
+                              className="workflow-card-meta-sep"
+                              aria-hidden
+                            >
                               ·
                             </span>
                             <span className="workflow-card-stat">
@@ -825,9 +832,18 @@ export function OverviewPage({
                   Specialists run through the installed{" "}
                   <strong>Codex CLI app-server</strong>.
                 </p>
-                <p className="settings-ok">
-                  <CheckCircle2 size={14} />
-                  Active runtime: <strong>Codex</strong>
+                <p className={codexInfo.compatible ? "settings-ok" : "settings-warn"}>
+                  {codexInfo.compatible ? (
+                    <>
+                      <CheckCircle2 size={14} />
+                      Active runtime: <strong>Codex</strong>
+                    </>
+                  ) : (
+                    <>
+                      <AlertTriangle size={14} />
+                      Active runtime: <strong>Needs attention</strong>
+                    </>
+                  )}
                 </p>
               </div>
               <div id="settings-connection" className="settings-block">
@@ -899,9 +915,7 @@ export function OverviewPage({
               </div>
               <div className="confirm-delete-copy">
                 <span className="confirm-delete-eyebrow">Delete workflow</span>
-                <h2 id="confirm-delete-title">
-                  Delete “{deleteTarget.name}”?
-                </h2>
+                <h2 id="confirm-delete-title">Delete “{deleteTarget.name}”?</h2>
                 <p>
                   This removes the workflow from the catalog permanently. It
                   cannot be undone.
@@ -1108,7 +1122,9 @@ function TemplateCard({
   const stats = templateStats(template);
   const isBuiltin = template.templateOrigin === "built-in";
   return (
-    <article className={`template-card ${isBuiltin ? "is-builtin" : "is-user"}`}>
+    <article
+      className={`template-card ${isBuiltin ? "is-builtin" : "is-user"}`}
+    >
       <div className="template-card-top">
         <div className="template-card-icon" aria-hidden>
           {isBuiltin ? (
@@ -1158,6 +1174,11 @@ function TemplateCard({
             type="button"
             className="template-card-btn template-card-btn-secondary"
             onClick={onOpenChat}
+            title={
+              isBuiltin
+                ? "Create a copy under Workflows and open it in chat"
+                : "Open chat for this workflow"
+            }
           >
             <MessageSquare size={14} aria-hidden />
             Open chat

@@ -11,6 +11,8 @@ release/
 .codex/
 .grok-acp/
 .agents/
+.zcode/
+test-results/
 AGENTS.md
 USER_FLOW.md
 

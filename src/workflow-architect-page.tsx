@@ -43,27 +43,7 @@ export type WorkflowArchitectPageProps = {
   onDuplicate: (id: string) => void;
   onTurn?: (req: MediatorTurnRequest) => Promise<MediatorTurnResult>;
 };
-
-const STARTERS = [
-  {
-    icon: Plus,
-    title: "Design a company",
-    prompt:
-      "Help me design a new company workflow. Start by asking me for the objective, users, inputs, outputs, constraints, approvals, and success criteria.",
-  },
-  {
-    icon: Wrench,
-    title: "Diagnose a workflow",
-    prompt:
-      "List my workflows and help me diagnose the most likely graph, prompt, tool-access, or handoff problems.",
-  },
-  {
-    icon: ShieldCheck,
-    title: "Audit access",
-    prompt:
-      "Audit every specialist for least-privilege tool and skill access. Show proposed changes before applying them.",
-  },
-];
+import { STARTERS } from "./shared/architect-presets";
 
 function loadArchitectStore(): WorkflowChatStore {
   const stored = loadChatStore(ARCHITECT_CHAT_SCOPE);
@@ -291,8 +271,11 @@ export function WorkflowArchitectPage({
       activeSessionId: session.id,
     };
     persist(next);
-    setDraft("");
-    if (prompt) void send(prompt, session, next);
+    if (prompt) {
+      setDraft(prompt);
+    } else {
+      setDraft("");
+    }
   };
 
   const deleteSession = (id: string) => {
