@@ -183,11 +183,14 @@ export type EdgeData = {
   maxRevisions?: number;
 };
 
+/** Default bound for revision feedback loops across authoring and execution. */
+export const DEFAULT_MAX_REVISIONS = 2;
+
 export type FlowNode = Node<AgentData>;
 export type FlowEdge = Edge<EdgeData>;
 
 export type WorkflowSnapshot = {
-  schemaVersion?: 2;
+  schemaVersion?: 2 | 3 | 4;
   nodes: FlowNode[];
   edges: FlowEdge[];
   /** Ephemeral notices produced while upgrading an older persisted snapshot. */
@@ -234,9 +237,33 @@ export type ApprovalRequest = {
 };
 
 export type StructuredApproval =
-  | { kind: "fileChange"; files: FileChangeSummary[]; reason?: string | null; grantRoot?: string | null }
-  | { kind: "execCommand"; command: string; cwd: string; reason?: string | null; commandActions?: { type: string; command: string; name?: string; path?: string | null; query?: string | null }[]; additionalPermissions?: unknown; availableDecisions?: string[] }
-  | { kind: "commandExecution"; command?: string; cwd?: string; reason?: string | null }
+  | {
+      kind: "fileChange";
+      files: FileChangeSummary[];
+      reason?: string | null;
+      grantRoot?: string | null;
+    }
+  | {
+      kind: "execCommand";
+      command: string;
+      cwd: string;
+      reason?: string | null;
+      commandActions?: {
+        type: string;
+        command: string;
+        name?: string;
+        path?: string | null;
+        query?: string | null;
+      }[];
+      additionalPermissions?: unknown;
+      availableDecisions?: string[];
+    }
+  | {
+      kind: "commandExecution";
+      command?: string;
+      cwd?: string;
+      reason?: string | null;
+    }
   | { kind: "permissions"; permissions?: unknown; reason?: string | null }
   | { kind: "unknown" };
 

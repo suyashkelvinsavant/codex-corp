@@ -29,8 +29,12 @@ function assertStrictObjectSchema(node: unknown, path: string): void {
 describe("DEFAULT_AGENT_OUTPUT_SCHEMA", () => {
   it("is strict enough for Live Codex response_format (nested objects + array items)", () => {
     assertStrictObjectSchema(DEFAULT_AGENT_OUTPUT_SCHEMA, "root");
-    const data = (DEFAULT_AGENT_OUTPUT_SCHEMA as { properties: { data: unknown } })
-      .properties.data as { additionalProperties: boolean; properties: { payload: unknown } };
+    const data = (
+      DEFAULT_AGENT_OUTPUT_SCHEMA as { properties: { data: unknown } }
+    ).properties.data as {
+      additionalProperties: boolean;
+      properties: { payload: unknown };
+    };
     expect(data.additionalProperties).toBe(false);
     expect(data.properties.payload).toEqual({ type: "string" });
   });
@@ -44,7 +48,7 @@ describe("DEFAULT_AGENT_OUTPUT_SCHEMA", () => {
     ]);
   });
 
-  it("allows claim/evidencePaths on criteria while keeping legacy passed optional", () => {
+  it("requires every criteria property for strict response_format", () => {
     const data = (
       DEFAULT_AGENT_OUTPUT_SCHEMA as {
         properties: {
@@ -64,7 +68,12 @@ describe("DEFAULT_AGENT_OUTPUT_SCHEMA", () => {
     expect(data.properties.claim).toBeDefined();
     expect(data.properties.evidencePaths).toBeDefined();
     expect(data.properties.passed).toBeDefined();
-    expect(data.required).toEqual(["id", "evidence"]);
-    expect(data.required).not.toContain("passed");
+    expect(data.required).toEqual([
+      "id",
+      "claim",
+      "evidence",
+      "evidencePaths",
+      "passed",
+    ]);
   });
 });

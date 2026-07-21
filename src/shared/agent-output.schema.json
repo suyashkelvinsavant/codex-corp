@@ -31,7 +31,7 @@
               },
               "passed": { "type": "boolean" }
             },
-            "required": ["id", "evidence"]
+            "required": ["id", "claim", "evidence", "evidencePaths", "passed"]
           }
         }
       },

@@ -1,6 +1,12 @@
-import type { FlowEdge, FlowNode, Kind } from "../model";
+import {
+  DEFAULT_MAX_REVISIONS,
+  type FlowEdge,
+  type FlowNode,
+  type Kind,
+} from "../model";
 import { DEFAULT_NODE_EFFORT, DEFAULT_NODE_MODEL_ID } from "../codex-models";
 import { defaultPlatformCriteria } from "../completion-criteria";
+import type { CompletionCriterion } from "../completion-criteria";
 import { kindPopColor } from "../kind-colors";
 import { instantiatePackById } from "./instantiate";
 
@@ -26,7 +32,12 @@ function edge(
     id,
     source,
     target,
-    data: { edgeType },
+    data: {
+      edgeType,
+      ...(edgeType === "revision"
+        ? { maxRevisions: DEFAULT_MAX_REVISIONS }
+        : {}),
+    },
   };
 }
 
@@ -46,7 +57,12 @@ function controlNode(
     },
     data: {
       label,
-      role: kind === "approval" ? "Approver" : "Control",
+      role:
+        kind === "approval"
+          ? "Approver"
+          : kind === "output"
+            ? "Verified handoff"
+            : "Control",
       kind,
       status: kind === "input" ? "completed" : "idle",
       model:
@@ -63,11 +79,14 @@ function controlNode(
           : kind === "approval"
             ? "Pause until a human approves the reviewed deliverable."
             : kind === "output"
-              ? "Collect approved artifacts and execution notes."
+              ? "After explicit approval, compare approved artifact hashes with the live artifact set and create a tamper-evident release bundle."
               : kind === "condition"
                 ? "Route when the configured branch value matches."
                 : "Define this node contract.",
-      description: `${label} control node`,
+      description:
+        kind === "output"
+          ? "Deterministically compares approved artifact hashes with live outputs and packages the verified, tamper-evident handoff. This is not an AI agent."
+          : `${label} control node`,
       duration: "—",
       tokens: 0,
       trace: ["Template seed"],
@@ -96,6 +115,11 @@ function packNode(
   packId: string,
   index: number,
   labelOverride?: string,
+  timeoutSeconds = 120,
+  executionPolicy: Pick<
+    FlowNode["data"],
+    "approvalPolicy" | "sandboxProfile" | "workspacePolicy"
+  > = {},
 ): FlowNode {
   const inst = instantiatePackById(packId);
   if (!inst) throw new Error(`Unknown pack ${packId}`);
@@ -125,7 +149,8 @@ function packNode(
       tokens: 0,
       trace: ["Template seed"],
       maxRetries: 2,
-      timeoutSeconds: 120,
+      timeoutSeconds,
+      ...executionPolicy,
       completionCriteria: inst.completionCriteria ?? defaultPlatformCriteria(),
       color: kindPopColor(inst.kind),
     },
@@ -134,14 +159,70 @@ function packNode(
 
 /** software-company-v1: input → pm → architect → builder → qa → approval → output (+ revision) */
 export function buildSoftwareCompanyTemplate(): BuiltinTemplate {
+  // Specialists operate autonomously inside the user-selected workflow
+  // workspace. The explicit Approval control node remains the human gate.
+  const autonomousWorkflowPolicy = {
+    // Normal workspace work stays sandboxed. Required dependency/network
+    // escalation remains possible through the native approval broker.
+    approvalPolicy: "on-request" as const,
+    sandboxProfile: "workspace-write" as const,
+    workspacePolicy: "workflow" as const,
+  };
   const nodes: FlowNode[] = [
     controlNode("input", "input", "Mission brief", 0),
-    packNode("pm", "product-manager", 1),
-    packNode("architect", "architect", 2),
-    packNode("builder", "frontend-engineer", 3, "Builder"),
-    packNode("qa", "qa-engineer", 4),
+    packNode(
+      "pm",
+      "product-manager",
+      1,
+      undefined,
+      300,
+      autonomousWorkflowPolicy,
+    ),
+    packNode(
+      "architect",
+      "architect",
+      2,
+      undefined,
+      300,
+      autonomousWorkflowPolicy,
+    ),
+    packNode(
+      "builder",
+      "frontend-engineer",
+      3,
+      "Builder",
+      600,
+      autonomousWorkflowPolicy,
+    ),
+    packNode("qa", "qa-engineer", 4, undefined, 600, autonomousWorkflowPolicy),
     controlNode("approval", "approval", "Approval", 5),
-    controlNode("output", "output", "Delivery", 6),
+    controlNode("output", "output", "Release Bundle", 6),
+  ];
+  const qa = nodes.find((node) => node.id === "qa");
+  if (!qa) throw new Error("Software Company template is missing QA");
+  const requiredCommands: CompletionCriterion[] = [
+    {
+      id: "software_npm_test",
+      label: "Run the repository test suite",
+      kind: "command",
+      enabled: true,
+      platform: false,
+      enforcement: "required",
+      templateId: "npm_test",
+    },
+    {
+      id: "software_npm_build",
+      label: "Run the production build",
+      kind: "command",
+      enabled: true,
+      platform: false,
+      enforcement: "required",
+      templateId: "npm_run_build",
+    },
+  ];
+  qa.data.completionCriteria = [
+    ...(qa.data.completionCriteria ?? defaultPlatformCriteria()),
+    ...requiredCommands,
   ];
   const edges: FlowEdge[] = [
     edge("e-in-pm", "input", "pm"),
@@ -156,7 +237,7 @@ export function buildSoftwareCompanyTemplate(): BuiltinTemplate {
     id: "software-company-v1",
     name: "Software company",
     description:
-      "PM → Architect → Builder → QA → Approval → Delivery with revision loop.",
+      "PM → Architect → Builder → QA → Approval → verified Release Bundle with revision loop.",
     version: "v1.0",
     nodes,
     edges,
@@ -173,7 +254,7 @@ export function buildCodeChangeDeliveryTemplate(): BuiltinTemplate {
     packNode("senior", "senior-software-engineer", 2),
     packNode("qa", "qa-engineer", 3),
     controlNode("approval", "approval", "Approval", 4),
-    controlNode("output", "output", "Delivery", 5),
+    controlNode("output", "output", "Release Bundle", 5),
   ];
   const edges: FlowEdge[] = [
     edge("e-in-arch", "input", "architect"),
@@ -187,7 +268,7 @@ export function buildCodeChangeDeliveryTemplate(): BuiltinTemplate {
     id: "code-change-delivery-v1",
     name: "Code change delivery",
     description:
-      "Focused implement track: Architect → Senior SE → QA → Approval → Delivery.",
+      "Focused implement track: Architect → Senior SE → QA → Approval → verified Release Bundle.",
     version: "v1.0",
     nodes,
     edges,
@@ -207,7 +288,7 @@ export function buildLaunchReviewTemplate(): BuiltinTemplate {
     packNode("builder", "senior-software-engineer", 5, "Builder"),
     packNode("reviewer", "code-reviewer", 6),
     controlNode("approval", "approval", "Approval", 7),
-    controlNode("output", "output", "Delivery", 8),
+    controlNode("output", "output", "Release Bundle", 8),
   ];
   const edges: FlowEdge[] = [
     edge("e-in-pm", "input", "pm"),

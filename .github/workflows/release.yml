@@ -1,0 +1,73 @@
+name: Release desktop apps
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            platform: windows-latest
+            args: --features custom-protocol --bundles nsis
+          - name: Linux x64
+            platform: ubuntu-22.04
+            args: --features custom-protocol --bundles appimage,deb
+          - name: macOS Apple Silicon
+            platform: macos-latest
+            rust-target: aarch64-apple-darwin
+            args: --target aarch64-apple-darwin --features custom-protocol --bundles dmg
+          - name: macOS Intel
+            platform: macos-latest
+            rust-target: x86_64-apple-darwin
+            args: --target x86_64-apple-darwin --features custom-protocol --bundles dmg
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target || '' }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Linux desktop dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Test release metadata
+        run: npm test -- --run src/release-contract.test.ts
+
+      - name: Build and attach installers to the draft release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v__VERSION__
+          releaseName: Codex Corp v__VERSION__
+          releaseBody: Download the installer for your platform from the assets below. These v0.1 builds are unsigned.
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}

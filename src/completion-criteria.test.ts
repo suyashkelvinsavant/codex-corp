@@ -76,6 +76,57 @@ describe("completion-criteria", () => {
     );
   });
 
+  it.each([
+    {
+      name: "allows a criterion self-report that denies exposing private reasoning",
+      summary: "Completed the architecture handoff successfully.",
+      data: {
+        criteria: [
+          {
+            id: "privacy",
+            evidence: "No hidden reasoning was exposed in the response.",
+          },
+        ],
+      },
+      expected: "pass",
+    },
+    {
+      name: "rejects an explicit reasoning_content field",
+      summary: "Completed the architecture handoff successfully.",
+      data: {
+        reasoning_content: "First I considered the private alternatives.",
+      },
+      expected: "fail",
+    },
+    {
+      name: "rejects a nested scratchpad field",
+      summary: "Completed the architecture handoff successfully.",
+      data: { payload: { debug: { scratchpad: "private working" } } },
+      expected: "fail",
+    },
+    {
+      name: "rejects a labeled chain-of-thought section",
+      summary: "Chain of Thought:\nFirst I compared all private alternatives.",
+      data: {},
+      expected: "fail",
+    },
+    {
+      name: "rejects a private-reasoning field smuggled through JSON text",
+      summary: "Completed the architecture handoff successfully.",
+      data: { payload: '{"internal_monologue":"private working"}' },
+      expected: "fail",
+    },
+  ])("$name", ({ summary, data, expected }) => {
+    const evaluated = evaluateCompletionCriteria(undefined, {
+      status: "success",
+      summary,
+      data,
+    });
+    expect(
+      evaluated.find((item) => item.id === "no_hidden_reasoning")?.status,
+    ).toBe(expected);
+  });
+
   it("marks pending when no result yet", () => {
     const pending = evaluateCompletionCriteria(defaultPlatformCriteria(), null);
     expect(pending.every((e) => e.status === "pending")).toBe(true);
@@ -276,9 +327,7 @@ describe("completion-criteria", () => {
         status: "success",
         summary: "Done",
         data: {
-          criteria: [
-            { id: "c1", passed: true, evidence: "I pinky swear" },
-          ],
+          criteria: [{ id: "c1", passed: true, evidence: "I pinky swear" }],
         },
       },
     );
@@ -324,9 +373,7 @@ describe("completion-criteria", () => {
       summary: "Done.",
       data: { criteria: [{ id: custom.id, passed: true }] },
     });
-    expect(barePass.find((item) => item.id === custom.id)?.status).toBe(
-      "fail",
-    );
+    expect(barePass.find((item) => item.id === custom.id)?.status).toBe("fail");
     // Explicit negative claim enum fails even with evidence text.
     const notSatisfied = evaluateCompletionCriteria([custom], {
       status: "success",

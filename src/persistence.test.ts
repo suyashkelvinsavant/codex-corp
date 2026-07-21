@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildPersistedRunNodes,
+  normalizeLoadedWorkflowState,
   parseRunRecords,
   parseWorkflowSnapshot,
   rehydrateRunRecord,
@@ -9,6 +10,7 @@ import {
   shouldAutosaveBeforeTemplateSwitch,
   shouldReplaceEdgesFromRun,
   templateSwitchBaselineEvents,
+  WORKFLOW_SCHEMA_VERSION,
 } from "./persistence";
 import type { FlowNode, Kind, RunRecord } from "./model";
 
@@ -34,6 +36,33 @@ const node = (id: string, kind: Kind = "agent"): FlowNode => ({
 });
 
 describe("persistence helpers", () => {
+  it("restores workflow workspace ownership across five persisted payload shapes", () => {
+    const graphJson = JSON.stringify({ nodes: [node("qa")], edges: [] });
+
+    // Attack vector 1: current native record restores its selected workspace.
+    expect(
+      normalizeLoadedWorkflowState({
+        graphJson,
+        workspacePath: "C:\\workspaces\\coffee",
+      }),
+    ).toEqual({ graphJson, workspacePath: "C:\\workspaces\\coffee" });
+    // Attack vector 2: legacy browser/raw graph values remain readable.
+    expect(normalizeLoadedWorkflowState(graphJson)).toEqual({
+      graphJson,
+      workspacePath: null,
+    });
+    // Attack vector 3: blank native paths cannot masquerade as a workspace.
+    expect(
+      normalizeLoadedWorkflowState({ graphJson, workspacePath: "   " }),
+    ).toEqual({ graphJson, workspacePath: null });
+    // Attack vector 4: malformed graph payloads fail closed.
+    expect(
+      normalizeLoadedWorkflowState({ graphJson: 7, workspacePath: "C:\\x" }),
+    ).toBeNull();
+    // Attack vector 5: missing records remain missing.
+    expect(normalizeLoadedWorkflowState(null)).toBeNull();
+  });
+
   it("parses valid workflow snapshots and rejects garbage", () => {
     const good = parseWorkflowSnapshot(
       JSON.stringify({
@@ -71,7 +100,7 @@ describe("persistence helpers", () => {
         ],
       }),
     );
-    expect(snapshot?.schemaVersion).toBe(2);
+    expect(snapshot?.schemaVersion).toBe(WORKFLOW_SCHEMA_VERSION);
     expect(snapshot?.nodes[0].data.workspacePolicy).toBe("isolated");
     expect(snapshot?.nodes[0].data).not.toHaveProperty("memoryMode");
     expect(snapshot?.nodes[0].data).not.toHaveProperty("environmentVariables");
@@ -81,22 +110,262 @@ describe("persistence helpers", () => {
     expect(snapshot?.edges[0].data?.maxRevisions).toBe(4);
   });
 
-  it("preserves the durable approval gate in schema-version 2 snapshots", () => {
+  it("preserves the durable approval gate in current snapshots", () => {
     const specialist = node("agent");
     specialist.data.requiresApproval = true;
     const snapshot = parseWorkflowSnapshot(
-      JSON.stringify({ schemaVersion: 2, nodes: [specialist], edges: [] }),
+      JSON.stringify({
+        schemaVersion: WORKFLOW_SCHEMA_VERSION,
+        nodes: [specialist],
+        edges: [],
+      }),
     );
     expect(snapshot?.nodes[0].data.requiresApproval).toBe(true);
     expect(snapshot?.migrationNotices).toBeUndefined();
   });
 
-  it("serializes current snapshots as v2 and rejects unknown future versions", () => {
+  it("renames only the legacy default Delivery control during schema migration", () => {
+    const legacyOutput = node("output", "output");
+    Object.assign(legacyOutput.data, {
+      label: "Delivery",
+      role: "Control",
+      model: "Collector",
+    });
+    const customOutput = node("custom-output", "output");
+    Object.assign(customOutput.data, {
+      label: "Publish to customer portal",
+      role: "Custom release",
+      model: "Collector",
+    });
+
+    const migrated = parseWorkflowSnapshot(
+      JSON.stringify({
+        schemaVersion: WORKFLOW_SCHEMA_VERSION - 1,
+        nodes: [legacyOutput, customOutput],
+        edges: [],
+      }),
+    );
+
+    expect(migrated?.nodes[0].data).toMatchObject({
+      label: "Release Bundle",
+      role: "Verified handoff",
+    });
+    expect(migrated?.nodes[1].data).toMatchObject({
+      label: "Publish to customer portal",
+      role: "Custom release",
+    });
+    expect(migrated?.migrationNotices).toContain(
+      "Renamed the default Delivery control to Release Bundle and clarified its verified handoff purpose.",
+    );
+  });
+
+  it("repairs the affected v2 Software Company policy without overriding a current explicit choice", () => {
+    const softwareNodes = [
+      node("input", "input"),
+      node("pm"),
+      node("architect"),
+      node("builder"),
+      node("qa"),
+      node("approval", "approval"),
+      node("output", "output"),
+    ];
+    for (const specialist of softwareNodes.filter(
+      (item) => item.data.kind === "agent",
+    )) {
+      specialist.data.approvalPolicy = "never";
+      specialist.data.sandboxProfile = "workspace-write";
+      specialist.data.workspacePolicy = "workflow";
+    }
+    softwareNodes.find((item) => item.id === "pm")!.data.packId =
+      "product-manager";
+    softwareNodes.find((item) => item.id === "architect")!.data.packId =
+      "architect";
+    softwareNodes.find((item) => item.id === "builder")!.data.packId =
+      "frontend-engineer";
+    softwareNodes.find((item) => item.id === "qa")!.data.packId = "qa-engineer";
+    const edges = [
+      {
+        id: "e-in-pm",
+        source: "input",
+        target: "pm",
+        data: { edgeType: "standard" as const },
+      },
+      {
+        id: "e-pm-arch",
+        source: "pm",
+        target: "architect",
+        data: { edgeType: "standard" as const },
+      },
+      {
+        id: "e-arch-builder",
+        source: "architect",
+        target: "builder",
+        data: { edgeType: "standard" as const },
+      },
+      {
+        id: "e-builder-qa",
+        source: "builder",
+        target: "qa",
+        data: { edgeType: "standard" as const },
+      },
+      {
+        id: "e-qa-approval",
+        source: "qa",
+        target: "approval",
+        data: { edgeType: "approval" as const },
+      },
+      {
+        id: "e-approval-out",
+        source: "approval",
+        target: "output",
+        data: { edgeType: "standard" as const },
+      },
+      {
+        id: "e-qa-builder-rev",
+        source: "qa",
+        target: "builder",
+        data: { edgeType: "revision" as const, maxRevisions: 2 },
+      },
+    ];
+    const migrated = parseWorkflowSnapshot(
+      JSON.stringify({ schemaVersion: 2, nodes: softwareNodes, edges }),
+    );
+    expect(
+      migrated?.nodes
+        .filter((item) => item.data.kind === "agent")
+        .every((item) => item.data.approvalPolicy === "on-request"),
+    ).toBe(true);
+    expect(migrated?.migrationNotices).toContain(
+      "Restored on-request approvals for the affected Software Company workflow so dependency setup can request permission.",
+    );
+
+    const current = parseWorkflowSnapshot(
+      JSON.stringify({
+        schemaVersion: WORKFLOW_SCHEMA_VERSION,
+        nodes: softwareNodes,
+        edges,
+      }),
+    );
+    expect(
+      current?.nodes
+        .filter((item) => item.data.kind === "agent")
+        .every((item) => item.data.approvalPolicy === "never"),
+    ).toBe(true);
+  });
+
+  it("repairs persisted role skill hints without dropping explicit connector selections", () => {
+    const specialist = node("product-manager");
+    Object.assign(specialist.data, {
+      packId: "product-manager",
+      skills: ["product-spec", "installed-skill"],
+    });
+    const snapshot = parseWorkflowSnapshot(
+      JSON.stringify({ schemaVersion: 2, nodes: [specialist], edges: [] }),
+    );
+    expect(snapshot?.nodes[0].data.skills).toEqual(["installed-skill"]);
+    expect(snapshot?.migrationNotices).toEqual([
+      "Removed obsolete role skill hints from saved specialists; connector skills must be selected from the live workspace inventory.",
+    ]);
+  });
+
+  it("round-trips current-schema connector selections across five adversarial shapes", () => {
+    const cases = [
+      // Attack vector 1: an installed skill may intentionally share one pack hint.
+      { packId: "product-manager", skills: ["product-spec"] },
+      // Attack vector 2: a hint collision must not remove siblings or reorder them.
+      {
+        packId: "product-manager",
+        skills: ["product-spec", "installed-skill"],
+      },
+      // Attack vector 3: preserve multiple selections that all match role hints.
+      {
+        packId: "frontend-engineer",
+        skills: ["frontend-design", "react"],
+      },
+      // Attack vector 4: unknown packs still preserve explicit selections.
+      { packId: "workspace-pack", skills: ["product-spec"] },
+      // Attack vector 5: an explicitly empty selection remains empty.
+      { packId: "product-manager", skills: [] },
+    ];
+
+    for (const testCase of cases) {
+      const specialist = node(testCase.packId);
+      Object.assign(specialist.data, testCase);
+      const snapshot = parseWorkflowSnapshot(
+        JSON.stringify({
+          schemaVersion: WORKFLOW_SCHEMA_VERSION,
+          nodes: [specialist],
+          edges: [],
+        }),
+      );
+      expect(snapshot?.nodes[0].data.skills).toEqual(testCase.skills);
+      expect(snapshot?.migrationNotices).toBeUndefined();
+    }
+  });
+
+  describe("missing revision-limit repair", () => {
+    const parseEdge = (data: Record<string, unknown>) =>
+      parseWorkflowSnapshot(
+        JSON.stringify({
+          schemaVersion: 2,
+          nodes: [node("agent")],
+          edges: [
+            {
+              id: "revision",
+              source: "review",
+              target: "agent",
+              data,
+            },
+          ],
+        }),
+      );
+
+    it("backfills the limit omitted by affected template instances", () => {
+      const snapshot = parseEdge({ edgeType: "revision" });
+      expect(snapshot?.edges[0].data?.maxRevisions).toBe(2);
+      expect(snapshot?.migrationNotices).toContain(
+        "Added the missing revision limit to an affected saved workflow.",
+      );
+    });
+
+    it("preserves an explicit positive revision limit", () => {
+      expect(
+        parseEdge({ edgeType: "revision", maxRevisions: 7 })?.edges[0].data
+          ?.maxRevisions,
+      ).toBe(7);
+    });
+
+    it("does not hide an explicitly invalid zero limit", () => {
+      expect(
+        parseEdge({ edgeType: "revision", maxRevisions: 0 })?.edges[0].data
+          ?.maxRevisions,
+      ).toBe(0);
+    });
+
+    it("does not reinterpret an explicit null limit as the factory omission", () => {
+      expect(
+        parseEdge({ edgeType: "revision", maxRevisions: null })?.edges[0].data
+          ?.maxRevisions,
+      ).toBeNull();
+    });
+
+    it("does not add a revision limit to standard edges", () => {
+      expect(
+        parseEdge({ edgeType: "standard" })?.edges[0].data,
+      ).not.toHaveProperty("maxRevisions");
+    });
+  });
+
+  it("serializes the current schema and rejects unknown future versions", () => {
     const raw = serializeWorkflowSnapshot([node("agent")], []);
-    expect(JSON.parse(raw).schemaVersion).toBe(2);
+    expect(JSON.parse(raw).schemaVersion).toBe(WORKFLOW_SCHEMA_VERSION);
     expect(
       parseWorkflowSnapshot(
-        JSON.stringify({ schemaVersion: 3, nodes: [node("agent")], edges: [] }),
+        JSON.stringify({
+          schemaVersion: WORKFLOW_SCHEMA_VERSION + 1,
+          nodes: [node("agent")],
+          edges: [],
+        }),
       ),
     ).toBeNull();
   });

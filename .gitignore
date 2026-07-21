@@ -16,14 +16,6 @@ test-results/
 AGENTS.md
 USER_FLOW.md
 
-# graphify knowledge-graph outputs (generated locally; do not commit)
-graphify-out/
-**/graphify-out/
-.graphify_python
-.graphify_root
-.graphify_labels.json
-.graphify_labels.json.sig
-
 # Local tool logs and review scratchpads
 firebase-debug.log
 code-review.md

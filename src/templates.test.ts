@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeTestWorkflow } from "./test-workflow-fixture";
+import { validateWorkflow } from "./graph";
 import {
   cloneTemplateGraph,
   cloneTemplateGraphLaidOut,
@@ -52,6 +53,12 @@ describe("workflow catalog", () => {
     ).toBe(true);
     expect(software.nodes.some((n) => n.data.baseInstructions)).toBe(true);
     expect(
+      software.nodes.find((n) => n.data.kind === "output")?.data,
+    ).toMatchObject({
+      label: "Release Bundle",
+      role: "Verified handoff",
+    });
+    expect(
       software.nodes
         .filter((node) => node.data.kind === "agent")
         .every(
@@ -64,6 +71,203 @@ describe("workflow catalog", () => {
       id: DEFAULT_TEMPLATE_ID,
       nodes: [],
       edges: [],
+    });
+  });
+
+  describe("built-in revision limits", () => {
+    it("gives every built-in output node an operator-facing release purpose", () => {
+      for (const template of listTemplates().filter(
+        (item) => item.templateOrigin === "built-in",
+      )) {
+        const output = template.nodes.find(
+          (node) => node.data.kind === "output",
+        );
+        expect(output?.data.label, template.id).toBe("Release Bundle");
+        expect(output?.data.description, template.id).toMatch(
+          /approved artifact hashes|tamper-evident/i,
+        );
+        expect(output?.data.prompt, template.id).toMatch(
+          /compare.*approved.*live|approved.*live.*artifacts/i,
+        );
+      }
+    });
+    it("runs Software company specialists in the selected workspace with escalation available", () => {
+      const agents = getTemplate("software-company-v1").nodes.filter(
+        (node) => node.data.kind === "agent",
+      );
+      expect(agents).toHaveLength(4);
+      expect(
+        agents.every((node) => node.data.approvalPolicy === "on-request"),
+      ).toBe(true);
+      expect(
+        agents.every((node) => node.data.sandboxProfile === "workspace-write"),
+      ).toBe(true);
+      expect(
+        agents.every((node) => node.data.workspacePolicy === "workflow"),
+      ).toBe(true);
+    });
+
+    it("gives QA deterministic required test and build gates", () => {
+      const qa = getTemplate("software-company-v1").nodes.find(
+        (node) => node.id === "qa",
+      );
+      const requiredCommands = qa?.data.completionCriteria
+        ?.filter(
+          (criterion) =>
+            criterion.enabled &&
+            criterion.enforcement === "required" &&
+            criterion.kind === "command",
+        )
+        .map((criterion) => criterion.templateId);
+      expect(requiredCommands).toEqual(
+        expect.arrayContaining(["npm_test", "npm_run_build"]),
+      );
+    });
+
+    it("requires Builder to finish dependency setup before handing work to QA", () => {
+      const builder = getTemplate("software-company-v1").nodes.find(
+        (node) => node.id === "builder",
+      );
+      expect(builder?.data.tools).toEqual(
+        expect.arrayContaining([
+          "Workspace read",
+          "Workspace write",
+          "Shell",
+          "Apply patch",
+          "Network",
+        ]),
+      );
+      expect(builder?.data.developerInstructions).toMatch(
+        /install.*declared dependencies|dependency install/i,
+      );
+      expect(builder?.data.developerInstructions).toMatch(
+        /test.*build|build.*test/i,
+      );
+      expect(builder?.data.developerInstructions).toMatch(
+        /do not report success/i,
+      );
+    });
+
+    it("requires QA to report verifier evidence instead of static-only success", () => {
+      const qa = getTemplate("software-company-v1").nodes.find(
+        (node) => node.id === "qa",
+      );
+      expect(qa?.data.developerInstructions).toMatch(
+        /host.*verifier.*npm test.*npm run build/i,
+      );
+      expect(qa?.data.developerInstructions).toMatch(
+        /do not.*run.*full.*test.*build|do not.*duplicate.*host/i,
+      );
+      expect(qa?.data.developerInstructions).toMatch(
+        /static.*not.*substitute/i,
+      );
+      expect(qa?.data.developerInstructions).toMatch(
+        /needs_revision.*actionable.*builder|actionable.*builder.*needs_revision/i,
+      );
+      expect(qa?.data.developerInstructions).toMatch(
+        /missing.*operator.*residual risk|residual risk.*missing.*operator/i,
+      );
+      expect(qa?.data.developerInstructions).toMatch(
+        /revision.*prior defect|prior defect.*revision/i,
+      );
+    });
+
+    it("keeps the Software company release gate explicitly human-controlled", () => {
+      const approval = getTemplate("software-company-v1").nodes.find(
+        (node) => node.data.kind === "approval",
+      );
+      expect(approval).toBeDefined();
+      expect(approval?.data.approvalPolicy).toBeUndefined();
+    });
+
+    it("does not silently broaden execution policy on unrelated templates", () => {
+      const agents = getTemplate("code-change-delivery-v1").nodes.filter(
+        (node) => node.data.kind === "agent",
+      );
+      expect(agents.some((node) => node.data.approvalPolicy !== "never")).toBe(
+        true,
+      );
+    });
+
+    it("gives implementation and verification nodes production-sized execution budgets", () => {
+      const software = getTemplate("software-company-v1");
+      expect(
+        software.nodes.find((node) => node.id === "pm")?.data.timeoutSeconds,
+      ).toBeGreaterThanOrEqual(300);
+      expect(
+        software.nodes.find((node) => node.id === "architect")?.data
+          .timeoutSeconds,
+      ).toBeGreaterThanOrEqual(300);
+      expect(
+        software.nodes.find((node) => node.id === "builder")?.data
+          .timeoutSeconds,
+      ).toBeGreaterThanOrEqual(600);
+      expect(
+        software.nodes.find((node) => node.id === "qa")?.data.timeoutSeconds,
+      ).toBeGreaterThanOrEqual(600);
+    });
+
+    it("makes the Software company template executable", () => {
+      const software = getTemplate("software-company-v1");
+      expect(
+        validateWorkflow(software.nodes, software.edges).filter(
+          (problem) => problem.severity === "error",
+        ),
+      ).toEqual([]);
+    });
+
+    it("keeps every built-in template free of revision-limit errors", () => {
+      for (const template of listTemplates().filter(
+        (item) => item.templateOrigin === "built-in",
+      )) {
+        expect(
+          validateWorkflow(template.nodes, template.edges).filter((problem) =>
+            problem.id.startsWith("revision-limit-"),
+          ),
+          template.id,
+        ).toEqual([]);
+      }
+    });
+
+    it("preserves revision limits when a template becomes a workflow", () => {
+      const workflow = createWorkflowFromTemplate(
+        getTemplate("software-company-v1"),
+        1_700_000_000_000,
+      );
+      expect(
+        workflow.edges.find((edge) => edge.data?.edgeType === "revision")?.data
+          ?.maxRevisions,
+      ).toBe(2);
+    });
+
+    it("uses finite positive integer limits on every built-in revision edge", () => {
+      const revisionLimits = listTemplates()
+        .filter((item) => item.templateOrigin === "built-in")
+        .flatMap((template) =>
+          template.edges
+            .filter((edge) => edge.data?.edgeType === "revision")
+            .map((edge) => edge.data?.maxRevisions),
+        );
+      expect(revisionLimits.length).toBeGreaterThan(0);
+      expect(
+        revisionLimits.every(
+          (limit) =>
+            typeof limit === "number" &&
+            Number.isFinite(limit) &&
+            Number.isInteger(limit) &&
+            limit > 0,
+        ),
+      ).toBe(true);
+    });
+
+    it("does not attach revision limits to non-revision edges", () => {
+      const nonRevisionEdges = listTemplates()
+        .filter((item) => item.templateOrigin === "built-in")
+        .flatMap((template) => template.edges)
+        .filter((edge) => edge.data?.edgeType !== "revision");
+      expect(
+        nonRevisionEdges.every((edge) => edge.data?.maxRevisions === undefined),
+      ).toBe(true);
     });
   });
 

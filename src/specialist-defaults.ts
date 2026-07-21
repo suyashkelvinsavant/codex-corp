@@ -4,10 +4,7 @@
  */
 
 import type { Kind } from "./model";
-import {
-  instantiatePackForRole,
-  type PackInstantiation,
-} from "./node-packs";
+import { instantiatePackForRole, type PackInstantiation } from "./node-packs";
 import {
   effectiveDeveloperInstructions,
   migrateInstructionFields,
@@ -36,6 +33,7 @@ export type SpecialistDefaults = {
   packVersion: string;
   tools: string[];
   skills: string[];
+  skillHints: string[];
   description: string;
 };
 
@@ -48,6 +46,7 @@ function fromInstantiation(inst: PackInstantiation): SpecialistDefaults {
     packVersion: inst.packVersion,
     tools: [...inst.tools],
     skills: [...inst.skills],
+    skillHints: [...inst.skillHints],
     description: inst.description,
   };
 }
@@ -69,6 +68,7 @@ export function defaultSpecialistForRole(
       packVersion: "",
       tools: [],
       skills: [],
+      skillHints: [],
       description: "",
     };
   }
@@ -114,6 +114,7 @@ export type EnsuredSpecialistFields = {
   prompt: string;
   tools: string[];
   skills: string[];
+  skillHints: string[];
   description: string;
 };
 
@@ -134,6 +135,7 @@ export function ensureSpecialistQuality<T extends SpecialistNodeFields>(
       prompt: data.prompt ?? "",
       tools: data.tools ? [...data.tools] : [],
       skills: data.skills ? [...data.skills] : [],
+      skillHints: [],
       description: data.description ?? "",
     };
   }
@@ -158,10 +160,13 @@ export function ensureSpecialistQuality<T extends SpecialistNodeFields>(
     Array.isArray(migrated.tools) && migrated.tools.length > 0
       ? migrated.tools
       : defaults.tools;
-  const skills =
+  const configuredSkills =
     Array.isArray(migrated.skills) && migrated.skills.length > 0
       ? migrated.skills
       : defaults.skills;
+  // Do not filter explicit operator selections here. Persisted snapshots are
+  // migrated centrally, while an in-session connector choice is authoritative.
+  const skills = configuredSkills;
   const description =
     (migrated.description ?? "").trim().length > 0
       ? migrated.description!
@@ -176,6 +181,7 @@ export function ensureSpecialistQuality<T extends SpecialistNodeFields>(
     prompt: nextDeveloper,
     tools: [...tools],
     skills: [...skills],
+    skillHints: [...defaults.skillHints],
     description,
   };
 }

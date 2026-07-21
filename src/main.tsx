@@ -105,7 +105,13 @@ import {
 } from "./codex-models";
 import { kindPopColor } from "./kind-colors";
 import { autoLayout, upstreamLineage, validateWorkflow } from "./graph";
-import { resetExecutableNodeForRun } from "./run-lifecycle";
+import {
+  nodeOutputPatchForRunEvent,
+  nodeStatusForRunEvent,
+  prepareNodesForRun,
+  resetExecutableNodeForRun,
+  revisionCountForRunEvent,
+} from "./run-lifecycle";
 import { resolveActiveSkill } from "./creative-skills";
 import {
   EMPTY_CODEX_CAPABILITIES,
@@ -118,6 +124,7 @@ import { isSpecialistKind } from "./model";
 import {
   ACTIVE_WORKFLOW_KEY,
   normalizeRunRecord,
+  normalizeLoadedWorkflowState,
   parseRunRecords,
   parseWorkflowSnapshot,
   readActiveWorkflowId,
@@ -128,6 +135,7 @@ import {
   shouldAutosaveBeforeTemplateSwitch,
   shouldReplaceEdgesFromRun,
   templateSwitchBaselineEvents,
+  WORKFLOW_SCHEMA_VERSION,
   WORKFLOW_ID,
   workflowStorageKey,
 } from "./persistence";
@@ -187,7 +195,12 @@ import {
   type MediatorQuestion,
   type MediatorQuestionAnswer,
 } from "./mediator-ui";
-import { appendStreamPreview, appendTypedTrace, isAgentMessageDelta, isStreamingTraceEvent } from "./stream-display";
+import {
+  appendStreamPreview,
+  appendTypedTrace,
+  isAgentMessageDelta,
+  isStreamingTraceEvent,
+} from "./stream-display";
 import {
   buildUserInputResponse,
   parseElicitationForm,
@@ -204,6 +217,11 @@ import {
   type PortfolioRunSummary,
 } from "./dashboard-finance";
 import { CONTROL_KINDS, controlKindLabel, statusText } from "./node-display";
+import { isConcreteMission } from "./mission-context";
+import {
+  resolveNativeApproval,
+  type NativeApprovalResolution,
+} from "./approval-lifecycle";
 import {
   buildMediatorContextDigest,
   companyMediatorDynamicTools,
@@ -240,6 +258,13 @@ const AgentChatPage = lazy(() =>
     default: module.AgentChatPage,
   })),
 );
+
+async function loadPersistedWorkflowState(id: string) {
+  const value = isTauri()
+    ? await invoke<unknown>("load_workflow_record", { id })
+    : localStorage.getItem(workflowStorageKey(id));
+  return normalizeLoadedWorkflowState(value);
+}
 const OverviewPage = lazy(() =>
   import("./overview-page").then((module) => ({
     default: module.OverviewPage,
@@ -444,7 +469,10 @@ function CorpNode({ data, selected }: NodeProps<FlowNode>) {
           data.cronExpression || "Not configured",
         ];
       case "output":
-        return ["Collects artifacts", `${data.artifacts?.length ?? 0} files`];
+        return [
+          "Verifies approved artifacts",
+          `${data.artifacts?.length ?? 0} release bundle${data.artifacts?.length === 1 ? "" : "s"}`,
+        ];
       case "approval":
         return [
           "Human checkpoint",
@@ -517,10 +545,11 @@ function CorpNode({ data, selected }: NodeProps<FlowNode>) {
       <div
         className={`node-activity ${data.streamingPreview ? "streaming" : ""}`}
       >
-        {data.streamingPreview || (() => {
-          const last = data.trace[data.trace.length - 1];
-          return typeof last === "string" ? last : last?.text;
-        })()}
+        {data.streamingPreview ||
+          (() => {
+            const last = data.trace[data.trace.length - 1];
+            return typeof last === "string" ? last : last?.text;
+          })()}
       </div>
       <div className="node-stats">
         {isControl ? (
@@ -683,8 +712,8 @@ const library = [
   },
   {
     kind: "output" as Kind,
-    label: "Output",
-    hint: "collect artifacts",
+    label: "Release bundle",
+    hint: "verify approved artifacts",
     icon: FileOutput,
   },
   {
@@ -939,7 +968,7 @@ function App() {
   );
 
   const snapshot = (): WorkflowSnapshot =>
-    structuredClone({ schemaVersion: 2, nodes, edges });
+    structuredClone({ schemaVersion: WORKFLOW_SCHEMA_VERSION, nodes, edges });
   const pushHistory = (value = snapshot()) => {
     historyPast.current.push(value);
     if (historyPast.current.length > 60) historyPast.current.shift();
@@ -1046,7 +1075,7 @@ function App() {
     actions: {
       run: (mission) => {
         if (mission) setMissionBrief(mission, "chat");
-        return run();
+        return run(undefined, mission);
       },
       stop: () => stop(),
       setMission: (mission) => setMissionBrief(mission, "chat"),
@@ -1072,12 +1101,23 @@ function App() {
     args: unknown,
   ): Promise<{ success: boolean; text: string }> => {
     if (surface === "company") {
-      if (["company_run", "company_run_from", "company_approve", "company_decline"].includes(tool)) {
-        const detail = tool === "company_run_from"
-          ? "Start from this node and intentionally skip its ancestors?"
-          : `Allow Byte to ${tool.replace("company_", "").replace(/_/g, " ")}?`;
+      if (
+        [
+          "company_run",
+          "company_run_from",
+          "company_approve",
+          "company_decline",
+        ].includes(tool)
+      ) {
+        const detail =
+          tool === "company_run_from"
+            ? "Start from this node and intentionally skip its ancestors?"
+            : `Allow Byte to ${tool.replace("company_", "").replace(/_/g, " ")}?`;
         if (!window.confirm(detail)) {
-          return { success: false, text: JSON.stringify({ error: "Operator cancelled confirmation" }) };
+          return {
+            success: false,
+            text: JSON.stringify({ error: "Operator cancelled confirmation" }),
+          };
         }
       }
       return executeCompanyMediatorTool(tool, args, mediatorHostContext());
@@ -1996,14 +2036,18 @@ function App() {
     setIdentityOpen(false);
   };
 
-  const save = async (emptyConfirmed = false) => {
-    if (!emptyConfirmed && !nodes.length && !edges.length) {
+  const save = async (
+    emptyConfirmed = false,
+    nodesToSave = nodes,
+    edgesToSave = edges,
+  ) => {
+    if (!emptyConfirmed && !nodesToSave.length && !edgesToSave.length) {
       const confirmed = window.confirm(
         "Are you sure you want to save an empty workflow?",
       );
       if (!confirmed) return false;
     }
-    const graphJson = serializeWorkflowSnapshot(nodes, edges);
+    const graphJson = serializeWorkflowSnapshot(nodesToSave, edgesToSave);
     const template = getTemplate(workflowId);
     saveCustomWorkflow({
       ...template,
@@ -2011,8 +2055,8 @@ function App() {
       description: workflowDescription.trim(),
       version: normalizeWorkflowVersion(workflowVersion),
       icon: normalizeWorkflowIcon(workflowIcon),
-      nodes: structuredClone(nodes),
-      edges: structuredClone(edges),
+      nodes: structuredClone(nodesToSave),
+      edges: structuredClone(edgesToSave),
       draft: false,
     });
     await saveWorkflowMutation.mutateAsync({
@@ -2026,8 +2070,8 @@ function App() {
         description: workflowDescription.trim(),
         version: normalizeWorkflowVersion(workflowVersion),
         icon: normalizeWorkflowIcon(workflowIcon),
-        nodes,
-        edges,
+        nodes: nodesToSave,
+        edges: edgesToSave,
         draft: false,
       }),
     });
@@ -2063,10 +2107,8 @@ function App() {
     setAppView("overview");
   };
   const load = async () => {
-    const raw = isTauri()
-      ? await invoke<string | null>("load_workflow", { id: workflowId })
-      : localStorage.getItem(workflowStorageKey(workflowId));
-    const w = parseWorkflowSnapshot(raw);
+    const persisted = await loadPersistedWorkflowState(workflowId);
+    const w = parseWorkflowSnapshot(persisted?.graphJson ?? null);
     if (!w) {
       emit(
         "No saved workflow found",
@@ -2076,6 +2118,7 @@ function App() {
       );
       return;
     }
+    activeChatWorkspaceRef.current = persisted?.workspacePath ?? null;
     userMutatedWorkflow.current = true;
     pushHistory();
     applyGraph(
@@ -2187,7 +2230,7 @@ function App() {
           workspacePath: activeChatWorkspaceRef.current,
           templateJson: JSON.stringify({
             ...leaving,
-            schemaVersion: 2,
+            schemaVersion: WORKFLOW_SCHEMA_VERSION,
             nodes,
             edges,
           }),
@@ -2211,10 +2254,9 @@ function App() {
     clearRunUiForTemplateSwitch(template.name);
 
     try {
-      const raw = isTauri()
-        ? await invoke<string | null>("load_workflow", { id: nextId })
-        : localStorage.getItem(workflowStorageKey(nextId));
-      const saved = parseWorkflowSnapshot(raw);
+      const persisted = await loadPersistedWorkflowState(nextId);
+      const saved = parseWorkflowSnapshot(persisted?.graphJson ?? null);
+      activeChatWorkspaceRef.current = persisted?.workspacePath ?? null;
       if (saved) {
         applyGraph(
           saved.nodes,
@@ -2285,12 +2327,15 @@ function App() {
     await switchTemplate(templateId, "chat");
   };
 
-  const validate = async () => {
-    let found = validateWorkflow(nodes, edges);
+  const validate = async (nodesToValidate = nodes, edgesToValidate = edges) => {
+    let found = validateWorkflow(nodesToValidate, edgesToValidate);
     if (isTauri())
       try {
         const nativeProblems = await invoke<typeof found>("validate_workflow", {
-          graphJson: serializeWorkflowSnapshot(nodes, edges),
+          graphJson: serializeWorkflowSnapshot(
+            nodesToValidate,
+            edgesToValidate,
+          ),
         });
         const known = new Set(found.map((problem) => problem.id));
         found = [
@@ -2358,11 +2403,9 @@ function App() {
     request: ApprovalRequest,
     approved: boolean,
   ) => {
-    const decision = approved ? "approved" : "declined";
-    approvalsRef.current = approvalsRef.current.map((item) =>
-      item.id === request.id ? { ...item, status: decision } : item,
-    );
-    setApprovals(approvalsRef.current);
+    const decision: "approved" | "declined" = approved
+      ? "approved"
+      : "declined";
     if (request.nativeRequestId && isTauri())
       await invoke(
         request.runId ? "respond_run_approval" : "respond_codex_approval",
@@ -2377,6 +2420,39 @@ function App() {
               decision: approved ? "accept" : "decline",
             },
       );
+    const resolution: NativeApprovalResolution = request.nativeRequestId
+      ? resolveNativeApproval(
+          approvalsRef.current,
+          request.nativeRequestId,
+          decision,
+        )
+      : {
+          requests: approvalsRef.current.map((item) =>
+            item.id === request.id ? { ...item, status: decision } : item,
+          ),
+          resumeNodeId: null,
+        };
+    approvalsRef.current = resolution.requests;
+    setApprovals(resolution.requests);
+    if (resolution.resumeNodeId && !request.runId) {
+      setNodes((nodes) =>
+        nodes.map((node) =>
+          node.id === resolution.resumeNodeId && node.data.status === "approval"
+            ? {
+                ...node,
+                data: {
+                  ...node.data,
+                  status: "running",
+                  trace: [
+                    ...node.data.trace,
+                    `Codex tool approval ${decision}`,
+                  ],
+                },
+              }
+            : node,
+        ),
+      );
+    }
     const next = approvalsRef.current.find((item) => item.status === "pending");
     setActiveApproval(next ?? null);
   };
@@ -2450,8 +2526,33 @@ function App() {
       "warning",
     );
   };
-  const run = async (startNodeId?: string) => {
-    if (running || !(await validate())) return;
+  const run = async (startNodeId?: string, missionOverride?: string) => {
+    if (running) return false;
+    const authorizedNodes = missionOverride?.trim()
+      ? nodes.map((node) =>
+          node.data.kind === "input"
+            ? {
+                ...node,
+                data: { ...node.data, output: missionOverride.trim() },
+              }
+            : node,
+        )
+      : nodes;
+    const missionNode = authorizedNodes.find(
+      (node) => node.data.kind === "input",
+    );
+    if (!isConcreteMission(missionNode?.data.output)) {
+      emit(
+        "Add a concrete product request to the Mission brief before starting the company.",
+        "run.mission.required",
+        missionNode?.id,
+        "error",
+      );
+      setDrawer(true);
+      setDrawerTab("timeline");
+      return false;
+    }
+    if (!(await validate(authorizedNodes, edges))) return false;
     if (!isTauri()) {
       emit(
         "Live Codex runs require the desktop app.",
@@ -2459,7 +2560,7 @@ function App() {
         undefined,
         "error",
       );
-      return;
+      return false;
     }
     setRunning(true);
     setDrawer(true);
@@ -2467,10 +2568,10 @@ function App() {
     eventsRef.current = [];
     setEvents([]);
     try {
-      const persisted = await save();
+      const persisted = await save(false, authorizedNodes, edges);
       if (!persisted) {
         setRunning(false);
-        return;
+        return false;
       }
       const record = await invoke<RunRecord>("start_run", {
         workflowId,
@@ -2482,8 +2583,11 @@ function App() {
         record,
         ...items.filter((item) => item.id !== record.id),
       ]);
-      setNodes((items) => items.map(resetExecutableNodeForRun));
+      setNodes(
+        prepareNodesForRun(authorizedNodes, undefined, edges, startNodeId),
+      );
       emit(`Native run ${record.id.slice(-8)} queued`, "run.queued");
+      return true;
     } catch (error) {
       setRunning(false);
       emit(
@@ -2492,6 +2596,7 @@ function App() {
         undefined,
         "error",
       );
+      return false;
     }
   };
 
@@ -2816,15 +2921,14 @@ function App() {
       // 1) Auto-load last saved workflow for the active template when present.
       // Skip if the user already Seeded/edited after first paint (late-load race).
       try {
-        const raw = isTauri()
-          ? await invoke<string | null>("load_workflow", { id: activeId })
-          : localStorage.getItem(workflowStorageKey(activeId));
-        const snapshot = parseWorkflowSnapshot(raw);
+        const persisted = await loadPersistedWorkflowState(activeId);
+        const snapshot = parseWorkflowSnapshot(persisted?.graphJson ?? null);
         if (
           !cancelled &&
           shouldApplyAutoloadSnapshot(userMutatedWorkflow.current)
         ) {
           if (snapshot) {
+            activeChatWorkspaceRef.current = persisted?.workspacePath ?? null;
             setWorkflowId(activeId);
             setNodes(snapshot.nodes);
             setEdges(snapshot.edges);
@@ -2900,7 +3004,11 @@ function App() {
       try {
         if (isTauri()) {
           const settings = await invoke<any>("get_app_settings");
-          if (!cancelled && settings && typeof settings.costPer1kTokensUsd === "number") {
+          if (
+            !cancelled &&
+            settings &&
+            typeof settings.costPer1kTokensUsd === "number"
+          ) {
             setCostPer1k(settings.costPer1kTokensUsd);
           }
         }
@@ -2923,7 +3031,10 @@ function App() {
     };
     window.addEventListener("codex-corp:settings-changed", onSettingsChanged);
     return () =>
-      window.removeEventListener("codex-corp:settings-changed", onSettingsChanged);
+      window.removeEventListener(
+        "codex-corp:settings-changed",
+        onSettingsChanged,
+      );
   }, []);
   useEffect(() => {
     const onPersistenceError = (event: Event) => {
@@ -2965,7 +3076,14 @@ function App() {
           extractTotalTokensFromPayload(payload),
           extractTotalTokensFromPayload(payload.message),
         );
-        if (!lifecycle && !streaming && !streamingTrace && !tokenEvent && tokens <= 0) return;
+        if (
+          !lifecycle &&
+          !streaming &&
+          !streamingTrace &&
+          !tokenEvent &&
+          tokens <= 0
+        )
+          return;
         setNodes((ns) =>
           ns.map((n) => {
             if (n.id !== payload.nodeId) return n;
@@ -3030,18 +3148,22 @@ function App() {
       }>("codex-approval-requested", (event) => {
         if (disposed) return;
         const payload = event.payload;
-        const structured = parseStructuredApproval(payload.method, payload.params);
+        const structured = parseStructuredApproval(
+          payload.method,
+          payload.params,
+        );
         const request: ApprovalRequest = {
           id: crypto.randomUUID(),
           nativeRequestId: payload.requestId,
           nodeId: payload.nodeId,
-          title: structured.kind === "fileChange"
-            ? "Approve proposed file changes"
-            : structured.kind === "execCommand"
-              ? `Approve command execution`
-              : payload.method.includes("fileChange")
-                ? "Approve proposed file changes"
-                : "Approve Codex tool action",
+          title:
+            structured.kind === "fileChange"
+              ? "Approve proposed file changes"
+              : structured.kind === "execCommand"
+                ? `Approve command execution`
+                : payload.method.includes("fileChange")
+                  ? "Approve proposed file changes"
+                  : "Approve Codex tool action",
           detail: JSON.stringify(payload.params, null, 2),
           risk: "Review the command, paths, working directory and requested permission. This decision applies once.",
           status: "pending",
@@ -3069,6 +3191,48 @@ function App() {
         );
       }),
     );
+    unlisteners.push(
+      listen<{
+        requestId: string;
+        nodeId: string;
+        decision: "accept" | "decline";
+      }>("codex-approval-resolved", (event) => {
+        if (disposed) return;
+        const payload = event.payload;
+        const status = payload.decision === "accept" ? "approved" : "declined";
+        const resolution = resolveNativeApproval(
+          approvalsRef.current,
+          payload.requestId,
+          status,
+        );
+        if (resolution.requests === approvalsRef.current) return;
+        approvalsRef.current = resolution.requests;
+        setApprovals(resolution.requests);
+        setActiveApproval(
+          resolution.requests.find((item) => item.status === "pending") ?? null,
+        );
+        if (resolution.resumeNodeId) {
+          setNodes((nodes) =>
+            nodes.map((node) =>
+              node.id === resolution.resumeNodeId &&
+              node.data.status === "approval"
+                ? {
+                    ...node,
+                    data: {
+                      ...node.data,
+                      status: "running",
+                      trace: [
+                        ...node.data.trace,
+                        `Codex tool approval ${status}`,
+                      ],
+                    },
+                  }
+                : node,
+            ),
+          );
+        }
+      }),
+    );
     // Handle user-input and elicitation requests (reuse approval broker).
     unlisteners.push(
       listen<{
@@ -3079,39 +3243,57 @@ function App() {
       }>("codex-user-input-requested", (event) => {
         if (disposed) return;
         const p = event.payload;
-        interactionQueue.current = interactionQueue.current.then(async () => {
-          let payload = buildUserInputResponse([]);
-          try {
-            const questions = parseUserInputQuestions(p.params);
-            const answers: MediatorQuestionAnswer[] = [];
-            const timeoutMs = Number(p.params.autoResolutionMs) || 0;
-            const collect = async () => {
-              for (const question of questions) {
-                const answer = await askMediatorQuestion(question);
-                if (!answer) return null;
-                answers.push(answer);
+        interactionQueue.current = interactionQueue.current
+          .then(async () => {
+            let payload = buildUserInputResponse([]);
+            try {
+              const questions = parseUserInputQuestions(p.params);
+              const answers: MediatorQuestionAnswer[] = [];
+              const timeoutMs = Number(p.params.autoResolutionMs) || 0;
+              const collect = async () => {
+                for (const question of questions) {
+                  const answer = await askMediatorQuestion(question);
+                  if (!answer) return null;
+                  answers.push(answer);
+                }
+                return answers;
+              };
+              const collected =
+                timeoutMs > 0
+                  ? await Promise.race([
+                      collect(),
+                      new Promise<null>((resolve) =>
+                        setTimeout(() => resolve(null), timeoutMs),
+                      ),
+                    ])
+                  : await collect();
+              if (collected) payload = buildUserInputResponse(collected);
+              else {
+                questionResolver.current?.(null);
+                questionResolver.current = null;
+                setActiveQuestion(null);
               }
-              return answers;
-            };
-            const collected = timeoutMs > 0
-              ? await Promise.race([
-                  collect(),
-                  new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs)),
-                ])
-              : await collect();
-            if (collected) payload = buildUserInputResponse(collected);
-            else {
-              questionResolver.current?.(null);
-              questionResolver.current = null;
-              setActiveQuestion(null);
+            } catch (failure) {
+              emit(
+                `Invalid Codex question: ${failure instanceof Error ? failure.message : String(failure)}`,
+                "interaction.invalid",
+                p.nodeId,
+                "error",
+              );
             }
-          } catch (failure) {
-            emit(`Invalid Codex question: ${failure instanceof Error ? failure.message : String(failure)}`, "interaction.invalid", p.nodeId, "error");
-          }
-          await invoke("respond_user_input", { requestId: p.requestId, payload });
-        }).catch((failure) => {
-          emit(`Could not answer Codex question: ${String(failure)}`, "interaction.failed", p.nodeId, "error");
-        });
+            await invoke("respond_user_input", {
+              requestId: p.requestId,
+              payload,
+            });
+          })
+          .catch((failure) => {
+            emit(
+              `Could not answer Codex question: ${String(failure)}`,
+              "interaction.failed",
+              p.nodeId,
+              "error",
+            );
+          });
       }),
     );
     unlisteners.push(
@@ -3123,32 +3305,59 @@ function App() {
       }>("codex-elicitation-requested", (event) => {
         if (disposed) return;
         const p = event.payload;
-        interactionQueue.current = interactionQueue.current.then(async () => {
-          let payload: Record<string, unknown> = { action: "cancel", content: {}, _meta: null };
-          try {
-            const fields = parseElicitationForm(p.params);
-            const content: Record<string, unknown> = {};
-            for (const field of fields) {
-              const answer = await askMediatorQuestion(field.question);
-              if (!answer) {
-                await invoke("respond_user_input", { requestId: p.requestId, payload });
-                return;
+        interactionQueue.current = interactionQueue.current
+          .then(async () => {
+            let payload: Record<string, unknown> = {
+              action: "cancel",
+              content: {},
+              _meta: null,
+            };
+            try {
+              const fields = parseElicitationForm(p.params);
+              const content: Record<string, unknown> = {};
+              for (const field of fields) {
+                const answer = await askMediatorQuestion(field.question);
+                if (!answer) {
+                  await invoke("respond_user_input", {
+                    requestId: p.requestId,
+                    payload,
+                  });
+                  return;
+                }
+                const raw = answer.freeText ?? answer.optionIds[0] ?? "";
+                content[field.id] =
+                  field.valueType === "number"
+                    ? Number(raw)
+                    : field.valueType === "boolean"
+                      ? raw === "true"
+                      : raw;
               }
-              const raw = answer.freeText ?? answer.optionIds[0] ?? "";
-              content[field.id] = field.valueType === "number"
-                ? Number(raw)
-                : field.valueType === "boolean"
-                  ? raw === "true"
-                  : raw;
+              payload = {
+                action: "accept",
+                content,
+                _meta: p.params._meta ?? null,
+              };
+            } catch (failure) {
+              emit(
+                `Invalid MCP elicitation: ${failure instanceof Error ? failure.message : String(failure)}`,
+                "interaction.invalid",
+                p.nodeId,
+                "error",
+              );
             }
-            payload = { action: "accept", content, _meta: p.params._meta ?? null };
-          } catch (failure) {
-            emit(`Invalid MCP elicitation: ${failure instanceof Error ? failure.message : String(failure)}`, "interaction.invalid", p.nodeId, "error");
-          }
-          await invoke("respond_user_input", { requestId: p.requestId, payload });
-        }).catch((failure) => {
-          emit(`Could not answer MCP elicitation: ${String(failure)}`, "interaction.failed", p.nodeId, "error");
-        });
+            await invoke("respond_user_input", {
+              requestId: p.requestId,
+              payload,
+            });
+          })
+          .catch((failure) => {
+            emit(
+              `Could not answer MCP elicitation: ${String(failure)}`,
+              "interaction.failed",
+              p.nodeId,
+              "error",
+            );
+          });
       }),
     );
     return () => {
@@ -3178,65 +3387,40 @@ function App() {
         if (disposed) return;
         const payload = event.payload;
         if (runId && payload.runId !== runId) return;
-        const nodeStatus: Partial<Record<string, Status>> = {
-          "node.attempt.started": "running",
-          "node.attempt.completed": "completed",
-          "node.attempt.failed": "failed",
-          "node.skipped": "skipped",
-          "approval.requested": "approval",
-        };
-        if (payload.nodeId && nodeStatus[payload.eventType]) {
+        const nodeStatus = nodeStatusForRunEvent(payload.eventType);
+        if (
+          payload.nodeId &&
+          (nodeStatus || payload.eventType === "revision.routed")
+        ) {
           const diag = payload.diagnostics ?? {};
-          const summary =
-            typeof diag.summary === "string" ? diag.summary : undefined;
-          const data =
-            diag.data &&
-            typeof diag.data === "object" &&
-            !Array.isArray(diag.data)
-              ? (diag.data as Record<string, unknown>)
-              : undefined;
-          const artifacts = Array.isArray(diag.artifacts)
-            ? diag.artifacts
-            : undefined;
           setNodes((items) =>
-            items.map((node) =>
-              node.id === payload.nodeId
-                ? {
-                    ...node,
-                    data: {
-                      ...node.data,
-                      status: nodeStatus[payload.eventType]!,
-                      // Live SSOT chips: slim diagnostics carry summary + data.verification
-                      // (+ artifact meta without file bodies). Full content stays in node_executions.
-                      ...(payload.eventType === "node.attempt.completed"
-                        ? {
-                            ...(summary !== undefined
-                              ? { output: summary }
-                              : {}),
-                            ...(data !== undefined
-                              ? {
-                                  structuredOutput: {
-                                    ...(typeof node.data.structuredOutput ===
-                                      "object" && node.data.structuredOutput
-                                      ? node.data.structuredOutput
-                                      : {}),
-                                    ...data,
-                                  },
-                                }
-                              : {}),
-                            ...(artifacts !== undefined
-                              ? {
-                                  artifacts:
-                                    artifacts as typeof node.data.artifacts,
-                                }
-                              : {}),
-                          }
-                        : {}),
-                      trace: [...node.data.trace, payload.message].slice(-80),
-                    },
-                  }
-                : node,
-            ),
+            items.map((node) => {
+              if (node.id !== payload.nodeId) return node;
+              const revisions = revisionCountForRunEvent(
+                payload.eventType,
+                diag,
+                node.data.revisions ?? 0,
+              );
+              return {
+                ...node,
+                data: {
+                  ...node.data,
+                  status: nodeStatus ?? node.data.status,
+                  ...(revisions !== undefined ? { revisions } : {}),
+                  // Host-slimmed diagnostics hydrate specialists and
+                  // deterministic controls without artifact bodies.
+                  ...nodeOutputPatchForRunEvent(
+                    payload.eventType,
+                    diag,
+                    typeof node.data.structuredOutput === "object" &&
+                      node.data.structuredOutput
+                      ? node.data.structuredOutput
+                      : undefined,
+                  ),
+                  trace: [...node.data.trace, payload.message].slice(-80),
+                },
+              };
+            }),
           );
         }
         const runEvent: RunEvent = {
@@ -3319,7 +3503,7 @@ function App() {
           nodeId: payload.nodeId,
           title: payload.title,
           detail: payload.detail,
-          risk: "This explicit human decision controls delivery for this run only.",
+          risk: "This explicit human decision authorizes the verified release bundle for this run only.",
           status: "pending",
         };
         approvalsRef.current = [...approvalsRef.current, request];
@@ -4518,7 +4702,7 @@ function App() {
                       label="Estimated cost"
                       value={`$${estimateTokenCostUsd(
                         nodes.reduce((s, n) => s + n.data.tokens, 0),
-                        costPer1k
+                        costPer1k,
                       ).toFixed(2)}`}
                     />
                   </div>

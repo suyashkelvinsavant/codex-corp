@@ -255,8 +255,77 @@ export function appendCompletionCriteriaToPrompt(
   return base ? `${base}\n${block}` : block.trimStart();
 }
 
-const HIDDEN_REASONING_RE =
-  /\b(chain[-\s]?of[-\s]?thought|internal monologue|hidden reasoning|reasoning_content|scratchpad:)\b/i;
+const PRIVATE_REASONING_KEYS = new Set([
+  "chain_of_thought",
+  "hidden_reasoning",
+  "internal_monologue",
+  "reasoning_content",
+  "scratchpad",
+]);
+
+const PRIVATE_REASONING_SECTION_RE =
+  /^(?:chain[-\s]?of[-\s]?thought|hidden reasoning|internal monologue|reasoning_content|scratchpad)\s*:\s*\S/i;
+const PRIVATE_REASONING_HEADING_RE =
+  /^(?:chain[-\s]?of[-\s]?thought|hidden reasoning|internal monologue|reasoning_content|scratchpad)\s*:?\s*$/i;
+
+function normalizedPrivateReasoningKey(key: string): string {
+  return key
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+}
+
+function privateReasoningSection(text: string): boolean {
+  const lines = text.split(/\r?\n/);
+  return lines.some((line, index) => {
+    const cleaned = line.replace(/^\s*(?:#{1,6}|[-*])\s*/, "").trim();
+    if (PRIVATE_REASONING_SECTION_RE.test(cleaned)) return true;
+    if (!PRIVATE_REASONING_HEADING_RE.test(cleaned)) return false;
+    return lines.slice(index + 1).some((next) => next.trim().length > 0);
+  });
+}
+
+function hiddenReasoningViolation(
+  value: unknown,
+  path: string,
+  depth = 0,
+): string | null {
+  if (depth > 32) return `${path} exceeds the private-reasoning scan depth`;
+  if (typeof value === "string") {
+    if (privateReasoningSection(value))
+      return `private-reasoning section marker at ${path}`;
+    const trimmed = value.trim();
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      try {
+        return hiddenReasoningViolation(JSON.parse(trimmed), path, depth + 1);
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      const violation = hiddenReasoningViolation(
+        value[index],
+        `${path}[${index}]`,
+        depth + 1,
+      );
+      if (violation) return violation;
+    }
+    return null;
+  }
+  if (value && typeof value === "object") {
+    for (const [key, child] of Object.entries(value)) {
+      const childPath = `${path}.${key}`;
+      if (PRIVATE_REASONING_KEYS.has(normalizedPrivateReasoningKey(key)))
+        return `explicit private-reasoning field at ${childPath}`;
+      const violation = hiddenReasoningViolation(child, childPath, depth + 1);
+      if (violation) return violation;
+    }
+  }
+  return null;
+}
 
 function evaluateOne(
   criterion: CompletionCriterion,
@@ -304,7 +373,6 @@ function evaluateOne(
       : result.structuredOutput && typeof result.structuredOutput === "object"
         ? result.structuredOutput
         : null;
-  const blob = `${summary}\n${JSON.stringify(data ?? {})}`;
 
   switch (criterion.kind) {
     case "structured_json": {
@@ -347,14 +415,16 @@ function evaluateOne(
       };
     }
     case "no_hidden_reasoning": {
-      const leaked = HIDDEN_REASONING_RE.test(blob);
+      const violation =
+        hiddenReasoningViolation(summary, "summary") ??
+        hiddenReasoningViolation(data ?? {}, "data");
       return {
         id: criterion.id,
         label: criterion.label,
-        status: leaked ? "fail" : "pass",
-        detail: leaked
-          ? "Possible hidden-reasoning markers in summary/data"
-          : "No hidden-reasoning markers detected",
+        status: violation ? "fail" : "pass",
+        detail:
+          violation ??
+          "No explicit private-reasoning fields or sections detected",
         enforcement,
       };
     }

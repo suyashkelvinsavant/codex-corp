@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildMediatorContextDigest,
   companyMediatorDynamicTools,
+  COMPANY_MEDIATOR_SYSTEM_PROMPT,
   executeCompanyMediatorTool,
   type MediatorHostContext,
 } from "./company-mediator-tools";
@@ -81,6 +82,25 @@ function ctx(over: Partial<MediatorHostContext> = {}): MediatorHostContext {
 }
 
 describe("company-mediator-tools", () => {
+  it("treats a clear simple build request as actionable with conservative defaults", () => {
+    expect(COMPANY_MEDIATOR_SYSTEM_PROMPT).toMatch(
+      /simple fish ?bowl shop website/i,
+    );
+    expect(COMPANY_MEDIATOR_SYSTEM_PROMPT).toMatch(/minimally actionable/i);
+  });
+
+  it("does not block an actionable build on optional product details", () => {
+    expect(COMPANY_MEDIATOR_SYSTEM_PROMPT).toMatch(
+      /do not ask optional scope or style questions before starting/i,
+    );
+  });
+
+  it("requires tool-confirmed run success before announcing a start", () => {
+    expect(COMPANY_MEDIATOR_SYSTEM_PROMPT).toMatch(
+      /only say the run started when company_run returns started: true/i,
+    );
+  });
+
   it("exports dynamic tool specs including node inspection", () => {
     const tools = companyMediatorDynamicTools();
     const names = tools.map((t) => t.name);
@@ -145,6 +165,7 @@ describe("company-mediator-tools", () => {
 
   it("company_run invokes host action", async () => {
     let ran = false;
+    let runMission: string | undefined;
     const r = await executeCompanyMediatorTool(
       "company_run",
       { mission: "New mission" },
@@ -153,14 +174,37 @@ describe("company-mediator-tools", () => {
           setMission: (m) => {
             expect(m).toBe("New mission");
           },
-          run: () => {
+          run: (mission) => {
             ran = true;
+            runMission = mission;
+            return true;
           },
         },
       }),
     );
     expect(r.success).toBe(true);
     expect(ran).toBe(true);
+    expect(runMission).toBe("New mission");
+  });
+
+  it("company_run fails closed when no host run action is available", async () => {
+    const r = await executeCompanyMediatorTool(
+      "company_run",
+      { mission: "Build a fishbowl shop website" },
+      ctx({ actions: {} }),
+    );
+    expect(r.success).toBe(false);
+    expect(r.text).toMatch(/run action is unavailable/i);
+  });
+
+  it("company_run reports a host-side refusal instead of fabricated success", async () => {
+    const r = await executeCompanyMediatorTool(
+      "company_run",
+      { mission: "Build a fishbowl shop website" },
+      ctx({ actions: { run: () => false } }),
+    );
+    expect(r.success).toBe(false);
+    expect(r.text).toMatch(/did not start/i);
   });
 
   it("ambiguous labels return candidates", async () => {

@@ -15,7 +15,8 @@ export type NodePack = {
   developerInstructions: string;
   harnessCoreVersion: string;
   tools: string[];
-  skills: string[];
+  /** Role guidance only; these names are not connector selections. */
+  skillHints: string[];
   nonGoals?: string[];
   completionCriteria?: CompletionCriterion[];
   sandboxProfile?: "read-only" | "workspace-write";
@@ -37,7 +38,10 @@ export type PackInstantiation = {
   /** Deprecated single-blob mirror of developerInstructions for legacy readers. */
   prompt: string;
   tools: string[];
+  /** Live connector skills explicitly selected by the operator. */
   skills: string[];
+  /** Non-binding role guidance retained for catalog/prompt UX. */
+  skillHints: string[];
   completionCriteria?: CompletionCriterion[];
   sandboxProfile?: "read-only" | "workspace-write";
   approvalPolicy?: "on-request" | "untrusted" | "never";

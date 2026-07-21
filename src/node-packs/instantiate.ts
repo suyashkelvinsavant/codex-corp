@@ -15,7 +15,10 @@ export function instantiatePack(pack: NodePack): PackInstantiation {
     developerInstructions: pack.developerInstructions,
     prompt: pack.developerInstructions,
     tools: [...pack.tools],
-    skills: [...pack.skills],
+    // Packs describe role guidance, but connector skills are workspace-scoped
+    // capabilities and must only be populated from live operator selections.
+    skills: [],
+    skillHints: [...pack.skillHints],
     completionCriteria: pack.completionCriteria
       ? pack.completionCriteria.map((c) => ({ ...c }))
       : defaultPlatformCriteria(),

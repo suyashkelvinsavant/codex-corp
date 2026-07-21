@@ -16,7 +16,7 @@ export function controlKindLabel(kind: Kind): string {
     case "cron":
       return "Schedule";
     case "output":
-      return "Delivery";
+      return "Release";
     case "approval":
       return "Human gate";
     case "condition":

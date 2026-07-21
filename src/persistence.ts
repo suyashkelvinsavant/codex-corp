@@ -1,19 +1,47 @@
-import type {
-  Artifact,
-  FlowEdge,
-  FlowNode,
-  RunEvent,
-  RunRecord,
-  Status,
-  WorkflowSnapshot,
+import {
+  DEFAULT_MAX_REVISIONS,
+  type Artifact,
+  type FlowEdge,
+  type FlowNode,
+  type RunEvent,
+  type RunRecord,
+  type Status,
+  type WorkflowSnapshot,
 } from "./model";
+import { getPack } from "./node-packs/packs";
 
 export const WORKFLOW_ID = "software-company";
 /** Legacy browser key for the original software-company workflow (back-compat). */
 export const WORKFLOW_STORAGE_KEY = "codex-corp-workflow";
 export const ACTIVE_WORKFLOW_KEY = "codex-corp-active-workflow";
 export const RUNS_STORAGE_KEY = "codex-corp-runs";
-export const WORKFLOW_SCHEMA_VERSION = 2 as const;
+export const WORKFLOW_SCHEMA_VERSION = 4 as const;
+
+export type LoadedWorkflowState = {
+  graphJson: string;
+  workspacePath: string | null;
+};
+
+/** Normalize current native records and legacy raw graph payloads at one boundary. */
+export function normalizeLoadedWorkflowState(
+  value: unknown,
+): LoadedWorkflowState | null {
+  if (typeof value === "string") {
+    return { graphJson: value, workspacePath: null };
+  }
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as {
+    graphJson?: unknown;
+    workspacePath?: unknown;
+  };
+  if (typeof candidate.graphJson !== "string") return null;
+  const workspacePath =
+    typeof candidate.workspacePath === "string" &&
+    candidate.workspacePath.trim().length > 0
+      ? candidate.workspacePath.trim()
+      : null;
+  return { graphJson: candidate.graphJson, workspacePath };
+}
 
 /** Serialize every current workflow write with an explicit schema version. */
 export function serializeWorkflowSnapshot(
@@ -37,45 +65,151 @@ type LegacyAgentData = Omit<FlowNode["data"], "workspacePolicy"> & {
 export function normalizeWorkflowSnapshot(
   snapshot: WorkflowSnapshot,
 ): WorkflowSnapshot {
-  const isLegacySnapshot = snapshot.schemaVersion !== WORKFLOW_SCHEMA_VERSION;
+  const sourceVersion = snapshot.schemaVersion ?? 1;
+  const isPreApprovalGateSnapshot = sourceVersion < 2;
   const resetLegacyApproval =
-    isLegacySnapshot &&
+    isPreApprovalGateSnapshot &&
     snapshot.nodes.some(
       (node) =>
         (node.data.kind === "agent" || node.data.kind === "creative") &&
         node.data.requiresApproval === true,
     );
+  const repairedMissingRevisionLimit = snapshot.edges.some(
+    (edge) =>
+      edge.data?.edgeType === "revision" &&
+      edge.data.maxRevisions === undefined,
+  );
+  const migrationNotices: string[] = [];
+  let removedPackSkillHints = false;
+  const affectedSoftwareCompanyPolicy =
+    sourceVersion === 2 &&
+    isAffectedSoftwareCompanyPolicy(snapshot.nodes, snapshot.edges);
+  const hasLegacyDeliveryControl =
+    sourceVersion < 4 && snapshot.nodes.some(isLegacyDeliveryControl);
+  if (resetLegacyApproval) {
+    migrationNotices.push(
+      "Legacy specialist approval flags were reset because they were not runtime gates before workflow schema v2.",
+    );
+  }
+  if (repairedMissingRevisionLimit) {
+    migrationNotices.push(
+      "Added the missing revision limit to an affected saved workflow.",
+    );
+  }
+  if (affectedSoftwareCompanyPolicy) {
+    migrationNotices.push(
+      "Restored on-request approvals for the affected Software Company workflow so dependency setup can request permission.",
+    );
+  }
+  if (hasLegacyDeliveryControl) {
+    migrationNotices.push(
+      "Renamed the default Delivery control to Release Bundle and clarified its verified handoff purpose.",
+    );
+  }
+  const nodes = snapshot.nodes.map((node) => {
+    const legacy = node.data as LegacyAgentData;
+    const {
+      memoryMode: _memoryMode,
+      environmentVariables: _environmentVariables,
+      maxRevisions: _maxRevisions,
+      ...data
+    } = legacy;
+    return {
+      ...node,
+      data: {
+        ...data,
+        ...(sourceVersion < 4 && isLegacyDeliveryControl(node)
+          ? {
+              label: "Release Bundle",
+              role: "Verified handoff",
+              prompt:
+                "After explicit approval, compare approved artifact hashes with the live artifact set and create a tamper-evident release bundle.",
+              description:
+                "Deterministically compares approved artifact hashes with live outputs and packages the verified, tamper-evident handoff. This is not an AI agent.",
+            }
+          : {}),
+        ...(sourceVersion < 4 && data.packId && Array.isArray(data.skills)
+          ? (() => {
+              const hints = new Set(getPack(data.packId)?.skillHints ?? []);
+              const skills = data.skills.filter(
+                (skill) => typeof skill === "string" && !hints.has(skill),
+              );
+              if (skills.length !== data.skills.length) {
+                removedPackSkillHints = true;
+              }
+              return { skills };
+            })()
+          : {}),
+        workspacePolicy:
+          legacy.workspacePolicy === "workflow" ? "workflow" : "isolated",
+        // Before schema v2 this flag was decorative. Do not silently turn an
+        // old saved graph into a blocking post-node approval workflow.
+        ...(isPreApprovalGateSnapshot ? { requiresApproval: false } : {}),
+        ...(affectedSoftwareCompanyPolicy &&
+        (data.kind === "agent" || data.kind === "creative")
+          ? { approvalPolicy: "on-request" as const }
+          : {}),
+      },
+    } as FlowNode;
+  });
+  if (removedPackSkillHints) {
+    migrationNotices.push(
+      "Removed obsolete role skill hints from saved specialists; connector skills must be selected from the live workspace inventory.",
+    );
+  }
   return {
     schemaVersion: WORKFLOW_SCHEMA_VERSION,
-    nodes: snapshot.nodes.map((node) => {
-      const legacy = node.data as LegacyAgentData;
-      const {
-        memoryMode: _memoryMode,
-        environmentVariables: _environmentVariables,
-        maxRevisions: _maxRevisions,
-        ...data
-      } = legacy;
-      return {
-        ...node,
-        data: {
-          ...data,
-          workspacePolicy:
-            legacy.workspacePolicy === "workflow" ? "workflow" : "isolated",
-          // Before schema v2 this flag was decorative. Do not silently turn an
-          // old saved graph into a blocking post-node approval workflow.
-          ...(isLegacySnapshot ? { requiresApproval: false } : {}),
-        },
-      } as FlowNode;
-    }),
-    edges: snapshot.edges,
-    ...(resetLegacyApproval
-      ? {
-          migrationNotices: [
-            "Legacy specialist approval flags were reset because they were not runtime gates before workflow schema v2.",
-          ],
-        }
-      : {}),
+    nodes,
+    edges: snapshot.edges.map((edge) =>
+      edge.data?.edgeType === "revision" && edge.data.maxRevisions === undefined
+        ? {
+            ...edge,
+            data: { ...edge.data, maxRevisions: DEFAULT_MAX_REVISIONS },
+          }
+        : edge,
+    ),
+    ...(migrationNotices.length ? { migrationNotices } : {}),
   };
+}
+
+function isLegacyDeliveryControl(node: FlowNode): boolean {
+  return (
+    node.data.kind === "output" &&
+    node.data.label === "Delivery" &&
+    node.data.role === "Control" &&
+    node.data.model === "Collector"
+  );
+}
+
+function isAffectedSoftwareCompanyPolicy(
+  nodes: FlowNode[],
+  edges: FlowEdge[],
+): boolean {
+  const expectedPacks = new Map([
+    ["pm", "product-manager"],
+    ["architect", "architect"],
+    ["builder", "frontend-engineer"],
+    ["qa", "qa-engineer"],
+  ]);
+  const specialists = nodes.filter((node) => expectedPacks.has(node.id));
+  if (specialists.length !== expectedPacks.size) return false;
+  if (
+    !specialists.every(
+      (node) =>
+        node.data.packId === expectedPacks.get(node.id) &&
+        node.data.approvalPolicy === "never" &&
+        node.data.sandboxProfile === "workspace-write" &&
+        node.data.workspacePolicy === "workflow",
+    )
+  ) {
+    return false;
+  }
+  return edges.some(
+    (edge) =>
+      edge.source === "qa" &&
+      edge.target === "builder" &&
+      edge.data?.edgeType === "revision",
+  );
 }
 
 /** Per-template browser storage key; software-company keeps the legacy key. */
@@ -135,7 +269,10 @@ export function parseWorkflowSnapshot(
     if (!parsed.nodes.length) return null;
     if (
       parsed.schemaVersion !== undefined &&
-      parsed.schemaVersion !== WORKFLOW_SCHEMA_VERSION
+      (typeof parsed.schemaVersion !== "number" ||
+        !Number.isInteger(parsed.schemaVersion) ||
+        parsed.schemaVersion < 1 ||
+        parsed.schemaVersion > WORKFLOW_SCHEMA_VERSION)
     ) {
       // A newer writer may have different semantics. Fail closed instead of
       // silently applying the legacy migration and destroying unknown fields.

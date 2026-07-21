@@ -3,6 +3,7 @@ import {
   composeAuthorizedMission,
   constraintsFromTextarea,
   constraintsToTextarea,
+  isConcreteMission,
   normalizeMissionConstraints,
 } from "./mission-context";
 
@@ -40,5 +41,26 @@ describe("mission-context", () => {
     const lines = constraintsFromTextarea("A\n\nB\nA");
     expect(lines).toEqual(["A", "B"]);
     expect(constraintsToTextarea(lines)).toBe("A\nB");
+  });
+
+  it.each([
+    ["empty", ""],
+    ["whitespace", "   \n\t  "],
+    ["template prompt", "Describe the product request for the company."],
+    ["empty fallback", "No workflow mission was provided."],
+    ["greeting", "hello"],
+    ["polite greeting", "Hello there!"],
+    ["workflow information question", "What can this workflow do?"],
+    ["capability question", "Can you explain the company template?"],
+  ])("rejects %s as a non-concrete mission", (_label, mission) => {
+    expect(isConcreteMission(mission)).toBe(false);
+  });
+
+  it("accepts a concrete product request", () => {
+    expect(
+      isConcreteMission(
+        "Build a simple Flappy Bird game for students, with keyboard controls and a score counter.",
+      ),
+    ).toBe(true);
   });
 });

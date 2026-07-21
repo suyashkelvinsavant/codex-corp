@@ -388,6 +388,40 @@ struct RuntimeOutput {
     tokens: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NodeExecutionFailure {
+    owner_node_id: Option<String>,
+    message: String,
+}
+
+impl NodeExecutionFailure {
+    fn owned(node_id: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            owner_node_id: Some(node_id.into()),
+            message: message.into(),
+        }
+    }
+
+    fn owner_or<'a>(&'a self, fallback: &'a str) -> &'a str {
+        self.owner_node_id.as_deref().unwrap_or(fallback)
+    }
+}
+
+impl From<String> for NodeExecutionFailure {
+    fn from(message: String) -> Self {
+        Self {
+            owner_node_id: None,
+            message,
+        }
+    }
+}
+
+impl From<&str> for NodeExecutionFailure {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RunCheckpoint {
@@ -842,12 +876,104 @@ fn evaluate_claim_criterion(
     }
 }
 
+fn normalized_private_reasoning_key(key: &str) -> String {
+    normalized_private_reasoning_label(key).replace(' ', "_")
+}
+
+fn normalized_private_reasoning_label(label: &str) -> String {
+    label
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', '_'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_private_reasoning_label(label: &str) -> bool {
+    matches!(
+        normalized_private_reasoning_label(label).as_str(),
+        "chain of thought"
+            | "hidden reasoning"
+            | "internal monologue"
+            | "reasoning content"
+            | "scratchpad"
+    )
+}
+
+fn private_reasoning_section(text: &str) -> bool {
+    let lines: Vec<&str> = text.lines().collect();
+    lines.iter().enumerate().any(|(index, line)| {
+        let mut cleaned = line.trim();
+        cleaned = cleaned.trim_start_matches('#').trim();
+        cleaned = cleaned
+            .strip_prefix("- ")
+            .or_else(|| cleaned.strip_prefix("* "))
+            .unwrap_or(cleaned)
+            .trim();
+        if let Some((label, content)) = cleaned.split_once(':') {
+            if is_private_reasoning_label(label) {
+                return !content.trim().is_empty()
+                    || lines[index + 1..]
+                        .iter()
+                        .any(|following| !following.trim().is_empty());
+            }
+        }
+        is_private_reasoning_label(cleaned)
+            && lines[index + 1..]
+                .iter()
+                .any(|following| !following.trim().is_empty())
+    })
+}
+
+fn hidden_reasoning_value_violation(value: &Value, path: &str, depth: usize) -> Option<String> {
+    if depth > 32 {
+        return Some(format!("{path} exceeds the private-reasoning scan depth"));
+    }
+    match value {
+        Value::String(text) => {
+            if private_reasoning_section(text) {
+                return Some(format!("private-reasoning section marker at {path}"));
+            }
+            let trimmed = text.trim();
+            if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                if let Ok(encoded) = serde_json::from_str::<Value>(trimmed) {
+                    return hidden_reasoning_value_violation(&encoded, path, depth + 1);
+                }
+            }
+            None
+        }
+        Value::Array(items) => items.iter().enumerate().find_map(|(index, item)| {
+            hidden_reasoning_value_violation(item, &format!("{path}[{index}]"), depth + 1)
+        }),
+        Value::Object(entries) => entries.iter().find_map(|(key, child)| {
+            let child_path = format!("{path}.{key}");
+            if matches!(
+                normalized_private_reasoning_key(key).as_str(),
+                "chain_of_thought"
+                    | "hidden_reasoning"
+                    | "internal_monologue"
+                    | "reasoning_content"
+                    | "scratchpad"
+            ) {
+                return Some(format!("explicit private-reasoning field at {child_path}"));
+            }
+            hidden_reasoning_value_violation(child, &child_path, depth + 1)
+        }),
+        _ => None,
+    }
+}
+
+fn hidden_reasoning_violation(summary: &str, data: &Value) -> Option<String> {
+    hidden_reasoning_value_violation(&Value::String(summary.into()), "summary", 0)
+        .or_else(|| hidden_reasoning_value_violation(data, "data", 0))
+}
+
 fn evaluate_criterion(
     criterion: &RuntimeCriterion,
     output: &RuntimeOutput,
     context: &RunContext,
 ) -> CriterionEval {
-    let lower = format!("{}\n{}", output.summary, output.data).to_ascii_lowercase();
     // Shared alias: custom → claim (also applied at deserialize).
     let kind = crate::verifier::normalize_kind(&criterion.kind);
     let required = criterion.platform || criterion.enforcement == "required";
@@ -873,22 +999,12 @@ fn evaluate_criterion(
             }
         }
         "no_hidden_reasoning" => {
-            let leaked = [
-                "chain-of-thought",
-                "chain of thought",
-                "internal monologue",
-                "hidden reasoning",
-                "scratchpad:",
-            ]
-            .iter()
-            .any(|marker| lower.contains(marker));
+            let violation = hidden_reasoning_violation(&output.summary, &output.data);
             CriterionEval {
-                failed: leaked,
-                detail: if leaked {
-                    "possible hidden-reasoning markers in summary/data".into()
-                } else {
-                    "no hidden-reasoning markers detected".into()
-                },
+                failed: violation.is_some(),
+                detail: violation.unwrap_or_else(|| {
+                    "no explicit private-reasoning fields or sections detected".into()
+                }),
                 method: "no_hidden_reasoning".into(),
                 residual_risks: Vec::new(),
             }
@@ -1250,28 +1366,9 @@ async fn specialist_once(
         .output_schema
         .as_deref()
         .and_then(|raw| serde_json::from_str(raw).ok());
-    // Resume thread from previous attempt if available.
-    let resume_thread_id: Option<String> = context
-        .database
-        .0
-        .lock()
-        .ok()
-        .and_then(|db| {
-            let mut stmt = db
-                .prepare(
-                    "SELECT thread_id FROM node_attempts WHERE run_id = ?1 AND node_id = ?2 AND thread_id IS NOT NULL ORDER BY attempt DESC, revision DESC LIMIT 1",
-                )
-                .ok()?;
-            let mut rows = stmt
-                .query_map(params![context.run_id, node.id], |row| {
-                    row.get::<_, Option<String>>(0)
-                })
-                .ok()?;
-            match rows.next() {
-                Some(Ok(Some(tid))) if !tid.is_empty() => Some(tid),
-                _ => None,
-            }
-        });
+    // Every specialist invocation owns a new ephemeral app-server process.
+    // A thread created by a finished process is therefore not resumable.
+    let resume_thread_id = specialist_thread_id_for_attempt(attempt, revision, None);
     // Composition split (plan I.1.2): base | developer+connector+criteria | user_input+extra
     let base_instructions = node.data.base_instructions.trim().to_string();
     let developer_core = if !node.data.developer_instructions.trim().is_empty() {
@@ -1530,6 +1627,14 @@ async fn specialist_once(
     }
 }
 
+fn specialist_thread_id_for_attempt(
+    _attempt: u32,
+    _revision: u32,
+    _prior_thread_id: Option<&str>,
+) -> Option<String> {
+    None
+}
+
 /// Classification of specialist_once Err strings for retry policy (G7).
 /// Verification failures return Ok and are never retried here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1558,7 +1663,11 @@ enum RetryAction {
 fn classify_retry_error(error: &str) -> RetryErrorClass {
     let lower = error.to_ascii_lowercase();
     // Prefer specific phrases over bare substrings (avoid "json"/"429"/"connection" false positives).
-    if lower.contains("timed out")
+    if (lower.contains("wall-clock budget") && lower.contains("exceeded"))
+        || (lower.contains("hard-deadline")
+            && lower.contains("active budget")
+            && lower.contains("exceeded"))
+        || lower.contains("timed out")
         || lower.contains("timeout")
         || lower.contains("rate limit")
         || lower.contains("rate-limit")
@@ -1670,6 +1779,63 @@ fn slim_attempt_completed_diagnostics(
         "summary": output.summary,
         "data": Value::Object(slim_data),
         "artifacts": slim_artifact_meta(&output.artifacts),
+    })
+}
+
+/// Slim deterministic control-node completion data for the live canvas.
+/// Full delivery handoffs and artifact bodies remain in persisted node output.
+fn slim_control_completed_diagnostics(output: &RuntimeOutput) -> Value {
+    const SAFE_DATA_KEYS: &[&str] = &[
+        "schemaVersion",
+        "mode",
+        "status",
+        "review",
+        "decision",
+        "explicitHuman",
+        "approvedArtifacts",
+        "approvedAt",
+        "requestId",
+        "liveArtifactRefs",
+        "verificationSummary",
+        "verification",
+        "residualRisks",
+        "safety",
+        "bundleHash",
+        "branch",
+        "matched",
+        "sourceNodeId",
+        "control",
+    ];
+    let mut slim_data = serde_json::Map::new();
+    for key in SAFE_DATA_KEYS {
+        if let Some(value) = output.data.get(*key) {
+            slim_data.insert((*key).to_string(), value.clone());
+        }
+    }
+    json!({
+        "status": output.status,
+        "summary": output.summary,
+        "data": Value::Object(slim_data),
+        "artifacts": slim_artifact_meta(&output.artifacts),
+        "tokens": output.tokens,
+    })
+}
+
+fn emits_control_completion(kind: Option<&str>) -> bool {
+    matches!(kind, Some("approval" | "merge" | "condition" | "output"))
+}
+
+fn revision_routed_diagnostics(
+    revision: u32,
+    max_revisions: u32,
+    reviewer_node_id: &str,
+    feedback: &str,
+) -> Value {
+    json!({
+        "revision": revision,
+        "maxRevisions": max_revisions,
+        "reviewerNodeId": reviewer_node_id,
+        "feedback": feedback,
     })
 }
 
@@ -1976,8 +2142,10 @@ async fn apply_retry_action(
 async fn execute_specialist_with_revision(
     context: &RunContext,
     node: &RuntimeNode,
-) -> Result<RuntimeOutput, String> {
-    let mut output = specialist_with_retries(context, node, 0, "").await?;
+) -> Result<RuntimeOutput, NodeExecutionFailure> {
+    let mut output = specialist_with_retries(context, node, 0, "")
+        .await
+        .map_err(|error| NodeExecutionFailure::owned(&node.id, error))?;
     emit_advisory_failures(context, node, &output);
     let revision_edge = context.graph.edges.iter().find(|edge| {
         edge.source == node.id
@@ -1998,7 +2166,10 @@ async fn execute_specialist_with_revision(
     };
     let Some(edge) = revision_edge else {
         if let Some(reason) = reason {
-            return Err(format!("{reason}; no revision edge is configured"));
+            return Err(NodeExecutionFailure::owned(
+                &node.id,
+                format!("{reason}; no revision edge is configured"),
+            ));
         }
         return Ok(output);
     };
@@ -2012,7 +2183,7 @@ async fn execute_specialist_with_revision(
         .nodes
         .iter()
         .find(|candidate| candidate.id == edge.target)
-        .ok_or("revision target missing")?;
+        .ok_or_else(|| NodeExecutionFailure::owned(&node.id, "revision target missing"))?;
     for revision in 1..=max {
         let Some(feedback) = reason.take() else {
             return Ok(output);
@@ -2024,7 +2195,7 @@ async fn execute_specialist_with_revision(
             Some(&target.id),
             None,
             format!("Revision {revision}/{max} routed to {}", target.data.label),
-            json!({"reviewerNodeId":node.id,"feedback":feedback}),
+            revision_routed_diagnostics(revision, max, &node.id, &feedback),
         );
         let revised = specialist_with_retries(
             context,
@@ -2035,14 +2206,16 @@ async fn execute_specialist_with_revision(
                 node.data.label
             ),
         )
-        .await?;
+        .await
+        .map_err(|error| NodeExecutionFailure::owned(&target.id, error))?;
         // A revision is a new durable result for the target node, not merely
         // transient reviewer context. Persist it before exposing it in memory.
-        persist_node_output(context, &target.id, &revised)?;
+        persist_node_output(context, &target.id, &revised)
+            .map_err(|error| NodeExecutionFailure::owned(&target.id, error))?;
         context
             .outputs
             .lock()
-            .map_err(|_| "outputs lock poisoned".to_string())?
+            .map_err(|_| NodeExecutionFailure::owned(&target.id, "outputs lock poisoned"))?
             .insert(target.id.clone(), revised);
         output = specialist_with_retries(
             context,
@@ -2050,7 +2223,8 @@ async fn execute_specialist_with_revision(
             revision,
             "\n\nRe-review the revised upstream work and return success only if all required criteria pass.",
         )
-        .await?;
+        .await
+        .map_err(|error| NodeExecutionFailure::owned(&node.id, error))?;
         emit_advisory_failures(context, node, &output);
         reason = if output.status == "needs_revision" {
             Some(output.summary.clone())
@@ -2063,10 +2237,13 @@ async fn execute_specialist_with_revision(
             )
         };
     }
-    Err(format!(
-        "{} exhausted the revision limit ({max}): {}",
-        node.data.label,
-        reason.unwrap_or_else(|| "required criteria remain unsatisfied".into())
+    Err(NodeExecutionFailure::owned(
+        &node.id,
+        format!(
+            "{} exhausted the revision limit ({max}): {}",
+            node.data.label,
+            reason.unwrap_or_else(|| "required criteria remain unsatisfied".into())
+        ),
     ))
 }
 
@@ -2144,7 +2321,28 @@ async fn await_operator_approval(
         .ok()
         .and_then(|mut pending| pending.remove(&request_id));
     update_run_status(&context.database, &context.run_id, "running", None, true);
-    let decision_result = wait_result?;
+    let decision_result = match wait_result {
+        Ok(result) => result,
+        Err(error) => {
+            let error = error.to_string();
+            if let Ok(connection) = context.database.0.lock() {
+                let _ = connection.execute(
+                    "UPDATE approvals SET decision=?2 WHERE id=?1",
+                    params![request_id, error],
+                );
+            }
+            emit_event(
+                context,
+                "approval.expired",
+                "error",
+                Some(&node.id),
+                None,
+                format!("{} approval wait failed: {error}", node.data.label),
+                json!({"requestId":request_id,"error":error}),
+            );
+            return Err(error);
+        }
+    };
     let decision = match decision_result {
         Ok(decision) => decision,
         Err(error) => {
@@ -2154,6 +2352,15 @@ async fn await_operator_approval(
                     params![request_id, error],
                 );
             }
+            emit_event(
+                context,
+                "approval.expired",
+                "error",
+                Some(&node.id),
+                None,
+                format!("{} approval wait ended: {error}", node.data.label),
+                json!({"requestId":request_id,"error":error}),
+            );
             return Err(error);
         }
     };
@@ -2164,6 +2371,15 @@ async fn await_operator_approval(
                 params![request_id],
             );
         }
+        emit_event(
+            context,
+            "approval.declined",
+            "warning",
+            Some(&node.id),
+            None,
+            format!("{} was declined", node.data.label),
+            json!({"requestId":request_id,"decision":"declined"}),
+        );
         return Err("operator declined the approval gate".into());
     }
     if let Ok(connection) = context.database.0.lock() {
@@ -2172,6 +2388,15 @@ async fn await_operator_approval(
             params![request_id],
         );
     }
+    emit_event(
+        context,
+        "approval.approved",
+        "info",
+        Some(&node.id),
+        None,
+        format!("{} was approved", node.data.label),
+        json!({"requestId":request_id,"decision":"approved"}),
+    );
     Ok(request_id)
 }
 
@@ -2180,7 +2405,7 @@ async fn approval_node(context: &RunContext, node: &RuntimeNode) -> Result<Runti
         context,
         node,
         "approval",
-        "Review the completed required work before releasing delivery.",
+        "Review the completed required work before authorizing the verified release bundle.",
     )
     .await?;
     // Freeze approved artifact (key,hash) pairs onto approval output only.
@@ -2298,9 +2523,12 @@ fn collect_residual_risks(
     risks
 }
 
-async fn execute_node(context: &RunContext, node: &RuntimeNode) -> Result<RuntimeOutput, String> {
+async fn execute_node(
+    context: &RunContext,
+    node: &RuntimeNode,
+) -> Result<RuntimeOutput, NodeExecutionFailure> {
     if context.stop.load(Ordering::SeqCst) {
-        return Err("run interrupted".into());
+        return Err(NodeExecutionFailure::owned(&node.id, "run interrupted"));
     }
     match node.data.kind.as_str() {
         "agent" | "creative" => {
@@ -2312,11 +2540,14 @@ async fn execute_node(context: &RunContext, node: &RuntimeNode) -> Result<Runtim
                     "post-node-approval",
                     "Review this specialist's verified output before downstream work is released.",
                 )
-                .await?;
+                .await
+                .map_err(|error| NodeExecutionFailure::owned(&node.id, error))?;
             }
             Ok(output)
         }
-        "approval" => approval_node(context, node).await,
+        "approval" => approval_node(context, node)
+            .await
+            .map_err(|error| NodeExecutionFailure::owned(&node.id, error)),
         "merge" => Ok(RuntimeOutput {
             status: "success".into(),
             summary: "Dependencies joined.".into(),
@@ -2394,7 +2625,7 @@ async fn execute_node(context: &RunContext, node: &RuntimeNode) -> Result<Runtim
             match delivery_pair_compare(&approved_artifacts, &live_refs) {
                 DeliveryCompareResult::Pass => {}
                 DeliveryCompareResult::Fail(reason) => {
-                    return Err(format!("delivery pair-compare failed: {reason}"));
+                    return Err(format!("delivery pair-compare failed: {reason}").into());
                 }
             }
             let handoffs: Vec<Value> = outputs
@@ -2442,7 +2673,7 @@ async fn execute_node(context: &RunContext, node: &RuntimeNode) -> Result<Runtim
                 tokens: 0,
             })
         }
-        _ => Err(format!("unsupported runtime node kind: {}", node.data.kind)),
+        _ => Err(format!("unsupported runtime node kind: {}", node.data.kind).into()),
     }
 }
 
@@ -2601,6 +2832,45 @@ fn downstream_from(graph: &RuntimeGraph, start: Option<&str>) -> HashSet<String>
     included
 }
 
+fn initial_execution_sets(
+    graph: &RuntimeGraph,
+    start: Option<&str>,
+) -> (HashSet<String>, HashSet<String>, HashSet<String>) {
+    let included = downstream_from(graph, start);
+    let mut prerequisites = HashSet::new();
+    if let Some(start) = start {
+        let mut frontier = vec![start.to_string()];
+        while let Some(target) = frontier.pop() {
+            for edge in graph.edges.iter().filter(|edge| {
+                edge.target == target
+                    && edge.data.as_ref().map(|data| data.edge_type.as_str()) != Some("revision")
+            }) {
+                if prerequisites.insert(edge.source.clone()) {
+                    frontier.push(edge.source.clone());
+                }
+            }
+        }
+        prerequisites.remove(start);
+    }
+    let completed: HashSet<String> = graph
+        .nodes
+        .iter()
+        .filter(|node| {
+            prerequisites.contains(&node.id)
+                || (included.contains(&node.id)
+                    && (node.data.kind == "input" || node.data.kind == "cron"))
+        })
+        .map(|node| node.id.clone())
+        .collect();
+    let skipped = graph
+        .nodes
+        .iter()
+        .filter(|node| !included.contains(&node.id) && !prerequisites.contains(&node.id))
+        .map(|node| node.id.clone())
+        .collect();
+    (included, completed, skipped)
+}
+
 async fn run_worker(
     context: RunContext,
     workflow_id: String,
@@ -2618,23 +2888,8 @@ async fn run_worker(
         "Native workflow runtime started",
         json!({"runtimeVersion":RUNTIME_VERSION}),
     );
-    let included = downstream_from(&context.graph, start_node_id.as_deref());
-    let mut completed: HashSet<String> = context
-        .graph
-        .nodes
-        .iter()
-        .filter(|node| {
-            node.data.kind == "input" || node.data.kind == "cron" || !included.contains(&node.id)
-        })
-        .map(|node| node.id.clone())
-        .collect();
-    let mut skipped: HashSet<String> = context
-        .graph
-        .nodes
-        .iter()
-        .filter(|node| !included.contains(&node.id))
-        .map(|node| node.id.clone())
-        .collect();
+    let (included, mut completed, mut skipped) =
+        initial_execution_sets(&context.graph, start_node_id.as_deref());
     if let Some(checkpoint) = resume_checkpoint {
         completed.extend(checkpoint.completed);
         skipped.extend(checkpoint.skipped);
@@ -2752,10 +3007,36 @@ async fn run_worker(
                         ));
                         break;
                     }
+                    let node_kind = context
+                        .graph
+                        .nodes
+                        .iter()
+                        .find(|candidate| candidate.id == node_id)
+                        .map(|candidate| candidate.data.kind.as_str());
+                    let control_completion = emits_control_completion(node_kind)
+                        .then(|| slim_control_completed_diagnostics(&output));
                     if let Ok(mut outputs) = context.outputs.lock() {
                         outputs.insert(node_id.clone(), output);
                     }
                     completed.insert(node_id.clone());
+                    if let Some(diagnostics) = control_completion {
+                        let label = context
+                            .graph
+                            .nodes
+                            .iter()
+                            .find(|candidate| candidate.id == node_id)
+                            .map(|candidate| candidate.data.label.as_str())
+                            .unwrap_or(node_id.as_str());
+                        emit_event(
+                            &context,
+                            "node.completed",
+                            "info",
+                            Some(&node_id),
+                            None,
+                            format!("{label} completed"),
+                            diagnostics,
+                        );
+                    }
                     if let Some(branch) = branch {
                         for edge in context.graph.edges.iter().filter(|edge| {
                             edge.source == node_id
@@ -2778,7 +3059,7 @@ async fn run_worker(
                     }
                 }
                 Ok((node_id, Err(error))) => {
-                    batch_failure = Some((node_id, error));
+                    batch_failure = Some((error.owner_or(&node_id).to_string(), error.message));
                     break;
                 }
                 Err(error) => {
@@ -2788,6 +3069,15 @@ async fn run_worker(
             }
         }
         if let Some((node_id, error)) = batch_failure {
+            emit_event(
+                &context,
+                "node.terminal.failed",
+                "error",
+                Some(&node_id),
+                None,
+                format!("{node_id} terminally failed: {error}"),
+                json!({"status":"failed","error":error}),
+            );
             terminal_error = Some(format!("node {node_id} terminally failed: {error}"));
             context.stop.store(true, Ordering::SeqCst);
             kill_run_processes(
@@ -3745,6 +4035,45 @@ mod tests {
     }
 
     #[test]
+    fn hidden_reasoning_detection_handles_five_adversarial_shapes() {
+        assert_eq!(
+            hidden_reasoning_violation(
+                "Completed the architecture handoff successfully.",
+                &json!({"criteria":[{"evidence":"No hidden reasoning was exposed in the response."}]})
+            ),
+            None
+        );
+
+        let explicit_field = hidden_reasoning_violation(
+            "Completed the architecture handoff successfully.",
+            &json!({"reasoning_content":"First I considered private alternatives."}),
+        )
+        .expect("explicit private-reasoning key must fail");
+        assert!(explicit_field.contains("data.reasoning_content"));
+
+        let nested_field = hidden_reasoning_violation(
+            "Completed the architecture handoff successfully.",
+            &json!({"payload":{"debug":{"scratchpad":"private working"}}}),
+        )
+        .expect("nested scratchpad key must fail");
+        assert!(nested_field.contains("data.payload.debug.scratchpad"));
+
+        let labeled_section = hidden_reasoning_violation(
+            "Chain of Thought:\nFirst I compared all private alternatives.",
+            &json!({}),
+        )
+        .expect("labeled private-reasoning section must fail");
+        assert!(labeled_section.contains("summary"));
+
+        let encoded_json = hidden_reasoning_violation(
+            "Completed the architecture handoff successfully.",
+            &json!({"payload":"{\"internal_monologue\":\"private working\"}"}),
+        )
+        .expect("encoded JSON must not bypass the field scan");
+        assert!(encoded_json.contains("data.payload.internal_monologue"));
+    }
+
+    #[test]
     fn producer_passed_true_ignored_for_claim() {
         let criterion = sample_claim_criterion("advisory");
         let output = sample_output(
@@ -3873,6 +4202,59 @@ mod tests {
             classify_retry_error("ticket id 42901 closed"),
             RetryErrorClass::Fatal
         );
+    }
+
+    #[test]
+    fn wall_clock_deadline_errors_retry_without_broad_exceeded_false_positives() {
+        // Attack vector 1: the exact production failure emitted by execute_agent.
+        assert_eq!(
+            classify_retry_error("Codex turn exceeded the wall-clock budget"),
+            RetryErrorClass::Transient
+        );
+        // Attack vector 2: the normalized event wording uses the opposite order.
+        assert_eq!(
+            classify_retry_error("Turn wall-clock budget exceeded"),
+            RetryErrorClass::Transient
+        );
+        // Attack vector 3: the outer watchdog has a separate deadline message.
+        assert_eq!(
+            classify_retry_error("execute_agent hard-deadline (600s active budget) exceeded"),
+            RetryErrorClass::Transient
+        );
+        // Attack vector 4: casing must not change classification.
+        assert_eq!(
+            classify_retry_error("CODEX TURN EXCEEDED THE WALL-CLOCK BUDGET"),
+            RetryErrorClass::Transient
+        );
+        // Attack vector 5: unrelated exceeded budgets remain fatal.
+        assert_eq!(
+            classify_retry_error("specialist exceeded the authorized token budget"),
+            RetryErrorClass::Fatal
+        );
+    }
+
+    #[test]
+    fn specialist_attempts_never_reuse_threads_from_finished_ephemeral_app_servers() {
+        let cases = [
+            (0, 0, None),
+            (1, 0, Some("retry-thread")),
+            (0, 1, Some("revision-thread")),
+            (2, 2, Some("older-thread")),
+            (0, u32::MAX, Some("hostile-thread-id")),
+        ];
+        for (attempt, revision, prior) in cases {
+            assert_eq!(
+                specialist_thread_id_for_attempt(attempt, revision, prior),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn nested_revision_failure_keeps_the_actual_failing_node() {
+        let failure = NodeExecutionFailure::owned("builder", "thread not found");
+        assert_eq!(failure.owner_or("qa"), "builder");
+        assert_eq!(failure.message, "thread not found");
     }
 
     #[test]
@@ -4044,6 +4426,82 @@ mod tests {
         assert_eq!(
             arts[0].get("name").and_then(Value::as_str),
             Some("src/app.ts")
+        );
+    }
+
+    #[test]
+    fn slim_control_completion_preserves_release_identity_without_handoffs_or_content() {
+        let output = RuntimeOutput {
+            status: "success".into(),
+            summary: "Approved release bundle assembled.".into(),
+            data: json!({
+                "schemaVersion": "codex-corp.delivery.v3",
+                "bundleHash": "sha256:bundle",
+                "approvedArtifacts": [{"artifactKey":"builder::0::app.ts","contentHash":"sha256:app"}],
+                "liveArtifactRefs": [{"artifactKey":"builder::0::app.ts","contentHash":"sha256:app"}],
+                "residualRisks": [],
+                "safety": {"approval":"explicit-human"},
+                "specialistHandoffs": [{"huge":"must-not-cross-the-event-bus"}]
+            }),
+            artifacts: vec![json!({
+                "id": "delivery-bundle",
+                "name": "delivery-bundle.json",
+                "kind": "json",
+                "contentHash": "sha256:artifact",
+                "content": "large private bundle body"
+            })],
+            thread_id: None,
+            turn_id: None,
+            tokens: 0,
+        };
+
+        let diagnostics = slim_control_completed_diagnostics(&output);
+        assert_eq!(
+            diagnostics.get("summary").and_then(Value::as_str),
+            Some("Approved release bundle assembled.")
+        );
+        assert_eq!(
+            diagnostics
+                .pointer("/data/schemaVersion")
+                .and_then(Value::as_str),
+            Some("codex-corp.delivery.v3")
+        );
+        assert!(diagnostics.pointer("/data/specialistHandoffs").is_none());
+        assert!(diagnostics.pointer("/artifacts/0/content").is_none());
+        assert_eq!(
+            diagnostics
+                .pointer("/artifacts/0/contentHash")
+                .and_then(Value::as_str),
+            Some("sha256:artifact")
+        );
+    }
+
+    #[test]
+    fn only_executable_control_nodes_publish_terminal_completion_events() {
+        for kind in ["approval", "merge", "condition", "output"] {
+            assert!(emits_control_completion(Some(kind)), "{kind}");
+        }
+        for kind in ["agent", "creative", "input", "cron", "note", "unknown"] {
+            assert!(!emits_control_completion(Some(kind)), "{kind}");
+        }
+        assert!(!emits_control_completion(None));
+    }
+
+    #[test]
+    fn revision_routed_diagnostics_are_structured_for_connector_progress() {
+        let diagnostics = revision_routed_diagnostics(2, 3, "qa", "fix the defect");
+        assert_eq!(diagnostics.get("revision").and_then(Value::as_u64), Some(2));
+        assert_eq!(
+            diagnostics.get("maxRevisions").and_then(Value::as_u64),
+            Some(3)
+        );
+        assert_eq!(
+            diagnostics.get("reviewerNodeId").and_then(Value::as_str),
+            Some("qa")
+        );
+        assert_eq!(
+            diagnostics.get("feedback").and_then(Value::as_str),
+            Some("fix the defect")
         );
     }
 
@@ -4556,6 +5014,54 @@ mod tests {
             downstream_from(&graph, Some("a")),
             HashSet::from(["a".into(), "b".into()])
         );
+    }
+
+    #[test]
+    fn start_node_scope_keeps_prerequisites_completed_without_poisoning_the_retry_branch() {
+        let graph: RuntimeGraph = serde_json::from_value(json!({
+            "nodes":[
+                {"id":"input","data":{"label":"Input","role":"Input","kind":"input"}},
+                {"id":"pm","data":{"label":"PM","role":"PM","kind":"agent"}},
+                {"id":"builder","data":{"label":"Builder","role":"Builder","kind":"agent"}},
+                {"id":"qa","data":{"label":"QA","role":"QA","kind":"agent"}},
+                {"id":"approval","data":{"label":"Approval","role":"Approval","kind":"approval"}},
+                {"id":"output","data":{"label":"Output","role":"Output","kind":"output"}},
+                {"id":"unrelated","data":{"label":"Unrelated","role":"Unrelated","kind":"agent"}}
+            ],
+            "edges":[
+                {"id":"i-p","source":"input","target":"pm"},
+                {"id":"p-b","source":"pm","target":"builder"},
+                {"id":"b-q","source":"builder","target":"qa"},
+                {"id":"q-a","source":"qa","target":"approval","data":{"edgeType":"approval"}},
+                {"id":"a-o","source":"approval","target":"output"},
+                {"id":"q-b","source":"qa","target":"builder","data":{"edgeType":"revision"}}
+            ]
+        }))
+        .unwrap();
+
+        // Attack vector 1: the selected node and its normal descendants execute.
+        let (included, completed, mut skipped) = initial_execution_sets(&graph, Some("qa"));
+        assert_eq!(
+            included,
+            HashSet::from(["qa".into(), "approval".into(), "output".into()])
+        );
+        // Attack vector 2: ordinary ancestors satisfy dependencies but are not treated as excluded branches.
+        assert!(completed.is_superset(&HashSet::from([
+            "input".into(),
+            "pm".into(),
+            "builder".into()
+        ])));
+        assert!(!skipped.contains("builder"));
+        // Attack vector 3: an unrelated node remains excluded.
+        assert!(skipped.contains("unrelated"));
+        // Attack vector 4: a reverse revision edge never makes the selected QA node skip itself.
+        assert!(propagate_skips(&graph, &included, &completed, &mut skipped).is_empty());
+        assert!(!skipped.contains("qa"));
+        // Attack vector 5: a full run includes everything and has no precompleted/excluded branch state.
+        let (all, precompleted, excluded) = initial_execution_sets(&graph, None);
+        assert_eq!(all.len(), graph.nodes.len());
+        assert!(precompleted.iter().all(|id| id == "input"));
+        assert!(excluded.is_empty());
     }
 
     #[test]

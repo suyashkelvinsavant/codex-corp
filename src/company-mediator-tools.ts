@@ -24,13 +24,17 @@ Steer the company with **tools** and talk to the operator. You do **not** implem
 - Greetings and vague openers ("hi", "hello", "hey") are **not** build orders.
 - Questions about the workflow, its nodes, status, capabilities, or how it works do **not** need an app folder.
 - Call company_select_app_workspace only after the operator clearly asks to create/build/scaffold a software project or modify/fix/refactor an existing project. Never call it for greetings, general information, workflow inspection, brainstorming, or ambiguous requests.
-- After that tool returns a selection, treat its workspace as the target project folder. For a new app, clarify the product brief and starting constraints; for an existing app, establish what should change and what must be preserved. Include material folder constraints in the mission before starting the company.
+- A direct build request that names the product or feature is minimally actionable even when optional details are omitted. For example, "create a simple fish bowl shop website" is actionable. Use conservative defaults for unspecified presentation details.
+- After company_select_app_workspace returns a selection for a new app, compose a concrete mission from the operator's request, the selected folder, and conservative defaults, then call company_run. The host confirmation for company_run is the operator's confirmation.
+- Do not ask optional scope or style questions before starting an actionable new-app request. Ask only when a missing decision materially affects safety, irreversible data changes, billing, authentication, or mutually incompatible product behavior.
+- For an existing app, establish what should change and what must be preserved. Include material folder constraints in the mission before starting the company.
 - Do **not** treat a preloaded MISSION brief as confirmed user intent. Template seeds or leftover mission text are **hypotheses** until the operator affirms or replaces them.
-- Prefer **requirements gathering**: goal, users, constraints, success criteria, out-of-scope, timeline. Ask short, concrete questions when the mission is empty, vague, or only a seed.
+- Ask short, concrete questions when the mission is empty, genuinely ambiguous, or only a seed. Optional catalog contents, visual style, and similar refinements can be decided by the specialists unless the operator specified them.
 - Only after the operator has a clear mission may you offer to **set mission** and **run** the company.
 
 ## Tools
 - Never invent run status, failures, node outputs, or artifacts — call tools first (company_status, company_list_nodes, node_*).
+- Only say the run started when company_run returns started: true. If the tool fails or returns started: false, report that exact result and do not claim a run began.
 - company_run / company_run_from / company_stop / company_set_mission / approval tools for control.
 - company_ask_operator for blocking structured questions when a decision is missing.
 - company_list_nodes + node_get / node_get_trace / node_get_events / node_task_progress for inspection.
@@ -48,13 +52,13 @@ export type MediatorHostContext = {
   runHistory: RunRecord[];
   /** Side effects — optional for pure unit tests */
   actions?: {
-    run?: (mission?: string) => Promise<void> | void;
+    run?: (mission?: string) => Promise<boolean> | boolean;
     stop?: () => Promise<void> | void;
     setMission?: (mission: string) => void;
     approve?: () => Promise<void> | void;
     decline?: () => Promise<void> | void;
     focusNode?: (nodeId: string) => void;
-    runFrom?: (nodeId: string) => Promise<void> | void;
+    runFrom?: (nodeId: string) => Promise<boolean> | boolean;
     askOperator?: (
       question: MediatorQuestion,
     ) => Promise<MediatorQuestionAnswer | null>;
@@ -119,7 +123,7 @@ export function companyMediatorDynamicTools(): DynamicToolSpecJson[] {
       type: "function",
       name: "company_run",
       description:
-        "Start the company workflow. Optionally set mission text first.",
+        "Start the company workflow. Pass a concrete mission for a new or changed request; omit it only when the current Mission brief was already confirmed.",
       inputSchema: {
         type: "object",
         properties: {
@@ -398,7 +402,9 @@ export async function executeCompanyMediatorTool(
         if (mission) ctx.actions?.setMission?.(mission);
         if (ctx.running)
           return ok({ started: false, reason: "Already running" });
-        await ctx.actions?.run?.(mission);
+        if (!ctx.actions?.run) return fail("Company run action is unavailable");
+        const started = await ctx.actions.run(mission);
+        if (!started) return fail("Company run did not start");
         return ok({ started: true, missionUpdated: Boolean(mission) });
       }
       case "company_run_from": {
@@ -409,7 +415,10 @@ export async function executeCompanyMediatorTool(
         if (resolved.error) return fail(resolved.error);
         const node = resolved.node!;
         if (node.data.kind === "note") return fail("Notes cannot be run");
-        await ctx.actions?.runFrom?.(node.id);
+        if (!ctx.actions?.runFrom)
+          return fail("Company run-from action is unavailable");
+        const started = await ctx.actions.runFrom(node.id);
+        if (!started) return fail("Company run did not start");
         return ok({ started: true, nodeId: node.id, skippedAncestors: true });
       }
       case "company_stop": {

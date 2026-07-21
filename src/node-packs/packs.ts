@@ -4,7 +4,10 @@ import type { NodePack } from "./types";
 const V = "1.0.0";
 
 function pack(
-  partial: Omit<NodePack, "version" | "harnessCoreVersion" | "baseInstructions"> & {
+  partial: Omit<
+    NodePack,
+    "version" | "harnessCoreVersion" | "baseInstructions"
+  > & {
     baseInstructions?: string;
   },
 ): NodePack {
@@ -31,7 +34,7 @@ export const NODE_PACKS: NodePack[] = [
     description:
       "Owns problem framing, scope, and success criteria for the company.",
     tools: ["Web search", "Workspace write"],
-    skills: ["product-spec"],
+    skillHints: ["product-spec"],
     nonGoals: ["Implement production code", "Final architecture decisions"],
     developerInstructions: `You are the Product Manager specialist for this company graph.
 
@@ -59,7 +62,7 @@ Output contract
     description:
       "Gathers evidence, constraints, and competitive/context notes.",
     tools: ["Web search", "Web fetch"],
-    skills: ["research-synthesis"],
+    skillHints: ["research-synthesis"],
     nonGoals: ["Ship product code", "Invent market claims without sources"],
     developerInstructions: `You are the Research specialist for this company graph.
 
@@ -84,7 +87,7 @@ Output contract
     menuOrder: 30,
     description: "Defines system shape, interfaces, and technical trade-offs.",
     tools: ["Workspace write", "Shell"],
-    skills: ["system-design"],
+    skillHints: ["system-design"],
     nonGoals: ["Write production feature code unless asked"],
     developerInstructions: `You are the Systems Architect specialist for this company graph.
 
@@ -111,7 +114,7 @@ Output contract
     description:
       "Owns UX flows, information architecture, and interaction clarity.",
     tools: ["Workspace write"],
-    skills: ["frontend-design", "ux-flows"],
+    skillHints: ["frontend-design", "ux-flows"],
     nonGoals: ["Production application code"],
     developerInstructions: `You are the Product Designer specialist for this company graph.
 
@@ -136,8 +139,14 @@ Output contract
     menuOrder: 50,
     description:
       "Implements UI and client-side behavior from approved designs.",
-    tools: ["Shell", "Workspace write", "Apply patch"],
-    skills: ["frontend-design", "react"],
+    tools: [
+      "Workspace read",
+      "Workspace write",
+      "Shell",
+      "Apply patch",
+      "Network",
+    ],
+    skillHints: ["frontend-design", "react"],
     nonGoals: ["Invent unapproved backend contracts"],
     developerInstructions: `You are the Frontend Engineer specialist — a SOLE IMPLEMENTER for UI work in this company.
 
@@ -146,12 +155,14 @@ Mission
 - Keep changes small, typed, and testable. Match existing project patterns.
 
 Process
-1. Read mission, design, and architecture handoffs carefully.
-2. Implement the smallest vertical slice that satisfies acceptance criteria.
-3. Verify with available checks; document residual risks.
+1. Inspect the existing workspace, package manifest, lockfile, and relevant source before editing. Reuse the existing stack and avoid rereading unrelated files.
+2. Implement the smallest vertical slice that satisfies acceptance criteria using focused patches.
+3. Reconcile the declared dependency environment. When dependencies are missing or incomplete, run the repository's deterministic package-manager install and request permission if the sandbox requires it.
+4. Run targeted tests first, then the repository test and production build commands. Fix failures you own before handing work to QA.
 
 Output contract
 - status success|failure|needs_revision, summary, data, code artifacts.
+- Do not report success while dependency installation, tests, or the production build are incomplete or failing. Include exact commands and results without dumping full logs.
 - Never invent backend contracts that Architect did not approve.`,
   }),
   pack({
@@ -163,7 +174,7 @@ Output contract
     description:
       "Implements server/API/data paths with least-privilege tooling.",
     tools: ["Shell", "Workspace write", "Apply patch"],
-    skills: ["api-design"],
+    skillHints: ["api-design"],
     nonGoals: ["Secret storage in source"],
     developerInstructions: `You are the Backend Engineer specialist — a SOLE IMPLEMENTER for server-side work.
 
@@ -188,7 +199,7 @@ Output contract
     description:
       "Full-stack implementer for focused code-change delivery tracks.",
     tools: ["Shell", "Workspace write", "Apply patch"],
-    skills: ["react", "api-design"],
+    skillHints: ["react", "api-design"],
     nonGoals: ["Bypass approval gates", "Scope creep beyond mission"],
     developerInstructions: `You are the Senior Software Engineer specialist — sole implementer for this change track.
 
@@ -211,8 +222,8 @@ Output contract
     kind: "agent",
     menuOrder: 70,
     description: "Plans and executes verification against acceptance criteria.",
-    tools: ["Shell", "Workspace write"],
-    skills: ["test-planning"],
+    tools: ["Workspace read", "Shell", "Workspace write"],
+    skillHints: ["test-planning"],
     nonGoals: ["Rewrite product features"],
     developerInstructions: `You are the QA Engineer specialist for this company graph.
 
@@ -222,11 +233,14 @@ Mission
 
 Process
 1. Derive a test matrix from acceptance notes and specialist outputs.
-2. Run available automated checks; perform structured manual verification when needed.
-3. File concrete defects with severity and expected vs actual.
+2. The host runtime verifier runs the required npm test and npm run build gates after your response. Do not run the full test suite or production build yourself or duplicate those host gates. Inspect focused source and tests, and run only targeted checks for a specific risk the host gates do not cover.
+3. On a revision, begin with the prior defect and revision feedback. Verify that defect and its regression coverage first; do not reopen unrelated areas that already passed unless new evidence requires it.
+4. Treat static inspection as supporting evidence, not a substitute for executable checks. The host verifier owns the full executable gates. File concrete defects with severity, exact repro steps, and expected vs actual.
+5. Use needs_revision only for a concrete, actionable defect that the Builder can fix from the authorized mission and available inputs. Never loop Builder for missing operator-supplied facts, credentials, contact details, brand assets, or product decisions.
+6. When optional operator data is missing and the implementation uses honest placeholders or safe fallbacks, return success and record the missing operator input as a residual risk. If the mission explicitly requires that data, report it as an operator-input blocker rather than fabricating values or requesting a code revision.
 
 Output contract
-- data: cases[], passCount, failCount, blockers[]. Do not rewrite product features.`,
+- data: cases[], passCount, failCount, blockers[], residualRisks[]. Do not rewrite product features.`,
   }),
   pack({
     id: "security-reviewer",
@@ -236,7 +250,7 @@ Output contract
     menuOrder: 80,
     description: "Threat-models and reviews for common vulnerability classes.",
     tools: ["Shell", "Workspace write"],
-    skills: ["security-review"],
+    skillHints: ["security-review"],
     nonGoals: ["Claim secure without evidence"],
     developerInstructions: `You are the Security Reviewer specialist for this company graph.
 
@@ -260,7 +274,7 @@ Output contract
     menuOrder: 90,
     description: "Five-vector quality review before human approval.",
     tools: ["Shell", "Workspace write"],
-    skills: ["code-review"],
+    skillHints: ["code-review"],
     nonGoals: ["Ship without actionable feedback"],
     developerInstructions: `You are the Code / Quality Reviewer specialist (five-vector gate) for this company.
 
@@ -284,7 +298,7 @@ Output contract
     menuOrder: 100,
     description: "Packages delivery notes, runbooks, and handoff artifacts.",
     tools: ["Workspace write"],
-    skills: ["delivery-packaging"],
+    skillHints: ["delivery-packaging"],
     nonGoals: ["Claim approval that did not happen"],
     developerInstructions: `You are the Delivery Agent specialist for this company graph.
 
@@ -308,7 +322,7 @@ Output contract
     menuOrder: 110,
     description: "Produces visual assets for non-technical operators.",
     tools: ["Image generation", "Image edit", "Workspace write"],
-    skills: ["brand-visuals", "ui-mockups"],
+    skillHints: ["brand-visuals", "ui-mockups"],
     nonGoals: ["Implement application logic"],
     developerInstructions: `You are Codex Creative Studio for this company graph.
 
@@ -333,7 +347,7 @@ Output contract
     description:
       "Blank specialist with neutral harness-core — configure role and contract.",
     tools: ["Shell", "Workspace write"],
-    skills: [],
+    skillHints: [],
     nonGoals: ["Operate without an operator-authored role contract"],
     developerInstructions: `You are a focused specialist agent in a multi-agent company graph.
 

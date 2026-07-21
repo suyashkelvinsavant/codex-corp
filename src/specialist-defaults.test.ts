@@ -13,7 +13,8 @@ describe("specialist defaults", () => {
     const builder = defaultSpecialistForRole("Frontend Engineer", "agent");
     expect(builder.prompt.length).toBeGreaterThan(MIN_SPECIALIST_PROMPT_CHARS);
     expect(builder.tools.length).toBeGreaterThan(0);
-    expect(builder.skills.length).toBeGreaterThan(0);
+    expect(builder.skills).toEqual([]);
+    expect(builder.skillHints.length).toBeGreaterThan(0);
     expect(builder.prompt.toLowerCase()).toMatch(/frontend|implementer|ui/);
 
     const creative = defaultSpecialistForRole("Creative", "creative");
@@ -43,7 +44,8 @@ describe("specialist defaults", () => {
     });
     expect(weak.prompt.length).toBeGreaterThan(MIN_SPECIALIST_PROMPT_CHARS);
     expect(weak.tools.length).toBeGreaterThan(0);
-    expect(weak.skills.length).toBeGreaterThan(0);
+    expect(weak.skills).toEqual([]);
+    expect(weak.skillHints.length).toBeGreaterThan(0);
 
     const custom =
       "You are a custom researcher with a carefully authored multi-line brief.\n\nMission\n- Only answer X.\n\nProcess\n1. A\n2. B\n\nOutput contract\n- Return findings with sources and residual unknowns for the architect.";

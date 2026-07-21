@@ -735,6 +735,84 @@ fn outer_agent_deadline_seconds(wall_seconds: u64) -> u64 {
     wall_seconds.saturating_add(30)
 }
 
+/// Human interaction is not agent execution time. Keep it bounded separately
+/// so slow approvals do not consume the turn budget, while a request loop still
+/// cannot keep a specialist alive forever.
+const MAX_OPERATOR_WAIT_SECS: u64 = 30 * 60;
+const DEADLINE_WATCHDOG_POLL_MILLIS: u64 = 250;
+
+#[derive(Debug)]
+struct PausableDeadline {
+    deadline: std::time::Instant,
+    paused_at: Option<std::time::Instant>,
+    credited_pause: Duration,
+    max_pause: Duration,
+}
+
+impl PausableDeadline {
+    fn new(started: std::time::Instant, active_budget: Duration, max_pause: Duration) -> Self {
+        Self {
+            deadline: started + active_budget,
+            paused_at: None,
+            credited_pause: Duration::ZERO,
+            max_pause,
+        }
+    }
+
+    fn pause(&mut self, now: std::time::Instant) {
+        if self.paused_at.is_none() {
+            self.paused_at = Some(now);
+        }
+    }
+
+    fn resume(&mut self, now: std::time::Instant) {
+        let Some(paused_at) = self.paused_at.take() else {
+            return;
+        };
+        let remaining_credit = self.max_pause.saturating_sub(self.credited_pause);
+        let credit = now.duration_since(paused_at).min(remaining_credit);
+        self.credited_pause = self.credited_pause.saturating_add(credit);
+        self.deadline = self.deadline.checked_add(credit).unwrap_or(self.deadline);
+    }
+
+    fn remaining(&self, now: std::time::Instant) -> Duration {
+        let live_credit = self
+            .paused_at
+            .map(|paused_at| {
+                now.duration_since(paused_at)
+                    .min(self.max_pause.saturating_sub(self.credited_pause))
+            })
+            .unwrap_or(Duration::ZERO);
+        self.deadline
+            .checked_add(live_credit)
+            .unwrap_or(self.deadline)
+            .saturating_duration_since(now)
+    }
+}
+
+fn recv_with_operator_pause<T>(
+    receiver: &mpsc::Receiver<T>,
+    timeout: Duration,
+    turn_deadline: &mut PausableDeadline,
+    outer_deadline: &Arc<Mutex<PausableDeadline>>,
+) -> Result<Result<T, mpsc::RecvTimeoutError>, String> {
+    let paused_at = std::time::Instant::now();
+    outer_deadline
+        .lock()
+        .map_err(|_| "outer agent deadline lock poisoned".to_string())?
+        .pause(paused_at);
+    turn_deadline.pause(paused_at);
+
+    let result = receiver.recv_timeout(timeout);
+    let resumed_at = std::time::Instant::now();
+    turn_deadline.resume(resumed_at);
+    outer_deadline
+        .lock()
+        .map_err(|_| "outer agent deadline lock poisoned".to_string())?
+        .resume(resumed_at);
+    Ok(result)
+}
+
 /// Apply dual instruction surfaces to app-server thread params (omit empty base).
 pub(crate) fn apply_instruction_params(params: &mut Value, base: &str, developer: &str) {
     let base = base.trim();
@@ -881,6 +959,16 @@ struct NativeApprovalEvent {
     node_id: String,
     method: String,
     params: Value,
+    thread_id: String,
+    turn_id: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct NativeApprovalResolvedEvent {
+    request_id: String,
+    node_id: String,
+    decision: String,
     thread_id: String,
     turn_id: String,
 }
@@ -2322,6 +2410,47 @@ fn load_workflow(
         .map_err(|error| error.to_string())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LoadedWorkflowRecord {
+    graph_json: String,
+    workspace_path: Option<String>,
+}
+
+fn load_workflow_record_from_connection(
+    connection: &Connection,
+    id: &str,
+) -> Result<Option<LoadedWorkflowRecord>, String> {
+    let mut statement = connection
+        .prepare("SELECT graph_json,workspace_path FROM workflows WHERE id=?1")
+        .map_err(|error| error.to_string())?;
+    let mut rows = statement
+        .query(params![id])
+        .map_err(|error| error.to_string())?;
+    let Some(row) = rows.next().map_err(|error| error.to_string())? else {
+        return Ok(None);
+    };
+    let workspace_path: Option<String> = row.get(1).map_err(|error| error.to_string())?;
+    Ok(Some(LoadedWorkflowRecord {
+        graph_json: row.get(0).map_err(|error| error.to_string())?,
+        workspace_path: workspace_path
+            .map(|path| path.trim().to_string())
+            .filter(|path| !path.is_empty()),
+    }))
+}
+
+#[tauri::command]
+fn load_workflow_record(
+    id: String,
+    database: tauri::State<'_, Database>,
+) -> Result<Option<LoadedWorkflowRecord>, String> {
+    let connection = database
+        .0
+        .lock()
+        .map_err(|_| "database lock poisoned".to_string())?;
+    load_workflow_record_from_connection(&connection, &id)
+}
+
 #[tauri::command]
 fn validate_workflow(graph_json: String) -> Result<Vec<GraphProblem>, String> {
     let graph: GraphSnapshot = serde_json::from_str(&graph_json)
@@ -2465,6 +2594,17 @@ fn list_runs(
     Ok(records)
 }
 
+fn runtime_output_status_for_canvas(status: &str) -> &'static str {
+    match status {
+        "success" | "completed" => "completed",
+        "failure" | "failed" => "failed",
+        "needs_revision" => "needs_revision",
+        "interrupted" => "interrupted",
+        "skipped" => "skipped",
+        _ => "failed",
+    }
+}
+
 fn hydrate_run_records(connection: &Connection, records: &mut [RunRecord]) -> Result<(), String> {
     for record in records {
         let mut event_statement = connection.prepare(
@@ -2481,16 +2621,21 @@ fn hydrate_run_records(connection: &Connection, records: &mut [RunRecord]) -> Re
         }
 
         let mut token_totals: HashMap<String, u64> = HashMap::new();
+        let mut revision_totals: HashMap<String, u64> = HashMap::new();
         let mut attempt_statement = connection
-            .prepare("SELECT node_id,diagnostics_json FROM node_attempts WHERE run_id=?1")
+            .prepare("SELECT node_id,revision,diagnostics_json FROM node_attempts WHERE run_id=?1")
             .map_err(|error| error.to_string())?;
         let attempts = attempt_statement
             .query_map(params![record.id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })
             .map_err(|error| error.to_string())?;
         for attempt in attempts {
-            let (node_id, diagnostics) = attempt.map_err(|error| error.to_string())?;
+            let (node_id, revision, diagnostics) = attempt.map_err(|error| error.to_string())?;
             let tokens = serde_json::from_str::<Value>(&diagnostics)
                 .ok()
                 .and_then(|value| {
@@ -2500,8 +2645,10 @@ fn hydrate_run_records(connection: &Connection, records: &mut [RunRecord]) -> Re
                         .and_then(Value::as_u64)
                 })
                 .unwrap_or(0);
-            let total = token_totals.entry(node_id).or_insert(0);
+            let total = token_totals.entry(node_id.clone()).or_insert(0);
             *total = total.saturating_add(tokens);
+            let highest_revision = revision_totals.entry(node_id).or_insert(0);
+            *highest_revision = (*highest_revision).max(revision);
         }
 
         let mut nodes: Value = serde_json::from_str(&record.nodes_json).unwrap_or(Value::Null);
@@ -2526,7 +2673,10 @@ fn hydrate_run_records(connection: &Connection, records: &mut [RunRecord]) -> Re
                     .find(|node| node.get("id").and_then(Value::as_str) == Some(node_id.as_str()))
                 {
                     if let Some(data) = node.get_mut("data").and_then(Value::as_object_mut) {
-                        data.insert("status".into(), Value::String(status));
+                        data.insert(
+                            "status".into(),
+                            Value::String(runtime_output_status_for_canvas(&status).into()),
+                        );
                         if let Some(output) =
                             output_json.and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
                         {
@@ -2556,11 +2706,13 @@ fn hydrate_run_records(connection: &Connection, records: &mut [RunRecord]) -> Re
                 else {
                     continue;
                 };
-                let Some(tokens) = token_totals.get(&node_id).copied() else {
-                    continue;
-                };
                 if let Some(data) = node.get_mut("data").and_then(Value::as_object_mut) {
-                    data.insert("tokens".into(), Value::Number(tokens.into()));
+                    if let Some(tokens) = token_totals.get(&node_id).copied() {
+                        data.insert("tokens".into(), Value::Number(tokens.into()));
+                    }
+                    if let Some(revisions) = revision_totals.get(&node_id).copied() {
+                        data.insert("revisions".into(), Value::Number(revisions.into()));
+                    }
                 }
             }
             record.nodes_json =
@@ -5653,9 +5805,11 @@ impl Drop for AppServerConnection {
     }
 }
 
-/// Idle gap between stdout lines before killing a stalled turn.
-/// Keep high enough for multi-file writes; hard wall still bounds the turn.
-const TURN_IDLE_SECS: u64 = 75;
+/// App-server commands can legitimately stay silent until their process exits.
+/// The configured, pausable turn deadline is the single execution bound.
+fn turn_receive_timeout(remaining: Duration) -> Duration {
+    remaining
+}
 
 fn agent_trace(msg: &str) {
     let path = app_data_dir().join("execute-agent-trace.log");
@@ -5689,6 +5843,11 @@ pub(crate) async fn execute_agent_internal(
     let wall_secs = request.timeout_seconds.clamp(10, 1800);
     let timeout_process_key = request.process_key();
     let timeout_broker = process_broker.clone();
+    let outer_deadline = Arc::new(Mutex::new(PausableDeadline::new(
+        std::time::Instant::now(),
+        Duration::from_secs(outer_agent_deadline_seconds(wall_secs)),
+        Duration::from_secs(MAX_OPERATOR_WAIT_SECS),
+    )));
     // Outer hard deadline: even if the inner body deadlocks, the invoke returns.
     let work = tauri::async_runtime::spawn_blocking(move || {
         let node_for_log = request.node_id.clone();
@@ -5699,6 +5858,7 @@ pub(crate) async fn execute_agent_internal(
         let broker_outer = broker.clone();
         let process_broker_outer = process_broker.clone();
         let database_outer = database.clone();
+        let worker_outer_deadline = outer_deadline.clone();
         std::thread::spawn(move || {
             let node_id_log = request_outer.node_id.clone();
             agent_trace(&format!("worker START node={node_id_log}"));
@@ -5858,35 +6018,89 @@ pub(crate) async fn execute_agent_internal(
                     approval_policy,
                     sandbox,
                 );
-                // Resume existing thread or start a fresh one.
-                let thread_id = if let Some(existing) = request.thread_id.as_deref() {
-                    emit_optional(
-                        &app,
-                        "codex-agent-event",
-                        NormalizedAgentEvent {
-                            node_id: request.node_id.clone(),
-                            event_type: "agent.thread.resume".into(),
-                            message: format!("Resumed existing thread {existing}"),
-                            thread_id: Some(existing.into()),
-                            turn_id: None,
-                            tokens: None,
-                        },
+                // Resume only through the app-server protocol. A prior ephemeral
+                // process may no longer own the thread, so recover fail-safe by
+                // starting a fresh thread with the complete authorized input.
+                let mut resumed = false;
+                let thread_result = if let Some(existing) = request
+                    .thread_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                {
+                    let mut resume_params = json!({
+                        "threadId": existing,
+                        "model": model,
+                        "cwd": workspace,
+                        "approvalPolicy": approval_policy,
+                        "sandbox": sandbox,
+                        "excludeTurns": true
+                    });
+                    apply_instruction_params(
+                        &mut resume_params,
+                        &request.base_instructions,
+                        &request.developer_instructions,
                     );
-                    existing.to_string()
+                    send_json_timed(
+                        &stdin,
+                        json!({"jsonrpc":"2.0","id":11,"method":"thread/resume","params":resume_params}),
+                        Duration::from_secs(15),
+                    )?;
+                    match read_response(11, &line_rx, &app, &request.node_id, &child) {
+                        Ok(result) => {
+                            resumed = true;
+                            result
+                        }
+                        Err(error) => {
+                            emit_optional(
+                                &app,
+                                "codex-agent-event",
+                                NormalizedAgentEvent {
+                                    node_id: request.node_id.clone(),
+                                    event_type: "agent.thread.recovered".into(),
+                                    message: format!(
+                                        "Prior thread unavailable; fresh thread started: {error}"
+                                    ),
+                                    thread_id: Some(existing.into()),
+                                    turn_id: None,
+                                    tokens: None,
+                                },
+                            );
+                            send_json_timed(
+                                &stdin,
+                                json!({"jsonrpc":"2.0","id":2,"method":"thread/start","params":thread_params}),
+                                Duration::from_secs(10),
+                            )?;
+                            read_response(2, &line_rx, &app, &request.node_id, &child)?
+                        }
+                    }
                 } else {
                     send_json_timed(
                         &stdin,
                         json!({"jsonrpc":"2.0","id":2,"method":"thread/start","params":thread_params}),
                         Duration::from_secs(10),
                     )?;
-                    let thread_result = read_response(2, &line_rx, &app, &request.node_id, &child)?;
-                    thread_result
-                        .pointer("/thread/id")
-                        .and_then(Value::as_str)
-                        .ok_or("thread/start response missing thread id")?
-                        .to_string()
+                    read_response(2, &line_rx, &app, &request.node_id, &child)?
                 };
-                if request.thread_id.is_none() {
+                let thread_id = thread_result
+                    .pointer("/thread/id")
+                    .and_then(Value::as_str)
+                    .ok_or("thread start/resume response missing thread id")?
+                    .to_string();
+                if resumed {
+                    emit_optional(
+                        &app,
+                        "codex-agent-event",
+                        NormalizedAgentEvent {
+                            node_id: request.node_id.clone(),
+                            event_type: "agent.thread.resume".into(),
+                            message: format!("Resumed existing thread {thread_id}"),
+                            thread_id: Some(thread_id.clone()),
+                            turn_id: None,
+                            tokens: None,
+                        },
+                    );
+                } else {
                     emit_optional(
                         &app,
                         "codex-agent-event",
@@ -5968,11 +6182,14 @@ pub(crate) async fn execute_agent_internal(
                 };
                 let mut message = String::new();
                 let mut total_tokens: u64 = 0;
-                let turn_deadline = std::time::Instant::now() + Duration::from_secs(wall_secs);
+                let mut turn_deadline = PausableDeadline::new(
+                    std::time::Instant::now(),
+                    Duration::from_secs(wall_secs),
+                    Duration::from_secs(MAX_OPERATOR_WAIT_SECS),
+                );
                 loop {
-                    let idle = Duration::from_secs(TURN_IDLE_SECS)
-                        .min(turn_deadline.saturating_duration_since(std::time::Instant::now()));
-                    if idle.is_zero() {
+                    let remaining = turn_deadline.remaining(std::time::Instant::now());
+                    if remaining.is_zero() {
                         kill_app_server_child(&child);
                         emit_optional(
                             &app,
@@ -5988,7 +6205,7 @@ pub(crate) async fn execute_agent_internal(
                         );
                         return Err("Codex turn exceeded the wall-clock budget".into());
                     }
-                    let line = match line_rx.recv_timeout(idle) {
+                    let line = match line_rx.recv_timeout(turn_receive_timeout(remaining)) {
                         Ok(Ok(line)) => line,
                         Ok(Err(error)) => {
                             if message.is_empty() {
@@ -6004,17 +6221,14 @@ pub(crate) async fn execute_agent_internal(
                                 NormalizedAgentEvent {
                                     node_id: request.node_id.clone(),
                                     event_type: "turn.timeout".into(),
-                                    message: format!(
-                                        "No app-server output for {TURN_IDLE_SECS}s; killed"
-                                    ),
+                                    message: "Turn wall-clock budget exceeded; app-server killed"
+                                        .into(),
                                     thread_id: Some(thread_id.clone()),
                                     turn_id: Some(turn_id.clone()),
                                     tokens: None,
                                 },
                             );
-                            return Err(format!(
-                                "Codex turn produced no app-server output for {TURN_IDLE_SECS}s"
-                            ));
+                            return Err("Codex turn exceeded the wall-clock budget".into());
                         }
                         Err(mpsc::RecvTimeoutError::Disconnected) => {
                             if message.is_empty() {
@@ -6210,9 +6424,13 @@ pub(crate) async fn execute_agent_internal(
                             } else {
                                 json!({"action":"cancel","content":{},"_meta":null})
                             };
-                            let response_payload = receiver
-                                .recv_timeout(timeout)
-                                .unwrap_or_else(|_| cancellation.clone());
+                            let response_payload = recv_with_operator_pause(
+                                &receiver,
+                                timeout,
+                                &mut turn_deadline,
+                                &worker_outer_deadline,
+                            )?
+                            .unwrap_or_else(|_| cancellation.clone());
                             broker
                                 .0
                                 .lock()
@@ -6323,11 +6541,15 @@ pub(crate) async fn execute_agent_internal(
                                         eprintln!(
                                             "[codex-corp] requestApproval waiting (headless wait policy); respond via MCP respond_codex_approval requestId={broker_request_id}"
                                         );
-                                        receiver
-                                            .recv_timeout(Duration::from_secs(120))
-                                            .ok()
-                                            .and_then(|value| value.as_str().map(str::to_string))
-                                            .unwrap_or_else(|| "decline".into())
+                                        recv_with_operator_pause(
+                                            &receiver,
+                                            Duration::from_secs(120),
+                                            &mut turn_deadline,
+                                            &worker_outer_deadline,
+                                        )?
+                                        .ok()
+                                        .and_then(|value| value.as_str().map(str::to_string))
+                                        .unwrap_or_else(|| "decline".into())
                                     }
                                 }
                             } else {
@@ -6358,17 +6580,32 @@ pub(crate) async fn execute_agent_internal(
                                         turn_id: turn_id.clone(),
                                     },
                                 );
-                                receiver
-                                    .recv_timeout(Duration::from_secs(120))
-                                    .ok()
-                                    .and_then(|value| value.as_str().map(str::to_string))
-                                    .unwrap_or_else(|| "decline".into())
+                                recv_with_operator_pause(
+                                    &receiver,
+                                    Duration::from_secs(120),
+                                    &mut turn_deadline,
+                                    &worker_outer_deadline,
+                                )?
+                                .ok()
+                                .and_then(|value| value.as_str().map(str::to_string))
+                                .unwrap_or_else(|| "decline".into())
                             };
                             broker
                                 .0
                                 .lock()
                                 .ok()
                                 .and_then(|mut pending| pending.remove(&broker_request_id));
+                            emit_optional(
+                                &app,
+                                "codex-approval-resolved",
+                                NativeApprovalResolvedEvent {
+                                    request_id: broker_request_id.clone(),
+                                    node_id: request.node_id.clone(),
+                                    decision: decision.clone(),
+                                    thread_id: thread_id.clone(),
+                                    turn_id: turn_id.clone(),
+                                },
+                            );
                             // Timed write: never block forever if the child is not reading stdin.
                             if let Err(error) = send_json_timed(
                                 &stdin,
@@ -6525,16 +6762,12 @@ pub(crate) async fn execute_agent_internal(
             let _ = done_tx.send(result);
         });
         let hard_secs = outer_agent_deadline_seconds(wall_secs);
-        let hard = Duration::from_secs(hard_secs);
-        let out = match done_rx.recv_timeout(hard) {
-            Ok(result) => {
-                agent_trace(&format!(
-                    "spawn_blocking RECV node={node_for_log} ok={}",
-                    result.is_ok()
-                ));
-                result
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+        let out = loop {
+            let remaining = outer_deadline
+                .lock()
+                .map_err(|_| "outer agent deadline lock poisoned".to_string())?
+                .remaining(std::time::Instant::now());
+            if remaining.is_zero() {
                 agent_trace(&format!("spawn_blocking HARD_DEADLINE node={node_for_log}"));
                 if let Some(child) = timeout_broker
                     .0
@@ -6544,14 +6777,25 @@ pub(crate) async fn execute_agent_internal(
                 {
                     kill_app_server_child(&child);
                 }
-                Err(format!(
-                    "execute_agent hard-deadline ({}s) exceeded",
+                break Err(format!(
+                    "execute_agent hard-deadline ({}s active budget) exceeded",
                     hard_secs
-                ))
+                ));
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                agent_trace(&format!("spawn_blocking DISCONNECTED node={node_for_log}"));
-                Err("execute_agent worker disconnected".into())
+            let poll = remaining.min(Duration::from_millis(DEADLINE_WATCHDOG_POLL_MILLIS));
+            match done_rx.recv_timeout(poll) {
+                Ok(result) => {
+                    agent_trace(&format!(
+                        "spawn_blocking RECV node={node_for_log} ok={}",
+                        result.is_ok()
+                    ));
+                    break result;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    agent_trace(&format!("spawn_blocking DISCONNECTED node={node_for_log}"));
+                    break Err("execute_agent worker disconnected".into());
+                }
             }
         };
         agent_trace(&format!("spawn_blocking EXIT node={node_for_log}"));
@@ -6740,6 +6984,7 @@ pub fn run() {
             save_workflow_catalog_item,
             delete_workflow,
             load_workflow,
+            load_workflow_record,
             validate_workflow,
             plan_workflow,
             list_runs,
@@ -6943,6 +7188,88 @@ mod tests {
     }
 
     #[test]
+    fn turn_receive_wait_uses_the_bounded_turn_deadline_not_an_arbitrary_idle_gap() {
+        for remaining in [0, 10, 75, 120, 600] {
+            assert_eq!(
+                turn_receive_timeout(Duration::from_secs(remaining)),
+                Duration::from_secs(remaining)
+            );
+        }
+    }
+
+    #[test]
+    fn execution_deadline_expires_without_operator_interaction() {
+        let started = std::time::Instant::now();
+        let deadline =
+            PausableDeadline::new(started, Duration::from_secs(10), Duration::from_secs(30));
+
+        assert_eq!(
+            deadline.remaining(started + Duration::from_secs(11)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn execution_deadline_pauses_while_operator_decision_is_pending() {
+        let started = std::time::Instant::now();
+        let mut deadline =
+            PausableDeadline::new(started, Duration::from_secs(10), Duration::from_secs(30));
+        deadline.pause(started + Duration::from_secs(4));
+
+        assert_eq!(
+            deadline.remaining(started + Duration::from_secs(9)),
+            Duration::from_secs(6)
+        );
+    }
+
+    #[test]
+    fn execution_deadline_resumes_with_the_original_active_budget() {
+        let started = std::time::Instant::now();
+        let mut deadline =
+            PausableDeadline::new(started, Duration::from_secs(10), Duration::from_secs(30));
+        deadline.pause(started + Duration::from_secs(4));
+        deadline.resume(started + Duration::from_secs(9));
+
+        assert_eq!(
+            deadline.remaining(started + Duration::from_secs(12)),
+            Duration::from_secs(3)
+        );
+    }
+
+    #[test]
+    fn execution_deadline_accumulates_multiple_operator_waits() {
+        let started = std::time::Instant::now();
+        let mut deadline =
+            PausableDeadline::new(started, Duration::from_secs(10), Duration::from_secs(30));
+        deadline.pause(started + Duration::from_secs(2));
+        deadline.resume(started + Duration::from_secs(5));
+        deadline.pause(started + Duration::from_secs(7));
+        deadline.resume(started + Duration::from_secs(11));
+
+        assert_eq!(
+            deadline.remaining(started + Duration::from_secs(15)),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn execution_deadline_caps_total_operator_wait_credit() {
+        let started = std::time::Instant::now();
+        let mut deadline =
+            PausableDeadline::new(started, Duration::from_secs(10), Duration::from_secs(5));
+        deadline.pause(started + Duration::from_secs(2));
+
+        assert_eq!(
+            deadline.remaining(started + Duration::from_secs(9)),
+            Duration::from_secs(6)
+        );
+        assert_eq!(
+            deadline.remaining(started + Duration::from_secs(16)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
     fn isolated_workspace_keeps_selected_run_root_out_of_cwd() {
         let mut request = capability_request();
         request.target_workspace = Some("C:/operator-selected-workspace".into());
@@ -7120,6 +7447,163 @@ readline.createInterface({{ input: process.stdin }}).on('line', (line) => {{
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn fake_app_server_completes_after_two_sequential_approval_callbacks() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "codex-corp-two-approvals-{}-{unique}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        let log_path = root.join("approval-responses.jsonl");
+        let script_path = root.join("fake-app-server.cjs");
+        let command_path = root.join("fake-codex.cmd");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let log_literal = serde_json::to_string(&log_path.to_string_lossy()).unwrap();
+        let script = format!(
+            r#"const fs = require('fs');
+const readline = require('readline');
+const logPath = {log_literal};
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\n');
+readline.createInterface({{ input: process.stdin }}).on('line', (line) => {{
+  const request = JSON.parse(line);
+  if (request.method === 'initialize') send({{ jsonrpc:'2.0', id:request.id, result:{{}} }});
+  else if (request.method === 'skills/list') send({{ jsonrpc:'2.0', id:request.id, result:{{ data:[] }} }});
+  else if (request.method === 'thread/start') send({{ jsonrpc:'2.0', id:request.id, result:{{ thread:{{ id:'thread-two' }} }} }});
+  else if (request.method === 'turn/start') {{
+    send({{ jsonrpc:'2.0', id:request.id, result:{{ turn:{{ id:'turn-two' }} }} }});
+    send({{ jsonrpc:'2.0', id:'approval-one', method:'item/commandExecution/requestApproval', params:{{ command:'first' }} }});
+  }} else if (request.id === 'approval-one') {{
+    fs.appendFileSync(logPath, JSON.stringify(request) + '\n');
+    send({{ jsonrpc:'2.0', id:'approval-two', method:'item/commandExecution/requestApproval', params:{{ command:'second' }} }});
+  }} else if (request.id === 'approval-two') {{
+    fs.appendFileSync(logPath, JSON.stringify(request) + '\n');
+    send({{ jsonrpc:'2.0', method:'item/completed', params:{{ item:{{ type:'agentMessage', text:'{{"status":"success","summary":"two approvals handled","data":{{}},"artifacts":[]}}' }} }} }});
+    send({{ jsonrpc:'2.0', method:'turn/completed', params:{{ turn:{{ id:'turn-two' }} }} }});
+  }}
+}});"#
+        );
+        std::fs::write(&script_path, script).unwrap();
+        let node = find_node_exe().expect("Node.js is required for the fake app-server harness");
+        std::fs::write(
+            &command_path,
+            format!(
+                "@echo off\r\n\"{}\" \"{}\" %*\r\n",
+                node.display(),
+                script_path.display()
+            ),
+        )
+        .unwrap();
+
+        let mut request = capability_request();
+        request.approval_policy = "never".into();
+        request.workspace_policy = "workflow".into();
+        request.target_workspace = Some(workspace.to_string_lossy().into_owned());
+        request.timeout_seconds = 10;
+        request.output_schema = Some(default_agent_output_schema());
+        request.app_server_path = Some(command_path);
+        let result = tauri::async_runtime::block_on(execute_agent_internal(
+            request,
+            None,
+            ApprovalBroker(Arc::new(Mutex::new(HashMap::new()))),
+            ProcessBroker(Arc::new(Mutex::new(HashMap::new()))),
+            TurnStdinBroker(Arc::new(Mutex::new(HashMap::new()))),
+            Database(Arc::new(Mutex::new(Connection::open_in_memory().unwrap()))),
+            Arc::new(AtomicU64::new(0)),
+        ))
+        .unwrap();
+        assert_eq!(result.summary, "two approvals handled");
+
+        let responses = std::fs::read_to_string(&log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["id"], "approval-one");
+        assert_eq!(responses[1]["id"], "approval-two");
+        assert_eq!(responses[0]["result"]["decision"], "decline");
+        assert_eq!(responses[1]["result"]["decision"], "decline");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn stale_specialist_thread_recovers_with_fresh_thread_end_to_end() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "codex-corp-stale-thread-{}-{unique}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        let log_path = root.join("methods.log");
+        let script_path = root.join("fake-app-server.cjs");
+        let command_path = root.join("fake-codex.cmd");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let log_literal = serde_json::to_string(&log_path.to_string_lossy()).unwrap();
+        let script = format!(
+            r#"const fs = require('fs');
+const readline = require('readline');
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\n');
+readline.createInterface({{ input: process.stdin }}).on('line', (line) => {{
+  const request = JSON.parse(line);
+  if (request.method) fs.appendFileSync({log_literal}, request.method + '\n');
+  if (request.method === 'initialize') send({{jsonrpc:'2.0',id:request.id,result:{{}}}});
+  else if (request.method === 'thread/resume') send({{jsonrpc:'2.0',id:request.id,error:{{code:-32600,message:'thread not found: stale-thread'}}}});
+  else if (request.method === 'thread/start') send({{jsonrpc:'2.0',id:request.id,result:{{thread:{{id:'fresh-thread'}}}}}});
+  else if (request.method === 'turn/start') {{
+    if (request.params.threadId !== 'fresh-thread') send({{jsonrpc:'2.0',id:request.id,error:{{code:-32600,message:'thread not found: ' + request.params.threadId}}}});
+    else {{
+      send({{jsonrpc:'2.0',id:request.id,result:{{turn:{{id:'fresh-turn'}}}}}});
+      send({{jsonrpc:'2.0',method:'item/completed',params:{{item:{{type:'agentMessage',text:'{{"status":"success","summary":"fresh recovery worked","data":{{}},"artifacts":[]}}'}}}}}});
+      send({{jsonrpc:'2.0',method:'turn/completed',params:{{turn:{{id:'fresh-turn'}}}}}});
+    }}
+  }}
+}});"#
+        );
+        std::fs::write(&script_path, script).unwrap();
+        let node = find_node_exe().expect("Node.js is required for the fake app-server harness");
+        std::fs::write(
+            &command_path,
+            format!(
+                "@echo off\r\n\"{}\" \"{}\" %*\r\n",
+                node.display(),
+                script_path.display()
+            ),
+        )
+        .unwrap();
+
+        let mut request = capability_request();
+        request.thread_id = Some("stale-thread".into());
+        request.approval_policy = "never".into();
+        request.workspace_policy = "workflow".into();
+        request.target_workspace = Some(workspace.to_string_lossy().into_owned());
+        request.timeout_seconds = 10;
+        request.output_schema = Some(default_agent_output_schema());
+        request.app_server_path = Some(command_path);
+        let result = tauri::async_runtime::block_on(execute_agent_internal(
+            request,
+            None,
+            ApprovalBroker(Arc::new(Mutex::new(HashMap::new()))),
+            ProcessBroker(Arc::new(Mutex::new(HashMap::new()))),
+            TurnStdinBroker(Arc::new(Mutex::new(HashMap::new()))),
+            Database(Arc::new(Mutex::new(Connection::open_in_memory().unwrap()))),
+            Arc::new(AtomicU64::new(0)),
+        ))
+        .unwrap();
+        assert_eq!(result.summary, "fresh recovery worked");
+        let methods = std::fs::read_to_string(&log_path).unwrap();
+        assert!(methods.contains("thread/resume\nthread/start\nturn/start"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn empty_base_instructions_omitted_from_thread_params() {
         let mut request = capability_request();
@@ -7218,6 +7702,22 @@ readline.createInterface({{ input: process.stdin }}).on('line', (line) => {{
             schema["properties"]["artifacts"]["items"]["additionalProperties"],
             false
         );
+        let criteria = &schema["properties"]["data"]["properties"]["criteria"]["items"];
+        let required = criteria["required"]
+            .as_array()
+            .expect("criteria item schema must declare required fields");
+        for property in criteria["properties"]
+            .as_object()
+            .expect("criteria item schema must declare properties")
+            .keys()
+        {
+            assert!(
+                required
+                    .iter()
+                    .any(|value| value.as_str() == Some(property)),
+                "criteria item property {property} must be required"
+            );
+        }
     }
 
     #[test]
@@ -7415,6 +7915,149 @@ readline.createInterface({{ input: process.stdin }}).on('line', (line) => {{
         hydrate_run_records(&connection, &mut records).unwrap();
         let nodes: Value = serde_json::from_str(&records[0].nodes_json).unwrap();
         assert_eq!(nodes[0]["data"]["tokens"], 125);
+    }
+
+    #[test]
+    fn run_hydration_maps_runtime_output_statuses_to_canvas_statuses() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_database(&connection).unwrap();
+        for (node_id, status) in [
+            ("release", "success"),
+            ("failed", "failure"),
+            ("revision", "needs_revision"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO node_executions(id,run_id,node_id,status,output_json) VALUES(?1,'run',?2,?3,?4)",
+                    params![
+                        format!("run:{node_id}"),
+                        node_id,
+                        status,
+                        json!({"status":status,"summary":node_id,"data":{},"artifacts":[]}).to_string()
+                    ],
+                )
+                .unwrap();
+        }
+        let mut records = vec![RunRecord {
+            id: "run".into(),
+            workflow_id: "workflow".into(),
+            status: "completed".into(),
+            created_at: "2026-07-21T00:00:00Z".into(),
+            events_json: "[]".into(),
+            nodes_json: json!([
+                {"id":"release","data":{"status":"queued"}},
+                {"id":"failed","data":{"status":"queued"}},
+                {"id":"revision","data":{"status":"queued"}}
+            ])
+            .to_string(),
+            edges_json: "[]".into(),
+            terminal_reason: None,
+            resumable: false,
+            pinned: false,
+            last_event_sequence: 0,
+        }];
+
+        hydrate_run_records(&connection, &mut records).unwrap();
+        let nodes: Value = serde_json::from_str(&records[0].nodes_json).unwrap();
+        assert_eq!(nodes[0]["data"]["status"], "completed");
+        assert_eq!(nodes[1]["data"]["status"], "failed");
+        assert_eq!(nodes[2]["data"]["status"], "needs_revision");
+    }
+
+    #[test]
+    fn run_hydration_restores_the_highest_revision_for_connector_progress() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_database(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO node_attempts(id,run_id,node_id,attempt,revision,status,diagnostics_json)
+                 VALUES('a0','run','builder',0,0,'success','{}'),
+                       ('a1','run','builder',0,1,'success','{}'),
+                       ('a2','run','builder',0,2,'success','{}')",
+                [],
+            )
+            .unwrap();
+        let mut records = vec![RunRecord {
+            id: "run".into(),
+            workflow_id: "workflow".into(),
+            status: "failed".into(),
+            created_at: "2026-07-21T00:00:00Z".into(),
+            events_json: "[]".into(),
+            nodes_json: json!([{"id":"builder","data":{"revisions":0}}]).to_string(),
+            edges_json: "[]".into(),
+            terminal_reason: None,
+            resumable: false,
+            pinned: false,
+            last_event_sequence: 0,
+        }];
+
+        hydrate_run_records(&connection, &mut records).unwrap();
+        let nodes: Value = serde_json::from_str(&records[0].nodes_json).unwrap();
+        assert_eq!(nodes[0]["data"]["revisions"], 2);
+    }
+
+    #[test]
+    fn loaded_workflow_record_restores_workspace_without_blank_or_missing_values() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE workflows(
+                    id TEXT PRIMARY KEY,
+                    graph_json TEXT NOT NULL,
+                    workspace_path TEXT
+                );
+                INSERT INTO workflows(id,graph_json,workspace_path)
+                VALUES
+                  ('normal','{\"nodes\":[1]}','C:\\workspaces\\coffee'),
+                  ('unicode','{\"nodes\":[2]}','C:\\Work Spaces\\café'),
+                  ('blank','{\"nodes\":[3]}',''),
+                  ('spaces','{\"nodes\":[4]}','   '),
+                  ('null-path','{\"nodes\":[5]}',NULL);",
+            )
+            .unwrap();
+
+        // Attack vectors 1-2: exact absolute paths, including spaces/unicode.
+        let normal = load_workflow_record_from_connection(&connection, "normal")
+            .unwrap()
+            .unwrap();
+        assert_eq!(normal.graph_json, "{\"nodes\":[1]}");
+        assert_eq!(
+            normal.workspace_path.as_deref(),
+            Some("C:\\workspaces\\coffee")
+        );
+        let unicode = load_workflow_record_from_connection(&connection, "unicode")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unicode.workspace_path.as_deref(),
+            Some("C:\\Work Spaces\\café")
+        );
+        // Attack vectors 3-4: empty and whitespace-only paths become absent.
+        assert_eq!(
+            load_workflow_record_from_connection(&connection, "blank")
+                .unwrap()
+                .unwrap()
+                .workspace_path,
+            None
+        );
+        assert_eq!(
+            load_workflow_record_from_connection(&connection, "spaces")
+                .unwrap()
+                .unwrap()
+                .workspace_path,
+            None
+        );
+        // Attack vector 5: SQL NULL and missing workflow remain unambiguous.
+        assert_eq!(
+            load_workflow_record_from_connection(&connection, "null-path")
+                .unwrap()
+                .unwrap()
+                .workspace_path,
+            None
+        );
+        assert!(load_workflow_record_from_connection(&connection, "missing")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

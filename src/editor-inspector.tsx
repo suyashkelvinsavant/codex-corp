@@ -157,35 +157,24 @@ export function NodeInspector({
     ...d.trace.flatMap((entry, index): RunEvent[] =>
       typeof entry === "string"
         ? []
-        : [{
-            id: `trace-${entry.at}-${index}`,
-            at: new Date(entry.at).toISOString(),
-            type: entry.eventType,
-            message: entry.text,
-            nodeId: node.id,
-            threadId: entry.threadId,
-            turnId: entry.turnId,
-            level: "info",
-          }],
+        : [
+            {
+              id: `trace-${entry.at}-${index}`,
+              at: new Date(entry.at).toISOString(),
+              type: entry.eventType,
+              message: entry.text,
+              nodeId: node.id,
+              threadId: entry.threadId,
+              turnId: entry.turnId,
+              level: "info",
+            },
+          ],
     ),
   ].sort((left, right) => Date.parse(left.at) - Date.parse(right.at));
   const modelId = normalizeStoredModelId(d.model);
   const effortOptions = effortsForModel(availableModels, modelId);
-  const [threads, setThreads] = useState<Array<{
-    id: string;
-    name: string | null;
-    preview: string | null;
-    status: string | null;
-    createdAt: number;
-    updatedAt: number;
-    cwd: string | null;
-  }>>([]);
-  const [threadsLoaded, setThreadsLoaded] = useState(false);
-  const [threadsError, setThreadsError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (tab !== "threads" || threadsLoaded) return;
-    invoke<Array<{
+  const [threads, setThreads] = useState<
+    Array<{
       id: string;
       name: string | null;
       preview: string | null;
@@ -193,7 +182,24 @@ export function NodeInspector({
       createdAt: number;
       updatedAt: number;
       cwd: string | null;
-    }>>("list_codex_threads", { limit: 30 })
+    }>
+  >([]);
+  const [threadsLoaded, setThreadsLoaded] = useState(false);
+  const [threadsError, setThreadsError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (tab !== "threads" || threadsLoaded) return;
+    invoke<
+      Array<{
+        id: string;
+        name: string | null;
+        preview: string | null;
+        status: string | null;
+        createdAt: number;
+        updatedAt: number;
+        cwd: string | null;
+      }>
+    >("list_codex_threads", { limit: 30 })
       .then((data) => {
         setThreads([
           ...data.filter((thread) => thread.id === d.threadId),
@@ -203,7 +209,9 @@ export function NodeInspector({
         setThreadsLoaded(true);
       })
       .catch((failure) => {
-        setThreadsError(failure instanceof Error ? failure.message : String(failure));
+        setThreadsError(
+          failure instanceof Error ? failure.message : String(failure),
+        );
         setThreadsLoaded(true);
       });
   }, [tab, threadsLoaded, d.threadId]);
@@ -722,29 +730,53 @@ export function NodeInspector({
                 const label = traceEventLabel(event.type);
                 const isStreaming = isStreamingTraceEvent(event.type);
                 const icon = isStreaming ? (
-                  label === "Reasoning" ? <Brain size={12} /> :
-                  label === "Plan" ? <ListTodo size={12} /> :
-                  label === "Console" ? <Monitor size={12} /> :
-                  label === "Diff" ? <Diff size={12} /> :
-                  label === "File changes" ? <FileOutput size={12} /> :
-                  label === "Warning" ? <FileWarning size={12} /> :
-                  <Code2 size={12} />
+                  label === "Reasoning" ? (
+                    <Brain size={12} />
+                  ) : label === "Plan" ? (
+                    <ListTodo size={12} />
+                  ) : label === "Console" ? (
+                    <Monitor size={12} />
+                  ) : label === "Diff" ? (
+                    <Diff size={12} />
+                  ) : label === "File changes" ? (
+                    <FileOutput size={12} />
+                  ) : label === "Warning" ? (
+                    <FileWarning size={12} />
+                  ) : (
+                    <Code2 size={12} />
+                  )
                 ) : null;
                 return (
-                  <div key={event.id} className={isStreaming ? `trace-streaming trace-${label.toLowerCase().replace(/\s+/g, "-")}` : ""}>
+                  <div
+                    key={event.id}
+                    className={
+                      isStreaming
+                        ? `trace-streaming trace-${label.toLowerCase().replace(/\s+/g, "-")}`
+                        : ""
+                    }
+                  >
                     <span
                       className={i === nodeEvents.length - 1 ? "active" : ""}
                     />
                     <div>
-                      {isStreaming && <span className="trace-streaming-icon">{icon}</span>}
+                      {isStreaming && (
+                        <span className="trace-streaming-icon">{icon}</span>
+                      )}
                       <b>{isStreaming ? label : event.message}</b>
-                      {isStreaming && <span className="trace-streaming-detail">{event.message.slice(0, 200)}{event.message.length > 200 ? "…" : ""}</span>}
+                      {isStreaming && (
+                        <span className="trace-streaming-detail">
+                          {event.message.slice(0, 200)}
+                          {event.message.length > 200 ? "…" : ""}
+                        </span>
+                      )}
                       <small>
                         {new Date(event.at).toLocaleTimeString()} ·{" "}
                         {event.elapsedMs !== undefined
                           ? `${event.elapsedMs}ms · `
                           : ""}
-                        {event.status ?? event.level ?? event.type.replace(/^\[.*?\]\s*/, "")}
+                        {event.status ??
+                          event.level ??
+                          event.type.replace(/^\[.*?\]\s*/, "")}
                       </small>
                     </div>
                   </div>
@@ -958,7 +990,9 @@ export function NodeInspector({
             ) : threadsError ? (
               <p className="helper warning-text">
                 Thread history unavailable — {threadsError}{" "}
-                <button type="button" onClick={() => setThreadsLoaded(false)}>Retry</button>
+                <button type="button" onClick={() => setThreadsLoaded(false)}>
+                  Retry
+                </button>
               </p>
             ) : threads.length === 0 ? (
               <p className="helper">No threads found.</p>
@@ -967,13 +1001,18 @@ export function NodeInspector({
                 <div key={thread.id} className="thread-entry">
                   {thread.id === d.threadId ? (
                     <small>SELECTED NODE THREAD</small>
-                  ) : index === (d.threadId && threads[0]?.id === d.threadId ? 1 : 0) ? (
+                  ) : index ===
+                    (d.threadId && threads[0]?.id === d.threadId ? 1 : 0) ? (
                     <small>GLOBAL RECENT CODEX THREADS</small>
                   ) : null}
                   <div className="thread-header">
-                    <span className="thread-name">{thread.name ?? thread.id.slice(0, 8)}</span>
+                    <span className="thread-name">
+                      {thread.name ?? thread.id.slice(0, 8)}
+                    </span>
                     {thread.status && (
-                      <span className={`thread-status thread-status-${thread.status}`}>
+                      <span
+                        className={`thread-status thread-status-${thread.status}`}
+                      >
                         {thread.status}
                       </span>
                     )}
@@ -982,7 +1021,9 @@ export function NodeInspector({
                     <div className="thread-preview">{thread.preview}</div>
                   )}
                   <div className="thread-meta">
-                    <>Updated {new Date(thread.updatedAt).toLocaleDateString()}</>
+                    <>
+                      Updated {new Date(thread.updatedAt).toLocaleDateString()}
+                    </>
                     {thread.cwd && <> · {thread.cwd.split("/").pop()}</>}
                   </div>
                 </div>
@@ -1971,7 +2012,7 @@ function ControlNodeInspector({
         {kind === "output" && (
           <>
             {identityFields}
-            <Section title="Delivery">
+            <Section title="Release Bundle">
               <div className="output-card">
                 <span>{d.status}</span>
                 <p>{d.output || "No delivery summary yet."}</p>
@@ -2031,7 +2072,9 @@ function ControlNodeInspector({
               <Section title="Recent events">
                 <div className="trace">
                   {d.trace.slice(-6).map((line, i) => (
-                    <div key={`${typeof line === "string" ? line : line.at}-${i}`}>
+                    <div
+                      key={`${typeof line === "string" ? line : line.at}-${i}`}
+                    >
                       <span
                         className={
                           i === d.trace.slice(-6).length - 1 ? "active" : ""
@@ -2457,6 +2500,13 @@ function resolveCriteriaEvaluation(d: AgentData): CriterionEvaluation[] {
     );
   }
   if (d.criteriaEvaluation?.length) return d.criteriaEvaluation;
+  const hasTerminalResult =
+    d.status === "completed" ||
+    d.status === "failed" ||
+    Boolean(statusFromData);
+  if (!hasTerminalResult) {
+    return evaluateCompletionCriteria(d.completionCriteria, null, null);
+  }
   return evaluateCompletionCriteria(d.completionCriteria, resultLike, null);
 }
 
@@ -2564,7 +2614,17 @@ function CompletionCriteriaEditor({
         <code>data.verification.results</code> (runtime SSOT).
       </p>
       {onGateChange && (
-        <label className="criteria-hard-gate-toggle" style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.75rem", fontSize: "0.875rem", cursor: "pointer" }}>
+        <label
+          className="criteria-hard-gate-toggle"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "0.5rem",
+            marginBottom: "0.75rem",
+            fontSize: "0.875rem",
+            cursor: "pointer",
+          }}
+        >
           <input
             type="checkbox"
             checked={hardCriteriaGate === true}

@@ -129,7 +129,7 @@ Then enforce this map in four places:
 3. **Mechanical policy:** a verifier examines the diff/AST/dependency graph for forbidden ownership changes. For cron, it would require native scheduling behavior and native tests, while allowing TypeScript only for syntax preview and editor UX.
 4. **Independent review:** the reviewer receives the mission, architecture policy, diff, and test evidence—not the producer's confidence—and must cite file-level findings.
 
-Graphify is already installed in this repository and can help scope architecture relationships, but its output should inform a deterministic policy rather than becoming the policy itself.
+Architecture policy must be derived from the current source tree and enforced by deterministic validation.
 
 ## Codex prompt integration: preserve the model's native harness
 

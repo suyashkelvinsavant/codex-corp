@@ -234,7 +234,7 @@ test("builtin template + role catalog pack instantiate non-weak instructions", a
   await page
     .locator(".template-card")
     .filter({ hasText: "Software company" })
-    .getByRole("button", { name: "View / Edit" })
+    .getByRole("button", { name: "Use Template" })
     .click();
   await expect(page.getByRole("button", { name: "Seed" })).toBeVisible({
     timeout: 15_000,
@@ -287,7 +287,9 @@ test("keeps workflow and template toolbars aligned and themes template actions",
     .boundingBox();
 
   await page.getByRole("tab", { name: "Templates", exact: true }).click();
-  const templateSearchBox = await search.boundingBox();
+  const templateSearchBox = await page
+    .getByRole("textbox", { name: "Search templates" })
+    .boundingBox();
   const addTemplate = page.getByRole("button", {
     name: "Add template",
     exact: true,
@@ -309,9 +311,16 @@ test("keeps workflow and template toolbars aligned and themes template actions",
     "border-radius",
     "8px",
   );
-  await expect(
-    page.getByRole("button", { name: "Add templates", exact: true }),
-  ).toHaveCSS("background-color", "rgb(85, 214, 190)");
+  const emptySubmit = page.getByRole("button", {
+    name: "Add templates",
+    exact: true,
+  });
+  await expect(emptySubmit).toBeDisabled();
+  expect(
+    await emptySubmit.evaluate(
+      (element) => getComputedStyle(element).backgroundColor,
+    ),
+  ).toBe("rgb(255, 255, 255)");
 
   await page.getByRole("button", { name: "Cancel" }).click();
   await page.setViewportSize({ width: 520, height: 760 });
@@ -385,9 +394,13 @@ test("Workflow Architect chat history persists in the left sidebar", async ({
   );
   const actions = page.locator(".architect-compose-actions");
   await expect(actions).toHaveCSS("display", "flex");
-  await expect(page.getByRole("button", { name: "Start voice session" })).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Start voice session" }),
+  ).toHaveCount(0);
   const composerBox = await composer.boundingBox();
-  const sendBox = await page.getByRole("button", { name: "Send" }).boundingBox();
+  const sendBox = await page
+    .getByRole("button", { name: "Send" })
+    .boundingBox();
   expect((composerBox?.x ?? 0) + (composerBox?.width ?? 0)).toBeLessThanOrEqual(
     sendBox?.x ?? 0,
   );
@@ -580,7 +593,9 @@ test("tools tab labels capabilities as preferences and omits the obsolete MCP to
   await expect(page.getByTestId("tools-boundary-helper")).toContainText(
     /execution preferences.*not per-tool access controls/i,
   );
-  await expect(page.getByRole("button", { name: /MCP servers/i })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /MCP servers/i })).toHaveCount(
+    0,
+  );
 });
 
 test("mission constraints, acceptance notes, and completion criteria are editable and persist", async ({
