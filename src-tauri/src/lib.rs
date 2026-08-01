@@ -24,6 +24,7 @@ mod app_settings;
 mod business_data;
 mod chat_data;
 pub(crate) mod codex_turn;
+pub mod golden;
 pub mod mcp_server;
 mod platform_process;
 mod runtime_ownership;
@@ -1352,6 +1353,17 @@ fn command_for_codex(path: &Path, args: &[&str]) -> Command {
             .and_then(|value| value.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
+        // Windows cannot execute JavaScript modules as Win32 programs. Use
+        // the resolved Node runtime for explicit .js/.mjs/.cjs app-server
+        // paths, including the golden fake server.
+        if matches!(ext.as_str(), "js" | "mjs" | "cjs") {
+            if let Some(node) = find_node_exe() {
+                let mut command = Command::new(node);
+                command.arg(path).args(args);
+                prepare_command(&mut command);
+                return command;
+            }
+        }
         if ext == "ps1" {
             let mut command = Command::new("powershell.exe");
             command
@@ -1782,6 +1794,21 @@ fn validate_graph(graph: &GraphSnapshot) -> Vec<GraphProblem> {
                 let kind = crate::verifier::normalize_kind(&criterion.kind);
                 let kind = kind.as_str();
                 let required = criterion.platform || criterion.enforcement == "required";
+                // Fail closed at validation: an unknown kind cannot be silently
+                // downgraded (TS preview coerces unknown → advisory; Rust must not
+                // accept a required gate it cannot evaluate). Runtime also fails
+                // closed via evaluate_criterion's unknown-kind branch.
+                if !crate::verifier::is_known_kind(kind) {
+                    problems.push(problem(
+                        format!("criterion-kind-{}-{}", node.id, criterion.id),
+                        format!(
+                            "{}: unknown criterion kind: {kind}. Use one of structured_json, concise_summary, no_hidden_reasoning, claim, command, artifact_exists, architecture_policy.",
+                            node.data.label
+                        ),
+                        Some(node.id.clone()),
+                        None,
+                    ));
+                }
                 if required && kind == "claim" {
                     problems.push(problem(
                         format!("criterion-claim-required-{}-{}", node.id, criterion.id),
@@ -1858,7 +1885,11 @@ fn validate_graph(graph: &GraphSnapshot) -> Vec<GraphProblem> {
                         .unwrap_or(
                             crate::verifier::architecture::POLICY_NATIVE_RUNTIME_OWNERSHIP_V1,
                         );
-                    if policy != crate::verifier::architecture::POLICY_NATIVE_RUNTIME_OWNERSHIP_V1 {
+                    let supported = [
+                        crate::verifier::architecture::POLICY_NATIVE_RUNTIME_OWNERSHIP_V1,
+                        crate::verifier::architecture::POLICY_NATIVE_RUNTIME_OWNERSHIP_V2,
+                    ];
+                    if !supported.contains(&policy) {
                         problems.push(problem(
                             format!("criterion-arch-{}-{}", node.id, criterion.id),
                             format!(
@@ -7018,6 +7049,7 @@ pub fn run() {
             workflow_runtime::stop_run,
             workflow_runtime::get_run,
             workflow_runtime::list_active_runs,
+            workflow_runtime::analytics_verification_loops,
             workflow_runtime::respond_run_approval,
             list_codex_voices,
             start_codex_realtime,
@@ -7317,6 +7349,23 @@ mod tests {
                 r#""C:\Tools\Codex&Preview\codex.cmd" app-server --stdio"#,
             ]
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn javascript_app_server_paths_use_node_runtime() {
+        // Attack vector: the golden runner supplies a .mjs server path, which
+        // Windows cannot execute directly as a Win32 application.
+        let node = find_node_exe().expect("Node.js is required for JavaScript app-server paths");
+        let script = Path::new(r"C:\Tools\Codex Preview\fake-codex-server.mjs");
+        let command = command_for_codex(script, &["app-server", "--stdio"]);
+        assert_eq!(command.get_program(), node.as_os_str());
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args[0], script.to_string_lossy());
+        assert_eq!(&args[1..], ["app-server", "--stdio"]);
     }
 
     #[test]

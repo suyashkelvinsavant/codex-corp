@@ -120,6 +120,11 @@ import {
   type CodexCapabilityInventory,
 } from "./codex-capabilities";
 import { defaultPlatformCriteria } from "./completion-criteria";
+import {
+  parseVerificationLoops,
+  type VerificationLoopReport,
+} from "./analytics";
+import type { DeliveryPreviewStatus } from "./delivery-bundle";
 import { isSpecialistKind } from "./model";
 import {
   ACTIVE_WORKFLOW_KEY,
@@ -810,6 +815,13 @@ function App() {
   const [questionSelected, setQuestionSelected] = useState<string[]>([]);
   const [runId, setRunId] = useState<string | null>(null);
   const [runHistory, setRunHistory] = useState<RunRecord[]>([]);
+  /** Per-node verification→revision loops for the inspected run (P4 chip). */
+  const [verificationLoops, setVerificationLoops] = useState<
+    VerificationLoopReport[]
+  >([]);
+  /** Fail-closed Delivery status for the inspected run (P5 chip). */
+  const [inspectedDeliveryStatus, setInspectedDeliveryStatus] =
+    useState<DeliveryPreviewStatus>("pending");
   /** Compact lifetime totals for Dashboards (not active-workflow-only). */
   const [portfolioRunSummaries, setPortfolioRunSummaries] = useState<
     PortfolioRunSummary[]
@@ -1440,6 +1452,17 @@ function App() {
     if (shouldReplaceEdgesFromRun(rehydrated.edges)) setEdges(rehydrated.edges);
     setDrawer(true);
     setDrawerTab(rehydrated.deliveryArtifactPresent ? "artifacts" : "timeline");
+    // P5: the inspector shows the same fail-closed Delivery status as the
+    // overview list — derived from the output node verificationSummary +
+    // pair-compare, never contradiction a failed/cancelled run.
+    setInspectedDeliveryStatus(rehydrated.deliveryStatus);
+    // P4: verification-revision loop analytics chip (Native only — node_attempts).
+    setVerificationLoops([]);
+    if (isTauri()) {
+      invoke<unknown>("analytics_verification_loops", { runId: record.id })
+        .then((value) => setVerificationLoops(parseVerificationLoops(value)))
+        .catch(() => setVerificationLoops([]));
+    }
     emit(
       `Inspecting run ${record.id.slice(0, 8)} · ${record.status}`,
       "run.inspected",
@@ -4506,6 +4529,37 @@ function App() {
           </button>
           {drawer && (
             <div className="drawer-body">
+              {(verificationLoops.length > 0 ||
+                inspectedDeliveryStatus !== "pending") && (
+                <div className="drawer-verification-loops">
+                  {inspectedDeliveryStatus !== "pending" && (
+                    <span
+                      className={`delivery-preview-chip delivery-preview-${inspectedDeliveryStatus}`}
+                      title={
+                        inspectedDeliveryStatus === "failed"
+                          ? "Runtime verification or artifact pair-compare contradicts this delivery."
+                          : "Runtime verification rows back this delivery."
+                      }
+                    >
+                      Delivery{" "}
+                      {inspectedDeliveryStatus === "success"
+                        ? "trusted"
+                        : inspectedDeliveryStatus}
+                    </span>
+                  )}
+                  {verificationLoops.map((loop) => (
+                    <span
+                      key={loop.nodeId}
+                      className="verification-loops-chip"
+                      title={`criterionIds: ${loop.criterionIds.join(", ") || "—"}`}
+                    >
+                      {loop.verificationRevisions} verification loop
+                      {loop.verificationRevisions === 1 ? "" : "s"} ·{" "}
+                      {loop.nodeId}
+                    </span>
+                  ))}
+                </div>
+              )}
               <nav>
                 {(
                   [

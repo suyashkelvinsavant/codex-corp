@@ -9,6 +9,10 @@ import {
   type WorkflowSnapshot,
 } from "./model";
 import { getPack } from "./node-packs/packs";
+import {
+  deliveryStatusFromRun,
+  type DeliveryPreviewStatus,
+} from "./delivery-bundle";
 
 export const WORKFLOW_ID = "software-company";
 /** Legacy browser key for the original software-company workflow (back-compat). */
@@ -436,6 +440,9 @@ export type RunRehydration = {
   /** null = field missing (keep canvas edges); array = explicit snapshot (may be empty). */
   edges: FlowEdge[] | null;
   deliveryArtifactPresent: boolean;
+  /** Fail-closed delivery status (P5): derived from the run's output node
+   *  verificationSummary + pair-compare, never contradicting a failed run. */
+  deliveryStatus: DeliveryPreviewStatus;
 };
 
 /**
@@ -472,5 +479,11 @@ export function rehydrateRunRecord(record: RunRecord): RunRehydration {
       ),
     ),
   );
-  return { events, nodes, edges, deliveryArtifactPresent };
+  // P5: the run-inspector chip derives the same fail-closed Delivery status as
+  // the overview list — from the output node's verificationSummary + pair-compare.
+  const deliveryStatus = deliveryStatusFromRun({
+    runStatus: record.status,
+    nodesJson: record.nodesJson,
+  });
+  return { events, nodes, edges, deliveryArtifactPresent, deliveryStatus };
 }

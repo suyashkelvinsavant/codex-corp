@@ -229,6 +229,18 @@ impl McpHost {
         Ok(ids)
     }
 
+    /// Per-node verification→revision loop analytics (P4) — same SQL surface as
+    /// the `analytics_verification_loops` Tauri command.
+    pub fn analytics_verification_loops(&self, run_id: &str) -> Result<Value, String> {
+        let connection = self
+            .runtime
+            .database
+            .0
+            .lock()
+            .map_err(|_| "database lock poisoned".to_string())?;
+        crate::workflow_runtime::verification_loops_for_run(&connection, run_id)
+    }
+
     pub fn list_active_runs(&self, workflow_id: Option<&str>) -> Result<Value, String> {
         let active = self.runtime.workflow_runtime.list_active(workflow_id)?;
         Ok(json!({ "activeRuns": active }))

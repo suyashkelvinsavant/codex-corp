@@ -1,0 +1,37 @@
+{
+  "id": "mission-capability-gate-times-out",
+  "runMode": "mission",
+  "autoApproveGates": false,
+  "env": {
+    "CODEX_CORP_NEEDS_HUMAN_TIMEOUT_SECS": "3"
+  },
+  "mission": {
+    "text": "Ship a component but hit a sandbox permission boundary.",
+    "builderRole": "Frontend Engineer",
+    "builderCriteria": [
+      {
+        "id": "structured-1",
+        "label": "Structured output valid",
+        "kind": "structured_json",
+        "enforcement": "required"
+      }
+    ]
+  },
+  "scriptedOutputs": [
+    {
+      "status": "failure",
+      "summary": "workspace write denied: sandbox policy is read-only",
+      "data": {},
+      "artifacts": []
+    }
+  ],
+  "expect": {
+    "runStatus": "failed",
+    "delivery": {
+      "bundleHash": "absent",
+      "verification": "absent"
+    },
+    "terminalReasonContains": "needs_human",
+    "reason": "a capability failure arms a needs_human gate with no operator watching; CODEX_CORP_NEEDS_HUMAN_TIMEOUT_SECS=3 must fail it closed so the run stops promptly instead of hanging on the interactive 30-minute window"
+  }
+}

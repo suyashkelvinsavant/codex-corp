@@ -8,6 +8,7 @@ import {
   HOST_VERIFIER_KINDS,
   isHostVerifierKind,
   makeCustomCriterion,
+  normalizeCriterionKind,
   verificationResultsFromOutput,
 } from "./completion-criteria";
 
@@ -406,6 +407,59 @@ describe("completion-criteria", () => {
     });
     expect(satisfied.find((item) => item.id === custom.id)?.status).toBe(
       "pass",
+    );
+  });
+
+  it("preserves unknown criterion kinds instead of silently coercing to claim", () => {
+    const unknown = {
+      id: "typo-1",
+      label: "Artifacts",
+      kind: "artifct_exists",
+      enabled: true,
+      enforcement: "required",
+    } as never;
+    const merged = ensureCompletionCriteria([unknown as never]);
+    const row = merged.find((item) => item.id === "typo-1");
+    expect(row).toBeDefined();
+    // Unknown kinds must NOT be downgraded to advisory claim: required stays required.
+    expect(row?.kind).toBe("unknown");
+    expect(row?.enforcement).toBe("required");
+    expect(normalizeCriterionKind("artifct_exists")).toBe("unknown");
+    expect(normalizeCriterionKind("custom")).toBe("claim");
+    expect(normalizeCriterionKind("command")).toBe("command");
+  });
+
+  it("fails closed for required unknown kinds and stays pending for advisory", () => {
+    const unknown = {
+      id: "typo-1",
+      label: "Artifacts",
+      kind: "artifct_exists",
+      enabled: true,
+      enforcement: "required",
+    } as never;
+    const requiredEval = evaluateCompletionCriteria([unknown as never], {
+      status: "success",
+      summary: "done",
+      data: { criteria: [{ id: "typo-1", passed: true, evidence: "swear" }] },
+    });
+    const requiredRow = requiredEval.find((item) => item.id === "typo-1");
+    expect(requiredRow?.status).toBe("fail");
+    expect(requiredRow?.detail).toMatch(/required gate/i);
+
+    const advisory = {
+      id: "typo-2",
+      label: "Advisory typo",
+      kind: "artfitact",
+      enabled: true,
+      enforcement: "advisory",
+    } as never;
+    const advisoryEval = evaluateCompletionCriteria([advisory as never], {
+      status: "success",
+      summary: "done",
+      data: {},
+    });
+    expect(advisoryEval.find((item) => item.id === "typo-2")?.status).toBe(
+      "pending",
     );
   });
 });

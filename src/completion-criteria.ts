@@ -25,7 +25,9 @@ export type CriterionKind =
   /** Host checks materialized artifact presence. */
   | "artifact_exists"
   /** Host architecture policy (git-first). */
-  | "architecture_policy";
+  | "architecture_policy"
+  /** Unrecognized kind is preserved (not coerced to claim) so required gates fail closed. */
+  | "unknown";
 
 /** Kinds whose pass/fail is owned by the Rust host (runtime `verification.results`). */
 export const HOST_VERIFIER_KINDS = [
@@ -215,7 +217,8 @@ export function makeCustomCriterion(label: string): CompletionCriterion {
   };
 }
 
-/** Normalize legacy `custom` kind to `claim`. */
+/** Normalize legacy `custom` kind to `claim`. Unknown kinds are preserved so
+ *  required gates cannot be silently downgraded to advisory claims. */
 export function normalizeCriterionKind(
   kind: string | undefined | null,
 ): CriterionKind {
@@ -230,7 +233,7 @@ export function normalizeCriterionKind(
   ) {
     return kind;
   }
-  return "claim";
+  return "unknown";
 }
 
 /** Append enabled criteria into the specialist system prompt. */
@@ -429,6 +432,19 @@ function evaluateOne(
       };
     }
     // Host kinds handled above via isHostVerifierKind (command / artifact / arch).
+    // Unknown kinds fail-closed for required gates (mirrors Rust evaluate_criterion).
+    case "unknown": {
+      const requiredGate = enforcement === "required" || criterion.platform;
+      return {
+        id: criterion.id,
+        label: criterion.label,
+        status: requiredGate ? ("fail" as const) : ("pending" as const),
+        detail: requiredGate
+          ? "Unknown criterion kind cannot satisfy a required gate"
+          : "Unknown advisory criterion kind — awaiting runtime verification",
+        enforcement: requiredGate ? "required" : enforcement,
+      };
+    }
     case "claim":
     case "custom":
     default: {

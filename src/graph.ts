@@ -291,6 +291,14 @@ export function validateWorkflow(
         const kind = normalizeCriterionKind(criterion.kind);
         const required =
           Boolean(criterion.platform) || criterion.enforcement === "required";
+        if (kind === "unknown") {
+          problems.push({
+            id: `criterion-kind-${node.id}-${criterion.id}`,
+            severity: "error",
+            nodeId: node.id,
+            message: `${node.data.label}: unknown criterion kind "${criterion.kind}" — required gates cannot be satisfied by an unverified kind. Use structured_json, concise_summary, no_hidden_reasoning, claim, command, artifact_exists, or architecture_policy.`,
+          });
+        }
         if (required && (kind === "claim" || kind === "custom")) {
           problems.push({
             id: `criterion-claim-required-${node.id}-${criterion.id}`,

@@ -11,6 +11,7 @@ Run Codex Corp **without a GUI / WebView** on a Linux or Windows VM where the **
 ### Binary / platform notes
 
 - The headless binary currently **links the Tauri runtime** (not a pure minimal core crate). A future `codex_corp_core` split without WebView deps is out of scope for this version.
+- **Build vs runtime GTK nuance:** the **build** needs a GTK-capable image (e.g. `libwebkit2gtk-4.1-dev`) because the binary links the tauri/lib crate, but the **runtime needs no display** — the same binary runs `start_run` / MCP / `golden` headlessly. CI builds in a GTK-capable `ubuntu-22.04` image (`.github/workflows/golden.yml`).
 - On Linux VMs, validate shared-library needs by running `codex-corp-headless status` on the **target image** before automating.
 - Desktop and headless execution are mutually exclusive for one data directory. A cross-process runtime lock is acquired before SQLite is opened or recovered and is held for the process lifetime. Use a separate `CODEX_CORP_DATA_DIR` only when you intentionally need an isolated second runtime.
 
@@ -71,7 +72,7 @@ Authorization: Bearer <authToken>
 or header `X-Codex-Corp-Token: <authToken>`.
 
 - Token is generated per process and written to `mcp-server.status.json` as `authToken`.
-- Pin a token with `CODEX_CORP_MCP_TOKEN` (recommended if you set `CODEX_CORP_MCP_ALLOW_NON_LOOPBACK=1` — use a strong secret).
+- Pin a token with `CODEX_CORP_MCP_TOKEN` (non-loopback binds accept only tokens of at least 32 bytes; use a strong secret).
 - Auto-generated tokens use OS CSPRNG (`BCryptGenRandom` / `/dev/urandom`).
 - **Start banner** prints a short `authTokenFingerprint` (first 8 hex chars) by default. Full token on stdout only when `CODEX_CORP_MCP_PRINT_TOKEN=1`. Always prefer reading the status file for the secret.
 - On Unix, PID/status/lock files are created with mode `0600` and the data dir best-effort `0700`. On Windows, the data directory and runtime secret files receive a current-user-only ACL.
@@ -140,12 +141,18 @@ On headless start (and desktop `initialize`):
 There is **no desktop UI** for approval gates when running headless.
 
 1. Start a run with `company_run` (or via chat tools).
-2. When a node requests approval, the run waits (up to 30 minutes) on the run-approval broker.
+2. When a node requests approval, the run waits on the run-approval broker —
+   interactive approval gates up to 30 minutes, but a **`needs_human`** gate
+   (capability/specification recovery) resolves fail-closed within
+   `CODEX_CORP_NEEDS_HUMAN_TIMEOUT_SECS` seconds (default **30**) so batch/CI
+   runs never hang on a gate nobody is watching.
 3. Discover `requestId` via `list_pending_run_approvals`, `company_status.pendingRunApprovals`, or `get_run.pendingApprovals` (also logged to headless stderr when the gate arms).
 4. Call MCP tool `respond_run_approval` with `runId`, `requestId`, `decision` (bool).
 5. Or call `company_stop` to interrupt the run.
 
-Prefer graphs without blocking approval nodes for unattended VM automation.
+Prefer graphs without blocking approval nodes for unattended VM automation; a
+declined or timed-out `needs_human` gate stops the run with the intact failure
+class (`retry.needs_human` + `node.attempt.failed`) instead of hanging.
 
 ### Live Codex `requestApproval` (specialist tool steps)
 
@@ -201,7 +208,8 @@ Logs when enabled:
 ### Attack surface (loopback control plane)
 
 - **Bind:** default `127.0.0.1` only. Non-loopback requires `CODEX_CORP_MCP_ALLOW_NON_LOOPBACK=1`.
-- **Auth:** HTTP POST `/mcp` requires bearer token from `mcp-server.status.json` (`authToken`) or `CODEX_CORP_MCP_TOKEN`. Token compare is constant-time for equal-length secrets (length still leaks). Prefer a strong pinned token if binding off-loopback.
+- **Auth:** HTTP POST `/mcp` requires bearer token from `mcp-server.status.json` (`authToken`) or `CODEX_CORP_MCP_TOKEN`. Token compare is constant-time for equal-length secrets (length still leaks). Non-loopback binds are opt-in and reject tokens shorter than 32 bytes.
+- **CLI status:** `status` and `stop` redact the bearer token by default; read it from the protected status file. Set `CODEX_CORP_MCP_PRINT_TOKEN=1` only when an explicit full-token print is safe.
 - **Token location:** same data dir as SQLite — Windows `%LOCALAPPDATA%\CodexCorp\mcp-server.status.json`; Unix profile data-local `CodexCorp/`.
 - **CORS:** not enabled (not a browser API).
 - Bearer token is **not** printed in desktop logs; read the status file.
@@ -253,4 +261,4 @@ Intentional follow-ups (not blocking headless MCP quality bar):
 | **Full criterion engine move** | All evaluate + graph validate in `verifier/`; runtime only schedules. Today text/JSON/`claim` kinds are still runtime-local; host I/O kinds already call `verifier/*`. |
 | **Delivery assembly extract** | Lift delivery materialize / pair-compare orchestration into `runtime/delivery.rs` or expand `verifier/delivery` to shrink `workflow_runtime.rs`. |
 | **UI Codex turn migration** | Route `execute_mediator_turn` / `execute_agent_internal` through `codex_turn` only when streaming, UI tool broker, and `requestApproval` map cleanly — do not half-fork a third client. |
-| **Auth beyond loopback** | If non-loopback bind becomes a product default, revisit ACL on status files (Windows) and fixed-length token policy. |
+| **Auth beyond loopback** | Non-loopback bind is opt-in and accepts only a bearer token of at least 32 bytes; revisit the policy if remote access becomes a product default. |

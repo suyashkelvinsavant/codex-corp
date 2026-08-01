@@ -1,0 +1,15 @@
+{
+  "id": "capability-denial",
+  "criterion": {
+    "id": "cap-1",
+    "kind": "claim",
+    "enforcement": "advisory"
+  },
+  "attemptError": "workspace write denied: sandbox policy is read-only",
+  "expect": {
+    "failureClass": "capability",
+    "gate": "needs_human",
+    "action": "request authorization or route to a capable node",
+    "reason": "tool/sandbox denial is a capability failure, not a prompt failure — retrying the same prompt will not grant the permission; the node arms a needs_human gate (or reroutes) instead of failing the run"
+  }
+}

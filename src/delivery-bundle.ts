@@ -15,6 +15,24 @@ export type DeliveryArtifactRef = {
   hostOrdinal: number;
 };
 
+/** Runtime verification.results row (SSOT — producer can never own the pass bit). */
+export type VerificationRow = {
+  id: string;
+  passed: boolean;
+  kind?: string;
+  enforcement?: string;
+  detail?: string;
+  method?: string;
+  source?: string;
+};
+
+/**
+ * Fail-closed preview status. `success` is only claimed when runtime
+ * verification rows back the run; rows without runtime backing are `pending`
+ * and never `pass`; any contradiction is `failed`.
+ */
+export type DeliveryPreviewStatus = "success" | "failed" | "pending";
+
 export type DeliveryBundle = {
   schemaVersion: "codex-corp.delivery.v3" | string;
   /** Runtime emits "live"; this builder emits "preview". */
@@ -109,6 +127,7 @@ export function buildDeliveryBundle(args: {
   generatedAt?: string;
   approvedArtifacts?: DeliveryArtifactRef[];
   liveArtifactRefs?: DeliveryArtifactRef[];
+  verificationResults?: VerificationRow[];
 }): { summary: string; data: DeliveryBundle; artifacts: Artifact[] } {
   const generatedAt = args.generatedAt ?? new Date().toISOString();
   const handoffs = args.upstreamOutputs.map((item) => ({
@@ -170,14 +189,26 @@ export function buildDeliveryBundle(args: {
     residualRisks.push("empty_approval_artifact_set");
   }
 
-  const hasFailure = args.upstreamOutputs.some(
-    (item) =>
-      item.data.status === "failure" ||
-      item.data.status === "failed" ||
-      item.data.verdict === "fail" ||
-      item.data.verdict === "needs_revision",
-  );
-  const status = hasFailure ? "failed" : "success";
+  const status = deriveDeliveryStatus({
+    upstreamOutputs: args.upstreamOutputs,
+    verificationResults: args.verificationResults,
+    approvedArtifacts,
+    liveArtifactRefs,
+  });
+  const outcome =
+    status === "success" ? "pass" : status === "failed" ? "fail" : "pending";
+
+  const verificationSummary = args.verificationResults?.length
+    ? [
+        {
+          results: args.verificationResults,
+          requiredFailed: args.verificationResults
+            .filter((row) => row.passed === false)
+            .map((row) => row.id),
+          passBitOwner: "runtime",
+        },
+      ]
+    : undefined;
 
   const bundle: DeliveryBundle = {
     schemaVersion: "codex-corp.delivery.v3",
@@ -194,9 +225,10 @@ export function buildDeliveryBundle(args: {
     specialistHandoffs: handoffs,
     approvedArtifacts,
     liveArtifactRefs,
+    verificationSummary,
     residualRisks,
     review: {
-      outcome: String(reviewSource?.data.verdict ?? "pass"),
+      outcome,
       summary: reviewSource?.summary ?? "Review completed",
       revisionCount: Number(reviewSource?.data.revision ?? 1),
     },
@@ -223,4 +255,127 @@ export function buildDeliveryBundle(args: {
       },
     ],
   };
+}
+
+/**
+ * Pair-compare mirror of the runtime verifier (delivery_pair_compare): every
+ * approved (artifactKey, contentHash) must exist in the live set with the same
+ * hash, and every live release-set key must be present in the approved set.
+ * `true` means the pair contradicts a trusted handoff.
+ */
+export function pairCompareFailed(
+  approved: DeliveryArtifactRef[] | undefined,
+  live: DeliveryArtifactRef[] | undefined,
+): boolean {
+  if (!approved && !live) return false;
+  const approvedList = approved ?? [];
+  const liveList = live ?? [];
+  const liveByKey = new Map(
+    liveList.map((ref) => [ref.artifactKey, ref.contentHash]),
+  );
+  const approvedKeys = new Set(approvedList.map((ref) => ref.artifactKey));
+  for (const ref of approvedList) {
+    const liveHash = liveByKey.get(ref.artifactKey);
+    if (liveHash === undefined) return true;
+    if (liveHash !== ref.contentHash) return true;
+  }
+  for (const ref of liveList) {
+    if (!approvedKeys.has(ref.artifactKey)) return true;
+  }
+  return false;
+}
+
+/**
+ * Fail-closed delivery status derivation.
+ *
+ * Order of precedence — any contradiction fails; success is only claimed when
+ * runtime verification rows exist AND the approval artifact set is non-empty
+ * and pair-compare-clean:
+ *
+ * 1. explicit handoff failure signals → `failed`
+ * 2. runtime verification rows present with any `passed:false` → `failed`
+ * 3. pair-compare mismatch between approved and live refs → `failed`
+ * 4. rows backed by runtime verification + non-empty approval set → `success`
+ * 5. otherwise (no runtime rows, empty approval set) → `pending` — never `pass`
+ */
+export function deriveDeliveryStatus(args: {
+  upstreamOutputs: Array<{
+    nodeId: string;
+    data: Record<string, unknown>;
+  }>;
+  verificationResults?: VerificationRow[];
+  approvedArtifacts?: DeliveryArtifactRef[];
+  liveArtifactRefs?: DeliveryArtifactRef[];
+}): DeliveryPreviewStatus {
+  const hasHandoffFailure = args.upstreamOutputs.some(
+    (item) =>
+      item.data.status === "failure" ||
+      item.data.status === "failed" ||
+      item.data.verdict === "fail" ||
+      item.data.verdict === "needs_revision",
+  );
+  if (hasHandoffFailure) return "failed";
+
+  const runtimeRows = args.verificationResults ?? [];
+  if (
+    runtimeRows.length > 0 &&
+    runtimeRows.some((row) => row.passed === false)
+  ) {
+    return "failed";
+  }
+
+  if (pairCompareFailed(args.approvedArtifacts, args.liveArtifactRefs)) {
+    return "failed";
+  }
+
+  if (runtimeRows.length > 0 && (args.approvedArtifacts?.length ?? 0) > 0) {
+    return "success";
+  }
+
+  // Fail closed: no runtime backing (or empty approval snapshot) → pending.
+  return "pending";
+}
+
+/**
+ * Derive a fail-closed delivery status for a persisted run record. The run's
+ * output node `structuredOutput` (the delivery bundle) is authoritative when
+ * present; a run without a trusted bundle is `pending` and a failed run is
+ * `failed` — never claimed `success` from run status alone.
+ */
+export function deliveryStatusFromRun(args: {
+  runStatus?: string;
+  nodesJson?: string;
+}): DeliveryPreviewStatus {
+  if (args.runStatus === "failed" || args.runStatus === "cancelled") {
+    return "failed";
+  }
+  let bundle: Record<string, unknown> | undefined;
+  if (args.nodesJson?.trim()) {
+    try {
+      const nodes = JSON.parse(args.nodesJson) as Array<{
+        data?: { kind?: string; structuredOutput?: unknown };
+      }>;
+      const outputNode = nodes.find((node) => node.data?.kind === "output");
+      if (outputNode?.data?.structuredOutput) {
+        bundle = outputNode.data.structuredOutput as Record<string, unknown>;
+      }
+    } catch {
+      // Unparseable snapshot: fail closed below.
+    }
+  }
+  if (!bundle) return "pending";
+  const verificationSummary = Array.isArray(bundle.verificationSummary)
+    ? (bundle.verificationSummary as Array<{
+        results?: VerificationRow[];
+      }>)
+    : [];
+  const results = verificationSummary.flatMap((block) => block.results ?? []);
+  return deriveDeliveryStatus({
+    upstreamOutputs: [],
+    verificationResults: results,
+    approvedArtifacts: bundle.approvedArtifacts as
+      DeliveryArtifactRef[] | undefined,
+    liveArtifactRefs: bundle.liveArtifactRefs as
+      DeliveryArtifactRef[] | undefined,
+  });
 }

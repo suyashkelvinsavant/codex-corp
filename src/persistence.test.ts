@@ -469,9 +469,160 @@ describe("persistence helpers", () => {
     expect(rehydrated.events).toHaveLength(1);
     expect(rehydrated.nodes).toHaveLength(2);
     expect(rehydrated.deliveryArtifactPresent).toBe(true);
+    expect(rehydrated.deliveryStatus).toBe("pending");
     expect(
       rehydrated.nodes?.find((n) => n.id === "builder")?.data.structuredOutput,
     ).toEqual({ modules: ["x"] });
+  });
+
+  it("derives a trusted delivery status from the run inspector path (P5)", () => {
+    const outputNode = {
+      id: "output",
+      type: "corpNode",
+      position: { x: 0, y: 0 },
+      data: {
+        label: "output",
+        role: "Verified handoff",
+        kind: "output" as const,
+        status: "completed",
+        structuredOutput: {
+          status: "success",
+          approvedArtifacts: [
+            {
+              artifactKey: "builder::0::App.tsx",
+              contentHash: "sha256:abc",
+              sourceNodeId: "builder",
+              name: "App.tsx",
+              hostOrdinal: 0,
+            },
+          ],
+          liveArtifactRefs: [
+            {
+              artifactKey: "builder::0::App.tsx",
+              contentHash: "sha256:abc",
+              sourceNodeId: "builder",
+              name: "App.tsx",
+              hostOrdinal: 0,
+            },
+          ],
+          verificationSummary: [
+            {
+              results: [
+                {
+                  id: "cmd-1",
+                  kind: "command",
+                  passed: true,
+                  enforcement: "required",
+                  source: "runtime",
+                },
+              ],
+              passBitOwner: "runtime",
+            },
+          ],
+        },
+      },
+    };
+    const record: RunRecord = {
+      id: "run-trusted",
+      workflowId: "software-company",
+      status: "completed",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      eventsJson: "[]",
+      nodesJson: JSON.stringify([outputNode]),
+      edgesJson: "[]",
+    };
+    expect(rehydrateRunRecord(record).deliveryStatus).toBe("success");
+  });
+
+  it("never contradicts a failed run in the inspector path (P5)", () => {
+    // Even with a stale "success-looking" bundle snapshot, a failed run must
+    // resolve to Delivery failed — fail closed.
+    const staleBundle = {
+      id: "output",
+      type: "corpNode",
+      position: { x: 0, y: 0 },
+      data: {
+        label: "output",
+        role: "Verified handoff",
+        kind: "output" as const,
+        status: "failed",
+        structuredOutput: {
+          status: "success",
+          approvedArtifacts: [],
+          liveArtifactRefs: [],
+          verificationSummary: [],
+        },
+      },
+    };
+    const record: RunRecord = {
+      id: "run-failed",
+      workflowId: "software-company",
+      status: "failed",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      eventsJson: "[]",
+      nodesJson: JSON.stringify([staleBundle]),
+      edgesJson: "[]",
+    };
+    expect(rehydrateRunRecord(record).deliveryStatus).toBe("failed");
+  });
+
+  it("flags a stale pair-compare bundle in the inspector path (P5)", () => {
+    const stale = {
+      id: "output",
+      type: "corpNode",
+      position: { x: 0, y: 0 },
+      data: {
+        label: "output",
+        role: "Verified handoff",
+        kind: "output",
+        status: "completed",
+        structuredOutput: {
+          status: "success",
+          approvedArtifacts: [
+            {
+              artifactKey: "builder::0::App.tsx",
+              contentHash: "sha256:approved",
+              sourceNodeId: "builder",
+              name: "App.tsx",
+              hostOrdinal: 0,
+            },
+          ],
+          liveArtifactRefs: [
+            {
+              artifactKey: "builder::0::App.tsx",
+              contentHash: "sha256:stale",
+              sourceNodeId: "builder",
+              name: "App.tsx",
+              hostOrdinal: 0,
+            },
+          ],
+          verificationSummary: [
+            {
+              results: [
+                {
+                  id: "cmd-1",
+                  kind: "command",
+                  passed: true,
+                  enforcement: "required",
+                  source: "runtime",
+                },
+              ],
+              passBitOwner: "runtime",
+            },
+          ],
+        },
+      },
+    };
+    const record: RunRecord = {
+      id: "run-stale",
+      workflowId: "software-company",
+      status: "completed",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      eventsJson: "[]",
+      nodesJson: JSON.stringify([stale]),
+      edgesJson: "[]",
+    };
+    expect(rehydrateRunRecord(record).deliveryStatus).toBe("failed");
   });
 
   it("normalizes run history arrays from localStorage JSON", () => {

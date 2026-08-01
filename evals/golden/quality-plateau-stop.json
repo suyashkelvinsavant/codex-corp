@@ -1,0 +1,13 @@
+{
+  "id": "quality-plateau-stop",
+  "attempts": [
+    { "status": "failure", "summary": "still broken", "fingerprint": "fp-1", "artifactHashSet": "set-A" },
+    { "status": "failure", "summary": "still broken", "fingerprint": "fp-1", "artifactHashSet": "set-A" }
+  ],
+  "expect": {
+    "plateau": true,
+    "failureClass": "plateau",
+    "action": "change model/strategy or stop",
+    "reason": "≥2 identical fingerprints with a stable artifact hash-set means re-prompting the same inputs is waste — stop or replan"
+  }
+}
