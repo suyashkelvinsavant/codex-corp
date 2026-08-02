@@ -1216,7 +1216,7 @@ mod tests {
         let running = approve_local_test_launch_with_app(
             prepared.id.clone(),
             true,
-            &app.handle(),
+            app.handle(),
             app.state::<Database>().inner(),
             app.state::<LocalTestProcessRegistry>().inner(),
         )
@@ -1251,7 +1251,7 @@ mod tests {
             prepared.id.clone(),
             false,
             "The local page needs a visible save confirmation.".into(),
-            &app.handle(),
+            app.handle(),
             app.state::<Database>().inner(),
             app.state::<LocalTestProcessRegistry>().inner(),
         )
@@ -1351,7 +1351,7 @@ mod tests {
         let running = approve_local_test_launch_with_app(
             prepared.id.clone(),
             true,
-            &app.handle(),
+            app.handle(),
             app.state::<Database>().inner(),
             app.state::<LocalTestProcessRegistry>().inner(),
         )
@@ -1373,7 +1373,7 @@ mod tests {
             prepared.id.clone(),
             true,
             String::new(),
-            &app.handle(),
+            app.handle(),
             app.state::<Database>().inner(),
             app.state::<LocalTestProcessRegistry>().inner(),
         )
