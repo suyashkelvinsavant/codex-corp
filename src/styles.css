@@ -2273,9 +2273,11 @@ button.primary:focus-visible {
 }
 .decision-center-modal {
   position: relative;
-  width: min(620px, calc(100vw - 32px));
+  width: min(760px, calc(100vw - 32px));
+  max-width: 100%;
   max-height: min(760px, calc(100vh - 40px));
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 .decision-center-modal > .modal-close {
   position: absolute;
@@ -2292,10 +2294,14 @@ button.primary:focus-visible {
   margin-top: 14px;
 }
 .decision-card {
+  min-width: 0;
+  max-width: 100%;
   padding: 14px;
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--surface-2);
+  overflow-x: hidden;
+  overflow-wrap: anywhere;
 }
 .decision-card > span {
   color: var(--accent);
@@ -2313,6 +2319,10 @@ button.primary:focus-visible {
   display: block;
   color: var(--text-muted);
 }
+.decision-raw-payload {
+  min-width: 0;
+  max-width: 100%;
+}
 .decision-center-empty {
   padding: 18px 0;
   color: var(--text-muted);
@@ -2329,6 +2339,8 @@ button.primary:focus-visible {
   word-break: break-word;
   color: var(--text-muted);
   max-height: 200px;
+  max-width: 100%;
+  overflow-x: hidden;
   overflow-y: auto;
 }
 .structured-file-list {
@@ -2340,7 +2352,10 @@ button.primary:focus-visible {
   display: flex;
   align-items: center;
   gap: 6px;
-  font: 400 12px "IBM Plex Mono", ui-monospace, monospace;
+  font:
+    400 12px "IBM Plex Mono",
+    ui-monospace,
+    monospace;
 }
 .structured-file-type {
   font-size: 10px;
@@ -2368,11 +2383,21 @@ button.primary:focus-visible {
 }
 .structured-command-row {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 6px;
+  min-width: 0;
+  max-width: 100%;
   color: var(--text);
 }
+.structured-command-row > svg {
+  flex: 0 0 auto;
+  margin-top: 3px;
+}
 .structured-command {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  flex: 1 1 0;
   font:
     500 12px "IBM Plex Mono",
     ui-monospace,
@@ -2380,13 +2405,19 @@ button.primary:focus-visible {
   background: color-mix(in srgb, var(--accent) 10%, transparent);
   padding: 2px 6px;
   border-radius: 4px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 .structured-cwd {
+  max-width: 100%;
   font-size: 11px;
   color: var(--text-muted);
   margin: 2px 0 0;
 }
 .structured-cwd code {
+  overflow-wrap: anywhere;
+  word-break: break-word;
   font-size: 11px;
 }
 .structured-reason {
@@ -2403,6 +2434,140 @@ button.primary:focus-visible {
 .structured-parsed-cmd small {
   color: var(--text-muted);
   font-size: 11px;
+}
+.local-test-command-preview,
+.local-test-card-command {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+  margin: 12px 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+.local-test-command-preview code,
+.local-test-card-command code {
+  min-width: 0;
+  color: var(--accent);
+  font: 500 11px/1.45 var(--mono);
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.local-test-command-preview small,
+.local-test-card-command small {
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.local-test-card {
+  align-self: stretch;
+  width: min(700px, 100%);
+  margin: 4px auto 0;
+  padding: 15px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--accent) 8%, var(--panel));
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.local-test-card.status-changes_requested,
+.local-test-card.status-launch_failed {
+  border-color: color-mix(in srgb, var(--coral, #f06d6a) 50%, var(--border));
+}
+.local-test-card.status-approved {
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--border));
+}
+.local-test-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.local-test-eyebrow {
+  color: var(--accent);
+  font: 600 9px var(--mono);
+  letter-spacing: 0.1em;
+}
+.local-test-card h3 {
+  margin: 6px 0 0;
+  font: 600 16px "Sora";
+}
+.local-test-status {
+  flex: 0 0 auto;
+  padding: 4px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font: 600 9px var(--mono);
+  text-transform: uppercase;
+}
+.local-test-card p {
+  margin: 10px 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.local-test-card textarea {
+  display: block;
+  width: 100%;
+  min-height: 68px;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  padding: 9px 10px;
+  font:
+    12px/1.45 "Instrument Sans",
+    system-ui,
+    sans-serif;
+  outline: none;
+}
+.local-test-card textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+.local-test-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+.local-test-card-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 31px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-2);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 11px;
+}
+.local-test-card-actions button.primary {
+  border-color: var(--accent-soft-border, var(--accent));
+  background: var(--accent);
+  color: var(--accent-contrast, #08120f);
+}
+.local-test-card-actions button.quiet {
+  margin-left: auto;
+  color: var(--text-muted);
+}
+.local-test-card-actions button:hover {
+  border-color: var(--accent);
+}
+.local-test-card-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.local-test-card-actions button:disabled:hover {
+  border-color: var(--border);
 }
 .agent-chat-top-actions {
   display: flex;
@@ -3366,14 +3531,23 @@ select:focus-visible {
   display: grid;
   place-items: center;
   border-radius: 9px;
-  border: 1px solid color-mix(in srgb, var(--accent-mark, var(--accent)) 34%, var(--border));
-  background: color-mix(in srgb, var(--accent-mark, var(--accent)) 12%, var(--panel));
+  border: 1px solid
+    color-mix(in srgb, var(--accent-mark, var(--accent)) 34%, var(--border));
+  background: color-mix(
+    in srgb,
+    var(--accent-mark, var(--accent)) 12%,
+    var(--panel)
+  );
   color: var(--accent-mark, var(--accent));
 }
 .workflow-identity-trigger:hover,
 .workflow-identity-trigger[aria-expanded="true"] {
   border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
-  background: color-mix(in srgb, var(--hover-bg, var(--surface-2)) 70%, transparent);
+  background: color-mix(
+    in srgb,
+    var(--hover-bg, var(--surface-2)) 70%,
+    transparent
+  );
 }
 .workflow-identity-copy {
   min-width: 0;
@@ -3626,9 +3800,14 @@ select:focus-visible {
   align-items: center;
   height: 20px;
   padding: 0 7px;
-  border: 1px solid color-mix(in srgb, var(--accent-mark, var(--accent)) 32%, var(--border));
+  border: 1px solid
+    color-mix(in srgb, var(--accent-mark, var(--accent)) 32%, var(--border));
   border-radius: 6px;
-  background: color-mix(in srgb, var(--accent-mark, var(--accent)) 10%, var(--panel));
+  background: color-mix(
+    in srgb,
+    var(--accent-mark, var(--accent)) 10%,
+    var(--panel)
+  );
   color: var(--accent-mark, var(--accent));
   font:
     600 10px/1 "IBM Plex Mono",
@@ -3915,7 +4094,8 @@ select:focus-visible {
   border-radius: 10px;
   display: grid;
   place-items: center;
-  border: 1px solid color-mix(in srgb, var(--danger, #ef7772) 45%, var(--border));
+  border: 1px solid
+    color-mix(in srgb, var(--danger, #ef7772) 45%, var(--border));
   background: color-mix(in srgb, var(--danger, #ef7772) 12%, var(--panel));
   color: var(--danger, #ef7772);
 }
@@ -3993,7 +4173,8 @@ select:focus-visible {
   color: var(--text);
 }
 .confirm-delete-confirm {
-  border: 1px solid color-mix(in srgb, var(--danger, #ef7772) 55%, var(--border));
+  border: 1px solid
+    color-mix(in srgb, var(--danger, #ef7772) 55%, var(--border));
   background: color-mix(in srgb, var(--danger, #ef7772) 16%, var(--panel));
   color: var(--danger, #ef7772);
 }
@@ -4929,7 +5110,11 @@ select:focus-visible {
 }
 .architect-crud button:hover {
   color: var(--text);
-  border-color: color-mix(in srgb, var(--accent-mark, var(--accent)) 30%, var(--border));
+  border-color: color-mix(
+    in srgb,
+    var(--accent-mark, var(--accent)) 30%,
+    var(--border)
+  );
   background: var(--hover-bg, var(--surface-2));
 }
 .architect-crud button.danger:hover {
@@ -5020,7 +5205,8 @@ select:focus-visible {
   height: 6px;
   border-radius: 50%;
   background: var(--accent-mark, var(--accent));
-  box-shadow: 0 0 8px color-mix(in srgb, var(--accent-mark, var(--accent)) 55%, transparent);
+  box-shadow: 0 0 8px
+    color-mix(in srgb, var(--accent-mark, var(--accent)) 55%, transparent);
 }
 .architect-chat {
   width: min(960px, calc(100% - 50px));
@@ -5099,7 +5285,11 @@ select:focus-visible {
   position: absolute;
   top: 51px;
   height: 1px;
-  background: color-mix(in srgb, var(--accent-mark, var(--accent)) 45%, var(--border));
+  background: color-mix(
+    in srgb,
+    var(--accent-mark, var(--accent)) 45%,
+    var(--border)
+  );
   width: 69px;
 }
 .bp-line.a {
@@ -5113,7 +5303,8 @@ select:focus-visible {
   position: absolute;
   right: 0;
   top: -3px;
-  border-left: 5px solid color-mix(in srgb, var(--accent-mark, var(--accent)) 45%, var(--border));
+  border-left: 5px solid
+    color-mix(in srgb, var(--accent-mark, var(--accent)) 45%, var(--border));
   border-top: 3px solid transparent;
   border-bottom: 3px solid transparent;
 }
@@ -5141,7 +5332,11 @@ select:focus-visible {
     transform 0.12s;
 }
 .architect-starters button:hover {
-  border-color: color-mix(in srgb, var(--accent-mark, var(--accent)) 35%, var(--border));
+  border-color: color-mix(
+    in srgb,
+    var(--accent-mark, var(--accent)) 35%,
+    var(--border)
+  );
   background: var(--hover-bg, var(--surface-2));
   transform: translateY(-2px);
 }
@@ -5211,7 +5406,8 @@ select:focus-visible {
   right: 0;
   bottom: 116px;
   padding: 8px 12px;
-  border: 1px solid color-mix(in srgb, var(--danger, #ef7772) 45%, var(--border));
+  border: 1px solid
+    color-mix(in srgb, var(--danger, #ef7772) 45%, var(--border));
   background: color-mix(in srgb, var(--danger, #ef7772) 10%, var(--panel));
   color: var(--danger, #ef7772);
   border-radius: 8px;
@@ -5274,7 +5470,11 @@ select:focus-visible {
   color: var(--text-muted);
 }
 .architect-compose-actions > .architect-voice-button.live {
-  border-color: color-mix(in srgb, var(--accent-mark, var(--accent)) 55%, var(--border));
+  border-color: color-mix(
+    in srgb,
+    var(--accent-mark, var(--accent)) 55%,
+    var(--border)
+  );
   color: var(--accent-mark, var(--accent));
 }
 .architect-compose-actions > button:disabled {
@@ -5752,8 +5952,13 @@ select:focus-visible {
   border-radius: 50%;
   display: grid;
   place-items: center;
-  background: color-mix(in srgb, var(--accent-mark, var(--accent)) 14%, var(--panel));
-  border: 1px solid color-mix(in srgb, var(--accent-mark, var(--accent)) 35%, var(--border));
+  background: color-mix(
+    in srgb,
+    var(--accent-mark, var(--accent)) 14%,
+    var(--panel)
+  );
+  border: 1px solid
+    color-mix(in srgb, var(--accent-mark, var(--accent)) 35%, var(--border));
   color: var(--accent-mark, var(--accent));
   flex-shrink: 0;
 }
@@ -7194,7 +7399,11 @@ select:focus-visible {
 }
 .template-card:hover {
   border-color: color-mix(in srgb, var(--accent) 26%, var(--border));
-  background: color-mix(in srgb, var(--hover-bg, var(--surface-2)) 55%, var(--panel));
+  background: color-mix(
+    in srgb,
+    var(--hover-bg, var(--surface-2)) 55%,
+    var(--panel)
+  );
 }
 .template-card-top {
   display: grid;
@@ -7215,11 +7424,8 @@ select:focus-visible {
     var(--accent-mark, var(--accent)) 14%,
     var(--panel)
   );
-  border: 1px solid color-mix(
-    in srgb,
-    var(--accent-mark, var(--accent)) 34%,
-    var(--border)
-  );
+  border: 1px solid
+    color-mix(in srgb, var(--accent-mark, var(--accent)) 34%, var(--border));
   color: var(--accent-mark, var(--accent));
   flex-shrink: 0;
 }
@@ -9519,14 +9725,14 @@ button.primary,
 /* Runtime section (collapsible) */
 .runtime-section {
   margin-top: 12px;
-  border-top: 1px solid rgba(255,255,255,0.06);
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
   padding-top: 8px;
 }
 .runtime-section h4 {
   margin: 0 0 6px;
   font-size: 12px;
   font-weight: 600;
-  color: var(--text-secondary, rgba(255,255,255,0.6));
+  color: var(--text-secondary, rgba(255, 255, 255, 0.6));
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
@@ -9553,7 +9759,7 @@ button.primary,
 /* MCP server entries */
 .mcp-server-entry {
   padding: 6px 0;
-  border-bottom: 1px solid rgba(255,255,255,0.04);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
 }
 .mcp-server-entry:last-child {
   border-bottom: none;
@@ -9573,19 +9779,31 @@ button.primary,
   border-radius: 8px;
   font-weight: 500;
 }
-.mcp-auth-unsupported { background: rgba(255,255,255,0.06); color: rgba(255,255,255,0.4); }
-.mcp-auth-notLoggedIn { background: rgba(251,191,36,0.15); color: #fbbf24; }
-.mcp-auth-bearerToken { background: rgba(110,231,183,0.15); color: #6ee7b7; }
-.mcp-auth-oAuth { background: rgba(96,165,250,0.15); color: #60a5fa; }
+.mcp-auth-unsupported {
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.4);
+}
+.mcp-auth-notLoggedIn {
+  background: rgba(251, 191, 36, 0.15);
+  color: #fbbf24;
+}
+.mcp-auth-bearerToken {
+  background: rgba(110, 231, 183, 0.15);
+  color: #6ee7b7;
+}
+.mcp-auth-oAuth {
+  background: rgba(96, 165, 250, 0.15);
+  color: #60a5fa;
+}
 .mcp-server-meta {
   font-size: 11px;
-  color: rgba(255,255,255,0.4);
+  color: rgba(255, 255, 255, 0.4);
   margin-top: 2px;
 }
 /* Hook run entries */
 .hook-run-entry {
   padding: 6px 0;
-  border-bottom: 1px solid rgba(255,255,255,0.04);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
 }
 .hook-run-entry:last-child {
   border-bottom: none;
@@ -9606,19 +9824,34 @@ button.primary,
   border-radius: 8px;
   font-weight: 500;
 }
-.hook-status-running { background: rgba(96,165,250,0.15); color: #60a5fa; }
-.hook-status-completed { background: rgba(110,231,183,0.15); color: #6ee7b7; }
-.hook-status-failed { background: rgba(248,113,113,0.15); color: #f87171; }
-.hook-status-blocked { background: rgba(251,191,36,0.15); color: #fbbf24; }
-.hook-status-stopped { background: rgba(255,255,255,0.06); color: rgba(255,255,255,0.4); }
+.hook-status-running {
+  background: rgba(96, 165, 250, 0.15);
+  color: #60a5fa;
+}
+.hook-status-completed {
+  background: rgba(110, 231, 183, 0.15);
+  color: #6ee7b7;
+}
+.hook-status-failed {
+  background: rgba(248, 113, 113, 0.15);
+  color: #f87171;
+}
+.hook-status-blocked {
+  background: rgba(251, 191, 36, 0.15);
+  color: #fbbf24;
+}
+.hook-status-stopped {
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.4);
+}
 .hook-run-meta {
   font-size: 11px;
-  color: rgba(255,255,255,0.4);
+  color: rgba(255, 255, 255, 0.4);
   margin-top: 2px;
 }
 .hook-run-message {
   font-size: 11px;
-  color: rgba(255,255,255,0.5);
+  color: rgba(255, 255, 255, 0.5);
   margin-top: 2px;
   font-style: italic;
 }
@@ -9629,7 +9862,7 @@ button.primary,
 }
 .thread-entry {
   padding: 8px 0;
-  border-bottom: 1px solid rgba(255,255,255,0.04);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
 }
 .thread-entry:last-child {
   border-bottom: none;
@@ -9650,11 +9883,17 @@ button.primary,
   border-radius: 8px;
   font-weight: 500;
 }
-.thread-status-active { background: rgba(110,231,183,0.15); color: #6ee7b7; }
-.thread-status-archived { background: rgba(255,255,255,0.06); color: rgba(255,255,255,0.4); }
+.thread-status-active {
+  background: rgba(110, 231, 183, 0.15);
+  color: #6ee7b7;
+}
+.thread-status-archived {
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.4);
+}
 .thread-preview {
   font-size: 11px;
-  color: rgba(255,255,255,0.5);
+  color: rgba(255, 255, 255, 0.5);
   margin-top: 3px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -9662,6 +9901,6 @@ button.primary,
 }
 .thread-meta {
   font-size: 10px;
-  color: rgba(255,255,255,0.3);
+  color: rgba(255, 255, 255, 0.3);
   margin-top: 2px;
 }

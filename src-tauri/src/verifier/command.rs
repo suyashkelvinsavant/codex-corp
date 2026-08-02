@@ -158,20 +158,20 @@ fn drain_bounded(mut reader: impl Read, limit: usize) -> Vec<u8> {
     captured
 }
 
-struct ProcessTreeGuard {
+pub(crate) struct ProcessTreeGuard {
     #[cfg(windows)]
     job: Option<WindowsJob>,
 }
 
 impl ProcessTreeGuard {
-    fn attach(child: &std::process::Child) -> Self {
+    pub(crate) fn attach(child: &std::process::Child) -> Self {
         Self {
             #[cfg(windows)]
             job: WindowsJob::assign(child.id()),
         }
     }
 
-    fn terminate(&self, child: &mut std::process::Child) {
+    pub(crate) fn terminate(&self, child: &mut std::process::Child) {
         #[cfg(windows)]
         {
             if let Some(job) = &self.job {
@@ -199,6 +199,15 @@ impl ProcessTreeGuard {
 
 #[cfg(windows)]
 struct WindowsJob(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+// Windows kernel job handles are process-independent owned handles. The guard
+// is held behind synchronization before any operation, so transferring the
+// owned handle between worker threads is safe.
+unsafe impl Send for WindowsJob {}
+
+#[cfg(windows)]
+unsafe impl Sync for WindowsJob {}
 
 #[cfg(windows)]
 impl WindowsJob {

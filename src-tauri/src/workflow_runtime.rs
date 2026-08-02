@@ -198,6 +198,10 @@ struct RuntimeNodeData {
     developer_instructions: String,
     #[serde(default)]
     output: Option<String>,
+    /// Operator observations from a completed local test, routed explicitly to
+    /// the next producer invocation.
+    #[serde(default)]
+    user_test_feedback: Vec<String>,
     #[serde(default)]
     completion_criteria: Vec<RuntimeCriterion>,
     #[serde(default = "default_retries")]
@@ -1358,12 +1362,25 @@ fn compose_specialist_input(
     node: &RuntimeNode,
     revision_feedback: &str,
 ) -> Result<Value, String> {
-    let mission = context
+    let input_node = context
         .graph
         .nodes
         .iter()
-        .find(|candidate| candidate.data.kind == "input")
+        .find(|candidate| candidate.data.kind == "input");
+    let mission = input_node
         .and_then(|candidate| candidate.data.output.clone())
+        .unwrap_or_default();
+    let operator_test_feedback = input_node
+        .map(|candidate| {
+            candidate
+                .data
+                .user_test_feedback
+                .iter()
+                .rev()
+                .take(8)
+                .map(|feedback| feedback.chars().take(4_000).collect::<String>())
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     let outputs = context
         .outputs
@@ -1404,6 +1421,7 @@ fn compose_specialist_input(
         "workflowInput": mission,
         "upstreamOutputs": upstream_outputs,
         "revisionFeedback": revision_feedback,
+        "operatorTestFeedback": operator_test_feedback,
     }))
 }
 
@@ -2222,6 +2240,27 @@ async fn specialist_with_retries(
     ))
 }
 
+fn revision_gate_state(
+    criteria: &[RuntimeCriterion],
+    output: &RuntimeOutput,
+    context: &RunContext,
+    hard_criteria_gate: bool,
+) -> (Option<RequiredCriteriaFailure>, Option<String>) {
+    let required_failure = if output.status == "needs_revision" {
+        None
+    } else {
+        required_criteria_failure(criteria, output, context, hard_criteria_gate)
+    };
+    let reason = if output.status == "needs_revision" {
+        Some(output.summary.clone())
+    } else {
+        required_failure
+            .as_ref()
+            .map(|failure| failure.message.clone())
+    };
+    (required_failure, reason)
+}
+
 /// Apply a retry decision and report whether the caller should stop, retry, or
 /// consume a human-approved recovery attempt beyond the configured limit.
 #[allow(clippy::too_many_arguments)]
@@ -2399,23 +2438,12 @@ async fn execute_specialist_with_revision(
                 .as_ref()
                 .is_some_and(|data| data.edge_type == "revision")
     });
-    let mut required_failure = if output.status == "needs_revision" {
-        None
-    } else {
-        required_criteria_failure(
-            &node.data.completion_criteria,
-            &output,
-            context,
-            node.data.hard_criteria_gate,
-        )
-    };
-    let mut reason = if output.status == "needs_revision" {
-        Some(output.summary.clone())
-    } else {
-        required_failure
-            .as_ref()
-            .map(|failure| failure.message.clone())
-    };
+    let (mut required_failure, mut reason) = revision_gate_state(
+        &node.data.completion_criteria,
+        &output,
+        context,
+        node.data.hard_criteria_gate,
+    );
     let Some(edge) = revision_edge else {
         if let Some(reason) = reason {
             return Err(NodeExecutionFailure::owned(
@@ -2491,23 +2519,18 @@ async fn execute_specialist_with_revision(
         .await
         .map_err(|error| NodeExecutionFailure::owned(&node.id, error))?;
         emit_advisory_failures(context, node, &output);
-        required_failure = if output.status == "needs_revision" {
-            None
-        } else {
-            required_criteria_failure(
-                &node.data.completion_criteria,
-                &output,
-                context,
-                node.data.hard_criteria_gate,
-            )
-        };
-        reason = if output.status == "needs_revision" {
-            Some(output.summary.clone())
-        } else {
-            required_failure
-                .as_ref()
-                .map(|failure| failure.message.clone())
-        };
+        (required_failure, reason) = revision_gate_state(
+            &node.data.completion_criteria,
+            &output,
+            context,
+            node.data.hard_criteria_gate,
+        );
+        if reason.is_none() {
+            // A re-review is authoritative for the current revision. Do not
+            // fall through to the exhaustion error after the final allowed
+            // revision has actually passed every required host gate.
+            return Ok(output);
+        }
     }
     Err(NodeExecutionFailure::owned(
         &node.id,
@@ -3596,6 +3619,9 @@ async fn start_run_core(
         if !path.is_dir() {
             return Err("Selected app workspace is not a folder".into());
         }
+        if crate::is_app_managed_workspace(path) {
+            crate::prepare_greenfield_workspace(path, true)?;
+        }
     }
     if target_workspace.is_none() && graph_has_enabled_host_io_criteria(&graph) {
         return Err(
@@ -4226,6 +4252,7 @@ mod tests {
                 base_instructions: String::new(),
                 developer_instructions: String::new(),
                 output: None,
+                user_test_feedback: Vec::new(),
                 completion_criteria: Vec::new(),
                 max_retries: 0,
                 approval_policy: default_approval(),
@@ -4290,6 +4317,7 @@ mod tests {
                 base_instructions: String::new(),
                 developer_instructions: String::new(),
                 output: None,
+                user_test_feedback: Vec::new(),
                 completion_criteria: Vec::new(),
                 max_retries: 0,
                 approval_policy: "never".into(),
@@ -5046,7 +5074,7 @@ mod tests {
         let mut context = sample_run_context(None);
         context.graph = serde_json::from_value(json!({
             "nodes": [
-                {"id":"input","data":{"label":"Input","role":"Input","kind":"input","output":"mission"}},
+                {"id":"input","data":{"label":"Input","role":"Input","kind":"input","output":"mission","userTestFeedback":["save button is inert"]}},
                 {"id":"a","data":{"label":"A","role":"A","kind":"agent"}},
                 {"id":"unrelated","data":{"label":"Secret","role":"Secret","kind":"agent"}},
                 {"id":"review","data":{"label":"Review","role":"Review","kind":"agent"}},
@@ -5084,6 +5112,10 @@ mod tests {
         assert_eq!(
             composed["revisionFeedback"],
             json!([{"message":"fix this"}])
+        );
+        assert_eq!(
+            composed["operatorTestFeedback"],
+            json!(["save button is inert"])
         );
         assert!(!composed.to_string().contains("secret"));
     }
@@ -5186,6 +5218,7 @@ mod tests {
                 base_instructions: String::new(),
                 developer_instructions: String::new(),
                 output: None,
+                user_test_feedback: Vec::new(),
                 completion_criteria: criteria,
                 max_retries: 0,
                 approval_policy: default_approval(),
@@ -5319,6 +5352,99 @@ mod tests {
                 assert!(passed, "SSOT pass must not trigger required failure");
             }
         }
+    }
+
+    #[test]
+    fn a_passed_re_review_clears_the_revision_gate() {
+        let context = sample_run_context(None);
+        let criteria = vec![RuntimeCriterion {
+            id: "npm_test".into(),
+            label: "Unit tests".into(),
+            kind: "command".into(),
+            enabled: true,
+            platform: false,
+            enforcement: "required".into(),
+            instruction: None,
+            template_id: Some("npm_test".into()),
+            artifact_name: None,
+            artifact_path: None,
+            policy_id: None,
+        }];
+        let output = sample_output(
+            "success",
+            "QA passed after the builder revision.",
+            json!({
+                "verification": {
+                    "results": [{
+                        "id": "npm_test",
+                        "passed": true,
+                        "detail": "npm_test exited 0"
+                    }]
+                }
+            }),
+        );
+
+        let (failure, reason) = revision_gate_state(&criteria, &output, &context, false);
+
+        assert!(failure.is_none(), "a passed host row must clear the gate");
+        assert!(reason.is_none(), "a passed re-review must stop the loop");
+    }
+
+    #[test]
+    fn a_failed_re_review_keeps_the_revision_gate_open() {
+        let context = sample_run_context(None);
+        let criteria = vec![RuntimeCriterion {
+            id: "npm_test".into(),
+            label: "Unit tests".into(),
+            kind: "command".into(),
+            enabled: true,
+            platform: false,
+            enforcement: "required".into(),
+            instruction: None,
+            template_id: Some("npm_test".into()),
+            artifact_name: None,
+            artifact_path: None,
+            policy_id: None,
+        }];
+        let output = sample_output(
+            "success",
+            "QA completed with a host failure.",
+            json!({
+                "verification": {
+                    "results": [{
+                        "id": "npm_test",
+                        "passed": false,
+                        "detail": "npm_test exited 1"
+                    }]
+                }
+            }),
+        );
+
+        let (failure, reason) = revision_gate_state(&criteria, &output, &context, false);
+
+        assert!(failure.is_some(), "a failed host row must remain blocking");
+        assert!(
+            reason.is_some(),
+            "the blocking detail must route to revision"
+        );
+    }
+
+    #[test]
+    fn needs_revision_output_stays_revision_owned_without_fabricating_a_host_failure() {
+        let context = sample_run_context(None);
+        let output = sample_output(
+            "needs_revision",
+            "The cart count still disagrees with rendered lines.",
+            json!({}),
+        );
+
+        let (failure, reason) = revision_gate_state(&[], &output, &context, false);
+
+        assert!(failure.is_none());
+        assert_eq!(
+            reason.as_deref(),
+            Some("The cart count still disagrees with rendered lines.")
+        );
     }
 
     #[test]

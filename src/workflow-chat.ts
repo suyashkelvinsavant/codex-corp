@@ -65,7 +65,7 @@ export type ChatMessage = {
   role: ChatRole;
   text: string;
   at: string;
-  kind?: "status" | "approval" | "progress" | "help" | "error";
+  kind?: "status" | "approval" | "progress" | "help" | "error" | "test";
   attachments?: ChatAttachment[];
 };
 
@@ -507,6 +507,18 @@ export function appendMediatorEventToStore(
 ): void {
   const line = mediatorEventMessage(type, message);
   if (!line) return;
+  appendMediatorMessageToStore(workflowId, line.text, line.kind);
+}
+
+/** Append an explicit host-authored mediator message, such as local-test instructions. */
+export function appendMediatorMessageToStore(
+  workflowId: string,
+  message: string,
+  kind: ChatMessage["kind"] = "status",
+): void {
+  const text = message.trim();
+  if (!text) return;
+  const at = new Date().toISOString();
   let store = loadChatStore(workflowId);
   if (!store.activeSessionId || !store.sessions.length) {
     const session = createSession(workflowId, "Company run");
@@ -519,8 +531,11 @@ export function appendMediatorEventToStore(
     s.id === store.activeSessionId
       ? {
           ...s,
-          updatedAt: line.at,
-          messages: [...s.messages, line].slice(-120),
+          updatedAt: at,
+          messages: [
+            ...s.messages,
+            makeMessage("mediator", text, kind),
+          ].slice(-120),
         }
       : s,
   );

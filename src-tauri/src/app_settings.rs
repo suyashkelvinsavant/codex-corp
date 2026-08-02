@@ -453,6 +453,7 @@ pub(crate) fn clear_all_company_data(database: tauri::State<'_, Database>) -> Re
              DELETE FROM schedule_firings;
              DELETE FROM runs;
              DELETE FROM chat_stores;
+             DELETE FROM local_test_sessions;
              DELETE FROM dashboard_feedback;
              DELETE FROM finance_entries;
              DELETE FROM workflows;",

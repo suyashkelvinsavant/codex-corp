@@ -3,7 +3,10 @@
  * No stub / synthetic specialist outputs — specialists always go through Codex.
  */
 
-import { composeAuthorizedMission } from "./mission-context";
+import {
+  composeAuthorizedMission,
+  missionBriefStatus,
+} from "./mission-context";
 import {
   DEFAULT_MAX_REVISIONS,
   isSpecialistKind,
@@ -31,6 +34,24 @@ export function nodeStatusForRunEvent(
   eventType: string,
 ): FlowNode["data"]["status"] | undefined {
   return NODE_STATUS_BY_RUN_EVENT[eventType];
+}
+
+export type RunEventCursor = {
+  runId: string | null;
+  sequence: number;
+};
+
+/** Reject stale or duplicate events once the UI has an active run identity. */
+export function shouldAcceptRunEvent(
+  activeRunId: string | null,
+  eventRunId: string,
+  sequence: number,
+  cursor: RunEventCursor,
+): boolean {
+  if (!activeRunId || eventRunId !== activeRunId) return false;
+  if (!Number.isSafeInteger(sequence) || sequence <= 0) return false;
+  if (cursor.runId !== activeRunId) return true;
+  return sequence > cursor.sequence;
 }
 
 /** Return monotonic connector progress from a validated native revision event. */
@@ -123,12 +144,14 @@ export function isReviewerLikeAgent(node: FlowNode): boolean {
 export function resetExecutableNodeForRun(node: FlowNode): FlowNode {
   if (node.data.kind === "note") return node;
   if (node.data.kind === "input") {
+    const missionStatus = missionBriefStatus(node.data.output);
     return {
       ...node,
       data: {
         ...node.data,
-        status: "completed",
-        duration: node.data.duration || "0.1s",
+        status: missionStatus,
+        duration:
+          missionStatus === "completed" ? node.data.duration || "0.1s" : "—",
         threadId: undefined,
         revisions: 0,
         retries: 0,

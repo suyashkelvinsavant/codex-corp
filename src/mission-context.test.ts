@@ -4,6 +4,7 @@ import {
   constraintsFromTextarea,
   constraintsToTextarea,
   isConcreteMission,
+  missionBriefStatus,
   normalizeMissionConstraints,
 } from "./mission-context";
 
@@ -63,4 +64,17 @@ describe("mission-context", () => {
       ),
     ).toBe(true);
   });
+
+  it.each([
+    ["missing input", undefined, "idle"],
+    ["template seed", "Describe the product request for the company.", "idle"],
+    ["greeting", "Hello there!", "idle"],
+    ["workflow question", "What can this workflow do?", "idle"],
+    ["concrete request", "Build a simple landing page.", "completed"],
+  ] as const)(
+    "derives a truthful status for %s without treating it as completed work",
+    (_label, mission, expected) => {
+      expect(missionBriefStatus(mission)).toBe(expected);
+    },
+  );
 });

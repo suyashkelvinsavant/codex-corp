@@ -14,6 +14,7 @@ import {
 import {
   ArrowLeft,
   Brain,
+  Check,
   ChevronDown,
   Cpu,
   Folder,
@@ -27,6 +28,7 @@ import {
   Network,
   Paperclip,
   Pencil,
+  Square,
   Hand,
   Send,
   Sparkles,
@@ -96,6 +98,7 @@ import {
   subscribeLiveCodexModels,
   type CodexModelOption,
 } from "./codex-models";
+import type { LocalTestSession } from "./local-test";
 
 const MEDIATOR_MODEL_KEY = "codex-corp-mediator-model";
 const MEDIATOR_EFFORT_KEY = "codex-corp-mediator-effort";
@@ -182,7 +185,13 @@ export type AgentChatPageProps = {
   completedCount: number;
   totalExecutable: number;
   pendingDecisionCount: number;
+  localTest: LocalTestSession | null;
   onOpenApprovals: () => void;
+  onSubmitLocalTestFeedback: (
+    approved: boolean,
+    feedback: string,
+  ) => Promise<void>;
+  onStopLocalTest: () => Promise<void>;
   onBack: () => void;
   onEditWorkflow: (id: string) => void;
   /**
@@ -224,7 +233,10 @@ export function AgentChatPage({
   completedCount,
   totalExecutable,
   pendingDecisionCount,
+  localTest,
   onOpenApprovals,
+  onSubmitLocalTestFeedback,
+  onStopLocalTest,
   onBack,
   onEditWorkflow,
   onMediatorTurn,
@@ -241,6 +253,7 @@ export function AgentChatPage({
     loadChatStore(workflowId),
   );
   const [draft, setDraft] = useState("");
+  const [localTestFeedback, setLocalTestFeedback] = useState("");
   const [pendingFiles, setPendingFiles] = useState<ChatAttachment[]>([]);
   const [attachError, setAttachError] = useState<string | null>(null);
   const [voiceOpen, setVoiceOpen] = useState(false);
@@ -360,6 +373,7 @@ export function AgentChatPage({
       setWorkspaceRequestedByMediator(false);
       setProjectMode(active?.projectMode ?? "new");
       setWorkspacePath(active?.workspacePath ?? "Codex Corp workspace");
+      setLocalTestFeedback("");
       requestAnimationFrame(() => inputRef.current?.focus());
     });
     return () => {
@@ -440,6 +454,7 @@ export function AgentChatPage({
       activeSessionId: session.id,
     });
     setDraft("");
+    setLocalTestFeedback("");
     setProjectMode("new");
     setWorkspaceModalOpen(false);
     setWorkspaceRequestedByMediator(false);
@@ -450,6 +465,7 @@ export function AgentChatPage({
   const selectSession = (id: string) => {
     persist({ ...store, activeSessionId: id });
     setDraft("");
+    setLocalTestFeedback("");
     const selected = store.sessions.find((session) => session.id === id);
     setProjectMode(selected?.projectMode ?? "new");
     setWorkspacePath(selected?.workspacePath ?? "Codex Corp workspace");
@@ -571,7 +587,8 @@ export function AgentChatPage({
 
   const persistVoiceTranscript = (transcript: VoiceStore["transcript"]) => {
     const key = voiceSession.currentKey();
-    if (!key || persistedVoiceSessionsRef.current.has(key) || !activeSession) return;
+    if (!key || persistedVoiceSessionsRef.current.has(key) || !activeSession)
+      return;
     const voiceMessages = transcript
       .filter((turn) => turn.text.trim())
       .map((turn) =>
@@ -680,7 +697,8 @@ export function AgentChatPage({
           } catch (failure) {
             updateVoiceStore((s) =>
               applyError(s, {
-                message: failure instanceof Error ? failure.message : String(failure),
+                message:
+                  failure instanceof Error ? failure.message : String(failure),
               }),
             );
             void teardownVoice();
@@ -698,20 +716,24 @@ export function AgentChatPage({
           void teardownVoice();
         }),
         onRealtimeToolCall(sessionKey, async (payload) => {
-      try {
-        const result = await onVoiceToolCall("company", payload.tool, payload.arguments);
-        await invoke("respond_mediator_tool", {
-          requestId: payload.requestId,
-          success: result.success,
-          content: result.text,
-        });
-      } catch (failure) {
-        await invoke("respond_mediator_tool", {
-          requestId: payload.requestId,
-          success: false,
-          content: JSON.stringify({ error: String(failure) }),
-        }).catch(() => undefined);
-      }
+          try {
+            const result = await onVoiceToolCall(
+              "company",
+              payload.tool,
+              payload.arguments,
+            );
+            await invoke("respond_mediator_tool", {
+              requestId: payload.requestId,
+              success: result.success,
+              content: result.text,
+            });
+          } catch (failure) {
+            await invoke("respond_mediator_tool", {
+              requestId: payload.requestId,
+              success: false,
+              content: JSON.stringify({ error: String(failure) }),
+            }).catch(() => undefined);
+          }
         }),
       ]);
       realtimeUnlistenersRef.current = unlisteners;
@@ -735,7 +757,10 @@ export function AgentChatPage({
         contextDigest: voiceContext.contextDigest,
         recentTranscript: messages
           .slice(-12)
-          .map((message) => `${message.role === "user" ? "Operator" : "Byte"}: ${message.text}`)
+          .map(
+            (message) =>
+              `${message.role === "user" ? "Operator" : "Byte"}: ${message.text}`,
+          )
           .join("\n")
           .slice(-12_000),
         dynamicTools: voiceContext.dynamicTools,
@@ -1137,6 +1162,18 @@ export function AgentChatPage({
                 <strong>{template.name}</strong> without drowning in the graph.
               </p>
             </div>
+            {localTest ? (
+              <LocalTestCard
+                session={localTest}
+                feedback={localTestFeedback}
+                onFeedbackChange={setLocalTestFeedback}
+                onSubmit={async (approved) => {
+                  await onSubmitLocalTestFeedback(approved, localTestFeedback);
+                  if (approved) setLocalTestFeedback("");
+                }}
+                onStop={() => void onStopLocalTest()}
+              />
+            ) : null}
             <Composer
               centered
               draft={draft}
@@ -1217,6 +1254,21 @@ export function AgentChatPage({
                   </div>
                 </div>
               ))}
+              {localTest ? (
+                <LocalTestCard
+                  session={localTest}
+                  feedback={localTestFeedback}
+                  onFeedbackChange={setLocalTestFeedback}
+                  onSubmit={async (approved) => {
+                    await onSubmitLocalTestFeedback(
+                      approved,
+                      localTestFeedback,
+                    );
+                    if (approved) setLocalTestFeedback("");
+                  }}
+                  onStop={() => void onStopLocalTest()}
+                />
+              ) : null}
               <div ref={streamEnd} />
             </div>
             <div className="agent-chat-dock">
@@ -1384,9 +1436,7 @@ export function AgentChatPage({
         <VoicePanel
           store={voiceStore}
           voices={voices}
-          onVoiceChange={(v) =>
-            setVoiceStore((s) => ({ ...s, voice: v }))
-          }
+          onVoiceChange={(v) => setVoiceStore((s) => ({ ...s, voice: v }))}
           onModalityChange={(m) =>
             setVoiceStore((s) => ({ ...s, outputModality: m }))
           }
@@ -1394,6 +1444,103 @@ export function AgentChatPage({
         />
       )}
     </div>
+  );
+}
+
+function LocalTestCard({
+  session,
+  feedback,
+  onFeedbackChange,
+  onSubmit,
+  onStop,
+}: {
+  session: LocalTestSession;
+  feedback: string;
+  onFeedbackChange: (value: string) => void;
+  onSubmit: (approved: boolean) => Promise<void>;
+  onStop: () => void;
+}) {
+  const canReview = session.status === "running" || session.status === "exited";
+  const terminalMessage =
+    session.status === "launch_pending"
+      ? "Approval required before the local app starts."
+      : session.status === "approved"
+        ? "You approved the local test. This build is ready for handoff."
+        : session.status === "changes_requested"
+          ? "Feedback was routed back to the producer for the next run."
+          : session.status === "launch_failed"
+            ? session.lastError || "The local app could not be started."
+            : session.status === "declined"
+              ? "Local testing was skipped."
+              : session.status === "stopped"
+                ? "The local test process was stopped."
+                : session.status === "exited"
+                  ? "The local process exited; review the app result if it opened a window."
+                  : "Starting the local test…";
+  return (
+    <section className={`local-test-card status-${session.status}`}>
+      <div className="local-test-card-header">
+        <div>
+          <span className="local-test-eyebrow">OPERATOR TEST LOOP</span>
+          <h3>Test the local build</h3>
+        </div>
+        <span className="local-test-status">
+          {session.status.replace(/_/g, " ")}
+        </span>
+      </div>
+      <p>
+        {canReview
+          ? "Try the app like a user. Approve it when it is ready, or describe the problem so Byte can route the next revision."
+          : terminalMessage}
+      </p>
+      <div className="local-test-card-command">
+        <code>{session.plan.displayCommand}</code>
+        <small>{session.plan.cwd}</small>
+        {session.plan.script ? (
+          <small>Script: {session.plan.script}</small>
+        ) : null}
+        {session.detectedUrl ? (
+          <small>Open: {session.detectedUrl}</small>
+        ) : null}
+      </div>
+      {canReview ? (
+        <>
+          <textarea
+            value={feedback}
+            onChange={(event) => onFeedbackChange(event.target.value)}
+            rows={3}
+            placeholder="Optional for approval; required for changes (e.g. ‘Save does nothing on mobile’)."
+            aria-label="Local test feedback"
+          />
+          <div className="local-test-card-actions">
+            <button
+              type="button"
+              disabled={!feedback.trim()}
+              title={
+                feedback.trim()
+                  ? undefined
+                  : "Add concrete feedback before requesting changes"
+              }
+              onClick={() => void onSubmit(false)}
+            >
+              Request changes
+            </button>
+            <button
+              type="button"
+              className="primary"
+              onClick={() => void onSubmit(true)}
+            >
+              <Check size={14} /> Approve local test
+            </button>
+            {session.status === "running" ? (
+              <button type="button" className="quiet" onClick={onStop}>
+                <Square size={13} /> Stop app
+              </button>
+            ) : null}
+          </div>
+        </>
+      ) : null}
+    </section>
   );
 }
 
@@ -1539,7 +1686,9 @@ function Composer({
               className={`agent-tool-btn ${voiceOpen ? "live" : ""}`}
               onClick={onToggleVoice}
               title={voiceOpen ? "End voice session" : "Start voice session"}
-              aria-label={voiceOpen ? "End voice session" : "Start voice session"}
+              aria-label={
+                voiceOpen ? "End voice session" : "Start voice session"
+              }
               aria-pressed={voiceOpen}
             >
               {voiceOpen ? <PhoneOff size={15} /> : <Phone size={15} />}

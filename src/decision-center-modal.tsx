@@ -1,29 +1,45 @@
-import { Check, FileOutput, Hand, Terminal, ShieldQuestion, X } from "lucide-react";
+import {
+  Check,
+  FileOutput,
+  Hand,
+  Terminal,
+  ShieldQuestion,
+  X,
+} from "lucide-react";
 import type { CSSProperties } from "react";
 import type { ApprovalRequest, StructuredApproval } from "./model";
-import type { MediatorQuestion } from "./mediator-ui";
+import type { MediatorConfirmation, MediatorQuestion } from "./mediator-ui";
+import type { LocalTestSession } from "./local-test";
 
 export type DecisionCenterModalProps = {
   approvals: ApprovalRequest[];
+  confirmation: MediatorConfirmation | null;
   question: MediatorQuestion | null;
   selectedOptions: string[];
   freeText: string;
   onFreeTextChange: (value: string) => void;
   onToggleOption: (id: string, multiSelect: boolean) => void;
   onDecideApproval: (request: ApprovalRequest, approved: boolean) => void;
+  onResolveConfirmation: (approved: boolean) => void;
   onResolveQuestion: (cancel: boolean) => void;
+  localTest?: LocalTestSession | null;
+  onResolveLocalTestLaunch?: (approved: boolean) => void;
   onClose: () => void;
 };
 
 export function DecisionCenterModal({
   approvals,
+  confirmation,
   question,
   selectedOptions,
   freeText,
   onFreeTextChange,
   onToggleOption,
   onDecideApproval,
+  onResolveConfirmation,
   onResolveQuestion,
+  localTest,
+  onResolveLocalTestLaunch,
   onClose,
 }: DecisionCenterModalProps) {
   const pending = approvals.filter((item) => item.status === "pending");
@@ -47,13 +63,76 @@ export function DecisionCenterModal({
         </div>
         <span>OPERATOR DECISIONS</span>
         <h2 id="decision-center-title">Approvals & questions</h2>
-        {!pending.length && !question && (
-          <p className="decision-center-empty">
-            No pending decisions. New approvals and Byte questions will
-            appear here.
-          </p>
-        )}
+        {!pending.length &&
+          !question &&
+          !confirmation &&
+          localTest?.status !== "launch_pending" && (
+            <p className="decision-center-empty">
+              No pending decisions. New approvals and Byte questions will appear
+              here.
+            </p>
+          )}
         <div className="decision-center-list">
+          {confirmation && (
+            <section className="decision-card mediator-confirmation-card">
+              <span>BYTE ACTION REQUEST</span>
+              <h3>{confirmation.title}</h3>
+              <p>{confirmation.body}</p>
+              <div className="modal-actions">
+                <button
+                  type="button"
+                  onClick={() => onResolveConfirmation(false)}
+                >
+                  {confirmation.cancelLabel}
+                </button>
+                <button
+                  type="button"
+                  className="primary"
+                  onClick={() => onResolveConfirmation(true)}
+                >
+                  <Check size={14} /> {confirmation.confirmLabel}
+                </button>
+              </div>
+            </section>
+          )}
+          {localTest?.status === "launch_pending" && (
+            <section className="decision-card local-test-approval-card">
+              <span>LOCAL TEST · RELEASE BUNDLE</span>
+              <h3>Launch the app for operator testing?</h3>
+              <p>
+                The verified bundle is complete. Codex Corp will start this
+                local process only after you approve it, then wait for your test
+                result and feedback in workflow chat.
+              </p>
+              <div className="local-test-command-preview">
+                <code>{localTest.plan.displayCommand}</code>
+                <small>
+                  {localTest.plan.entrypoint} · {localTest.plan.cwd}
+                </small>
+                {localTest.plan.script ? (
+                  <small>Script: {localTest.plan.script}</small>
+                ) : null}
+                {localTest.detectedUrl ? (
+                  <small>Open: {localTest.detectedUrl}</small>
+                ) : null}
+              </div>
+              <div className="modal-actions">
+                <button
+                  type="button"
+                  onClick={() => onResolveLocalTestLaunch?.(false)}
+                >
+                  Skip local test
+                </button>
+                <button
+                  type="button"
+                  className="primary"
+                  onClick={() => onResolveLocalTestLaunch?.(true)}
+                >
+                  <Check size={14} /> Launch for testing
+                </button>
+              </div>
+            </section>
+          )}
           {pending.map((request) => (
             <section className="decision-card" key={request.id}>
               <span>APPROVAL · {request.nodeId}</span>
@@ -122,9 +201,15 @@ export function DecisionCenterModal({
                       question.placeholder ?? "Optional free-text answer…"
                     }
                     value={freeText}
-                    aria-label={question.secret ? "Secret answer" : "Free-text answer"}
+                    aria-label={
+                      question.secret ? "Secret answer" : "Free-text answer"
+                    }
                     onChange={(event) => onFreeTextChange(event.target.value)}
-                    style={question.secret ? ({ WebkitTextSecurity: "disc" } as CSSProperties) : undefined}
+                    style={
+                      question.secret
+                        ? ({ WebkitTextSecurity: "disc" } as CSSProperties)
+                        : undefined
+                    }
                   />
                 )}
               <div className="modal-actions">
@@ -147,7 +232,11 @@ export function DecisionCenterModal({
   );
 }
 
-function StructuredApprovalContent({ structured }: { structured: StructuredApproval }) {
+function StructuredApprovalContent({
+  structured,
+}: {
+  structured: StructuredApproval;
+}) {
   switch (structured.kind) {
     case "fileChange":
       return (
@@ -159,13 +248,17 @@ function StructuredApprovalContent({ structured }: { structured: StructuredAppro
             {structured.files.map((file) => (
               <div key={file.path} className="structured-file-item">
                 <FileOutput size={13} />
-                <span className={`structured-file-type ${file.type}`}>{file.type}</span>
+                <span className={`structured-file-type ${file.type}`}>
+                  {file.type}
+                </span>
                 <code className="structured-file-path">{file.path}</code>
               </div>
             ))}
           </div>
           {structured.grantRoot && (
-            <p className="structured-grant-root">Grant root: <code>{structured.grantRoot}</code></p>
+            <p className="structured-grant-root">
+              Grant root: <code>{structured.grantRoot}</code>
+            </p>
           )}
         </div>
       );
@@ -176,17 +269,25 @@ function StructuredApprovalContent({ structured }: { structured: StructuredAppro
             <Terminal size={13} />
             <code className="structured-command">{structured.command}</code>
           </div>
-          <p className="structured-cwd">in <code>{structured.cwd}</code></p>
+          <p className="structured-cwd">
+            in <code>{structured.cwd}</code>
+          </p>
           {structured.reason && (
             <p className="structured-reason">{structured.reason}</p>
           )}
           {structured.commandActions?.map((pc, i) => (
             <div key={i} className="structured-parsed-cmd">
-              <small>{pc.type}{pc.name ? ` · ${pc.name}` : ""}{pc.path ? ` → ${pc.path}` : ""}</small>
+              <small>
+                {pc.type}
+                {pc.name ? ` · ${pc.name}` : ""}
+                {pc.path ? ` → ${pc.path}` : ""}
+              </small>
             </div>
           ))}
           {structured.additionalPermissions != null && (
-            <pre className="decision-detail-raw">{JSON.stringify(structured.additionalPermissions, null, 2)}</pre>
+            <pre className="decision-detail-raw">
+              {JSON.stringify(structured.additionalPermissions, null, 2)}
+            </pre>
           )}
         </div>
       );
@@ -201,7 +302,9 @@ function StructuredApprovalContent({ structured }: { structured: StructuredAppro
             <p className="structured-reason">{structured.reason}</p>
           )}
           {structured.permissions != null && (
-            <pre className="decision-detail-raw">{JSON.stringify(structured.permissions, null, 2)}</pre>
+            <pre className="decision-detail-raw">
+              {JSON.stringify(structured.permissions, null, 2)}
+            </pre>
           )}
         </div>
       );
@@ -214,8 +317,14 @@ function StructuredApprovalContent({ structured }: { structured: StructuredAppro
               <code className="structured-command">{structured.command}</code>
             </div>
           )}
-          {structured.cwd && <p className="structured-cwd">in <code>{structured.cwd}</code></p>}
-          {structured.reason && <p className="structured-reason">{structured.reason}</p>}
+          {structured.cwd && (
+            <p className="structured-cwd">
+              in <code>{structured.cwd}</code>
+            </p>
+          )}
+          {structured.reason && (
+            <p className="structured-reason">{structured.reason}</p>
+          )}
         </div>
       );
     default:

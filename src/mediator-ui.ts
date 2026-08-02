@@ -47,6 +47,54 @@ export type MediatorQuestionAnswer = {
   at: string;
 };
 
+export type MediatorConfirmation = {
+  title: string;
+  body: string;
+  confirmLabel: string;
+  cancelLabel: string;
+};
+
+/**
+ * Actions that Byte may request must pause for an explicit in-app decision.
+ * Read-only mediator tools intentionally return null and continue directly.
+ */
+export function mediatorToolConfirmation(
+  tool: string,
+): MediatorConfirmation | null {
+  switch (tool) {
+    case "company_run":
+      return {
+        title: "Allow Byte to run?",
+        body: "Byte requested permission to start the current workflow.",
+        confirmLabel: "Run workflow",
+        cancelLabel: "Cancel",
+      };
+    case "company_run_from":
+      return {
+        title: "Allow Byte to run from this node?",
+        body: "Byte requested permission to start from this node and intentionally skip its ancestors.",
+        confirmLabel: "Start from node",
+        cancelLabel: "Cancel",
+      };
+    case "company_approve":
+      return {
+        title: "Allow Byte to approve?",
+        body: "Byte requested permission to approve the pending human gate.",
+        confirmLabel: "Approve",
+        cancelLabel: "Cancel",
+      };
+    case "company_decline":
+      return {
+        title: "Allow Byte to decline?",
+        body: "Byte requested permission to decline the pending human gate.",
+        confirmLabel: "Decline",
+        cancelLabel: "Cancel",
+      };
+    default:
+      return null;
+  }
+}
+
 /** Lifecycle events that should surface as chat progress + optional toast. */
 export function isLifecycleRunEvent(type: string): boolean {
   return (
@@ -245,7 +293,13 @@ export function parseStructuredApproval(
       cwd: (params.cwd as string) ?? ".",
       reason: (params.reason as string) ?? null,
       commandActions: Array.isArray(params.commandActions)
-        ? (params.commandActions as { type: string; command: string; name?: string; path?: string | null; query?: string | null }[])
+        ? (params.commandActions as {
+            type: string;
+            command: string;
+            name?: string;
+            path?: string | null;
+            query?: string | null;
+          }[])
         : undefined,
       additionalPermissions: params.additionalPermissions,
       availableDecisions: Array.isArray(params.availableDecisions)

@@ -13,6 +13,7 @@ import {
   deliveryStatusFromRun,
   type DeliveryPreviewStatus,
 } from "./delivery-bundle";
+import { missionBriefStatus } from "./mission-context";
 
 export const WORKFLOW_ID = "software-company";
 /** Legacy browser key for the original software-company workflow (back-compat). */
@@ -85,6 +86,7 @@ export function normalizeWorkflowSnapshot(
   );
   const migrationNotices: string[] = [];
   let removedPackSkillHints = false;
+  let repairedMissionStatus = false;
   const affectedSoftwareCompanyPolicy =
     sourceVersion === 2 &&
     isAffectedSoftwareCompanyPolicy(snapshot.nodes, snapshot.edges);
@@ -122,6 +124,14 @@ export function normalizeWorkflowSnapshot(
       ...node,
       data: {
         ...data,
+        ...(data.kind === "input" &&
+        data.status === "completed" &&
+        missionBriefStatus(data.output) === "idle"
+          ? (() => {
+              repairedMissionStatus = true;
+              return { status: "idle" as const };
+            })()
+          : {}),
         ...(sourceVersion < 4 && isLegacyDeliveryControl(node)
           ? {
               label: "Release Bundle",
@@ -159,6 +169,11 @@ export function normalizeWorkflowSnapshot(
   if (removedPackSkillHints) {
     migrationNotices.push(
       "Removed obsolete role skill hints from saved specialists; connector skills must be selected from the live workspace inventory.",
+    );
+  }
+  if (repairedMissionStatus) {
+    migrationNotices.push(
+      "Reset an unconfirmed Mission brief to idle; a template seed is not completed work.",
     );
   }
   return {

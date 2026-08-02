@@ -25,11 +25,13 @@ mod business_data;
 mod chat_data;
 pub(crate) mod codex_turn;
 pub mod golden;
+mod local_test;
 pub mod mcp_server;
 mod platform_process;
 mod runtime_ownership;
 mod verifier;
 mod workflow_runtime;
+mod workspace;
 
 /// Desktop MCP auto-start gate. Default **on** for hackathon continuity.
 /// Opt out with `CODEX_CORP_MCP_AUTO=0` (also accepts `false` / `off` / `no`).
@@ -1072,10 +1074,19 @@ pub(crate) fn default_chat_workspace_path() -> PathBuf {
     app_data_dir().join("workspaces").join("company-mediator")
 }
 
+pub(crate) fn is_app_managed_workspace(path: &Path) -> bool {
+    path.starts_with(app_data_dir().join("workspaces"))
+}
+
+pub(crate) fn prepare_greenfield_workspace(path: &Path, initialize: bool) -> Result<(), String> {
+    workspace::prepare_workspace_git(path, initialize).map(|_| ())
+}
+
 #[tauri::command]
 fn get_default_chat_workspace() -> Result<String, String> {
     let path = default_chat_workspace_path();
     std::fs::create_dir_all(&path).map_err(|error| error.to_string())?;
+    prepare_greenfield_workspace(&path, true)?;
     Ok(path.to_string_lossy().into_owned())
 }
 
@@ -1208,6 +1219,7 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
     app_settings::initialize(connection)?;
     business_data::initialize(connection)?;
     chat_data::initialize(connection)?;
+    local_test::initialize(connection)?;
     Ok(())
 }
 
@@ -3008,6 +3020,13 @@ async fn execute_mediator_turn(
         if !workspace.is_dir() {
             return Err("Selected app workspace is not a folder".into());
         }
+        let project_is_new = request
+            .project_mode
+            .as_deref()
+            .is_some_and(|mode| mode.eq_ignore_ascii_case("new"));
+        if project_is_new || is_app_managed_workspace(&workspace) {
+            prepare_greenfield_workspace(&workspace, true)?;
+        }
         let model = normalize_model_id(&request.model);
         if model.is_empty() {
             return Err("No Codex model for company mediator".into());
@@ -4024,6 +4043,10 @@ async fn start_codex_realtime(
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(default_chat_workspace_path);
+        std::fs::create_dir_all(&workspace).map_err(|error| error.to_string())?;
+        if is_app_managed_workspace(&workspace) {
+            prepare_greenfield_workspace(&workspace, true)?;
+        }
         let model = normalize_model_id(request.model.as_deref().unwrap_or(""));
         let base_instructions = request.base_instructions.unwrap_or_default();
         let mut developer_instructions = request.developer_instructions.unwrap_or_default();
@@ -6948,6 +6971,7 @@ pub fn run() {
         .manage(ApprovalBroker(Arc::new(Mutex::new(HashMap::new()))))
         .manage(ToolBroker(Arc::new(Mutex::new(HashMap::new()))))
         .manage(ProcessBroker(Arc::new(Mutex::new(HashMap::new()))))
+        .manage(local_test::LocalTestProcessRegistry::default())
         .manage(TurnStdinBroker(Arc::new(Mutex::new(HashMap::new()))))
         .manage(RealtimeBroker::default())
         .manage(runtime_owner)
@@ -7044,6 +7068,11 @@ pub fn run() {
             business_data::save_dashboard_feedback,
             chat_data::get_chat_store,
             chat_data::save_chat_store,
+            local_test::prepare_local_test,
+            local_test::get_local_test,
+            local_test::approve_local_test_launch,
+            local_test::submit_local_test_feedback,
+            local_test::stop_local_test,
             workflow_runtime::start_run,
             workflow_runtime::resume_run,
             workflow_runtime::stop_run,

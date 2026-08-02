@@ -127,6 +127,8 @@ export type AgentData = {
   chatSessionId?: string;
   /** Structured constraints attached via chat or inspector. */
   missionConstraints?: string[];
+  /** Operator feedback from local testing, routed into the next producer run. */
+  userTestFeedback?: string[];
   /** Acceptance notes / DoD for specialists. */
   acceptanceNotes?: string;
   /** ISO timestamp of last mission edit. */

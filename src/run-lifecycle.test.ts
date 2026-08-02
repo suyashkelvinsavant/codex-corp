@@ -7,6 +7,7 @@ import {
   resetExecutableNodeForRun,
   revisionCountForRunEvent,
   revisionLimitFor,
+  shouldAcceptRunEvent,
 } from "./run-lifecycle";
 import type { FlowEdge, FlowNode, Kind } from "./model";
 
@@ -103,7 +104,11 @@ describe("run-lifecycle", () => {
   it("scopes a selected-node run without fabricating upstream or revision activity", () => {
     const nodes = [
       node("input", "input", { status: "completed", output: "mission" }),
-      node("builder", "agent", { status: "completed", output: "built", revisions: 1 }),
+      node("builder", "agent", {
+        status: "completed",
+        output: "built",
+        revisions: 1,
+      }),
       node("qa", "agent", { status: "failed", output: "old failure" }),
       node("approval", "approval", { status: "idle" }),
       node("output", "output", { status: "idle" }),
@@ -112,13 +117,25 @@ describe("run-lifecycle", () => {
     const edges: FlowEdge[] = [
       { id: "i-b", source: "input", target: "builder" },
       { id: "b-q", source: "builder", target: "qa" },
-      { id: "q-a", source: "qa", target: "approval", data: { edgeType: "approval" } },
+      {
+        id: "q-a",
+        source: "qa",
+        target: "approval",
+        data: { edgeType: "approval" },
+      },
       { id: "a-o", source: "approval", target: "output" },
-      { id: "q-b", source: "qa", target: "builder", data: { edgeType: "revision", maxRevisions: 2 } },
+      {
+        id: "q-b",
+        source: "qa",
+        target: "builder",
+        data: { edgeType: "revision", maxRevisions: 2 },
+      },
     ];
 
     const prepared = prepareNodesForRun(nodes, undefined, edges, "qa");
-    const byId = Object.fromEntries(prepared.map((item) => [item.id, item.data]));
+    const byId = Object.fromEntries(
+      prepared.map((item) => [item.id, item.data]),
+    );
     // Attack vector 1: the selected failed node is reset for execution.
     expect(byId.qa.status).toBe("queued");
     expect(byId.qa.output).toBeUndefined();
@@ -162,6 +179,35 @@ describe("run-lifecycle", () => {
   it("marks non-specialist control nodes completed", () => {
     expect(nodeStatusForRunEvent("node.completed")).toBe("completed");
   });
+
+  it.each([
+    ["no active run", null, "run-1", 1, { runId: null, sequence: 0 }, false],
+    [
+      "different run",
+      "run-1",
+      "run-2",
+      1,
+      { runId: "run-1", sequence: 2 },
+      false,
+    ],
+    ["first event", "run-1", "run-1", 1, { runId: null, sequence: 0 }, true],
+    [
+      "duplicate or reordered event",
+      "run-1",
+      "run-1",
+      2,
+      { runId: "run-1", sequence: 2 },
+      false,
+    ],
+    ["newer event", "run-1", "run-1", 3, { runId: "run-1", sequence: 2 }, true],
+  ] as const)(
+    "accepts only fresh events for the active run: %s",
+    (_label, activeRunId, eventRunId, sequence, cursor, expected) => {
+      expect(
+        shouldAcceptRunEvent(activeRunId, eventRunId, sequence, cursor),
+      ).toBe(expected);
+    },
+  );
 
   it("hydrates a completed Release Bundle without leaking artifact bodies", () => {
     const patch = nodeOutputPatchForRunEvent("node.completed", {

@@ -146,6 +146,66 @@ describe("company-mediator-tools", () => {
     expect(r.text).toContain("failed");
   });
 
+  it("company_status reports runtime verification failures instead of trace-only guesses", async () => {
+    const r = await executeCompanyMediatorTool(
+      "company_status",
+      {},
+      ctx({
+        nodes: [
+          node("qa", {
+            label: "QA Engineer",
+            status: "failed",
+            criteriaEvaluation: [
+              {
+                id: "software_npm_test",
+                label: "Run the repository test suite",
+                status: "fail",
+                detail: "npm_test exited -4058 — package.json was missing",
+                enforcement: "required",
+              },
+              {
+                id: "software_npm_build",
+                label: "Run the production build",
+                status: "pass",
+                detail: "npm_run_build exited 0",
+                enforcement: "required",
+              },
+            ],
+          }),
+        ],
+        runHistory: [
+          {
+            id: "run-failed",
+            workflowId: "workflow-1",
+            status: "failed",
+            createdAt: "2026-08-01T13:47:13.000Z",
+            terminalReason:
+              "node qa terminally failed: required criteria remain unsatisfied",
+          },
+        ],
+      }),
+    );
+
+    expect(r.success).toBe(true);
+    expect(JSON.parse(r.text)).toMatchObject({
+      lastRun: {
+        id: "run-failed",
+        status: "failed",
+        terminalReason: expect.stringContaining("required criteria"),
+      },
+      verification: {
+        source: "runtime criteriaEvaluation",
+        failedCriteria: [
+          {
+            nodeId: "qa",
+            criterionId: "software_npm_test",
+            detail: expect.stringContaining("package.json"),
+          },
+        ],
+      },
+    });
+  });
+
   it("node_task_progress diagnoses failed builder", async () => {
     const r = await executeCompanyMediatorTool(
       "node_task_progress",

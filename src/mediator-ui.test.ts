@@ -1,132 +1,29 @@
 import { describe, expect, it } from "vitest";
-import {
-  formatQuestionAnswerForChat,
-  isLifecycleRunEvent,
-  isCodexAgentLifecycleEvent,
-  mediatorControlHelpText,
-  notificationFromRunEvent,
-  parseMediatorControlIntent,
-  parseStructuredApproval,
-  progressLineFromRunEvent,
-} from "./mediator-ui";
-import type { RunEvent } from "./model";
+import { mediatorToolConfirmation } from "./mediator-ui";
 
-const ev = (partial: Partial<RunEvent>): RunEvent => ({
-  id: "e1",
-  at: new Date().toISOString(),
-  type: "node.started",
-  message: "Builder · fresh thread started",
-  nodeId: "builder",
-  level: "info",
-  ...partial,
-});
+describe("mediator action confirmations", () => {
+  it.each([
+    ["company_run", "Allow Byte to run?", "Run workflow"],
+    [
+      "company_run_from",
+      "Allow Byte to run from this node?",
+      "Start from node",
+    ],
+    ["company_approve", "Allow Byte to approve?", "Approve"],
+    ["company_decline", "Allow Byte to decline?", "Decline"],
+  ])(
+    "describes %s as an explicit operator decision",
+    (tool, title, confirmLabel) => {
+      expect(mediatorToolConfirmation(tool)).toMatchObject({
+        title,
+        confirmLabel,
+        cancelLabel: "Cancel",
+      });
+    },
+  );
 
-describe("mediator-ui", () => {
-  it("treats only lifecycle events as progress fan-out", () => {
-    expect(isLifecycleRunEvent("node.started")).toBe(true);
-    expect(isLifecycleRunEvent("node.completed")).toBe(true);
-    expect(isLifecycleRunEvent("item/agentMessage/delta")).toBe(false);
-    expect(isLifecycleRunEvent("turn/started")).toBe(false);
-  });
-
-  it("keeps streaming deltas and token accounting out of timeline rows", () => {
-    expect(isCodexAgentLifecycleEvent("item/agentMessage/delta")).toBe(false);
-    expect(isCodexAgentLifecycleEvent("thread/tokenUsage/updated")).toBe(false);
-    expect(isCodexAgentLifecycleEvent("item/completed")).toBe(true);
-    expect(isCodexAgentLifecycleEvent("turn/failed")).toBe(true);
-  });
-
-  it("formats progress lines for chat", () => {
-    expect(progressLineFromRunEvent(ev({ type: "node.started" }))).toMatch(
-      /In progress/,
-    );
-    expect(
-      progressLineFromRunEvent(
-        ev({ type: "node.completed", message: "Build Agent · completed" }),
-      ),
-    ).toMatch(/Completed/);
-  });
-
-  it("builds toast notifications from lifecycle events", () => {
-    const n = notificationFromRunEvent(ev({ type: "node.failed", level: "error" }));
-    expect(n?.level).toBe("error");
-    expect(n?.nodeId).toBe("builder");
-  });
-
-  it("parses mediator control intents", () => {
-    expect(parseMediatorControlIntent("status").kind).toBe("status");
-    expect(parseMediatorControlIntent("stop now").kind).toBe("stop");
-    expect(parseMediatorControlIntent("approve").kind).toBe("approve");
-    const mission = parseMediatorControlIntent(
-      "mission: Build a calm landing page",
-    );
-    expect(mission).toEqual({
-      kind: "set_mission",
-      mission: "Build a calm landing page",
-    });
-    const run = parseMediatorControlIntent("run with: One page only");
-    expect(run.kind).toBe("run");
-    if (run.kind === "run") expect(run.mission).toBe("One page only");
-  });
-
-  it("formats question answers for the chat transcript", () => {
-    const text = formatQuestionAnswerForChat(
-      {
-        id: "q1",
-        title: "Theme",
-        body: "Pick a theme",
-        options: [
-          { id: "dark", label: "Dark only" },
-          { id: "both", label: "Light + dark" },
-        ],
-        source: "mediator",
-      },
-      {
-        questionId: "q1",
-        optionIds: ["dark"],
-        freeText: "High contrast",
-        at: new Date().toISOString(),
-      },
-    );
-    expect(text).toMatch(/Dark only/);
-    expect(text).toMatch(/High contrast/);
-  });
-
-  it("exposes control help text", () => {
-    expect(mediatorControlHelpText()).toMatch(/mission:/i);
-  });
-
-  it("parses generated approval contracts without inventing file lists", () => {
-    expect(parseStructuredApproval("item/fileChange/requestApproval", {
-      reason: "write generated output",
-      grantRoot: "C:/work",
-    })).toEqual({
-      kind: "fileChange",
-      files: [],
-      reason: "write generated output",
-      grantRoot: "C:/work",
-    });
-    const command = parseStructuredApproval("item/commandExecution/requestApproval", {
-      command: "npm test",
-      cwd: "C:/work",
-      commandActions: [{ type: "unknown", command: "npm test" }],
-      additionalPermissions: { network: { enabled: true } },
-      availableDecisions: ["accept", "decline"],
-    });
-    expect(command.kind).toBe("execCommand");
-    if (command.kind === "execCommand") {
-      expect(command.commandActions).toHaveLength(1);
-      expect(command.availableDecisions).toEqual(["accept", "decline"]);
-    }
-  });
-
-  it("preserves the structured permission profile", () => {
-    expect(parseStructuredApproval("item/permissions/requestApproval", {
-      reason: "needs repo access",
-      permissions: { fileSystem: { read: ["C:/work"] } },
-    })).toMatchObject({
-      kind: "permissions",
-      permissions: { fileSystem: { read: ["C:/work"] } },
-    });
+  it("does not create confirmations for read-only or unknown tools", () => {
+    expect(mediatorToolConfirmation("company_status")).toBeNull();
+    expect(mediatorToolConfirmation("unknown_tool")).toBeNull();
   });
 });

@@ -78,6 +78,26 @@ describe("persistence helpers", () => {
     ).toBeNull();
   });
 
+  it("repairs a stale completed Mission brief seed without changing real mission state", () => {
+    const seededInput = node("input", "input");
+    seededInput.data.status = "completed";
+    seededInput.data.output = "Describe the product request for the company.";
+    const authoredInput = node("authored-input", "input");
+    authoredInput.data.status = "completed";
+    authoredInput.data.output = "Build a simple landing page.";
+
+    const snapshot = parseWorkflowSnapshot(
+      JSON.stringify({
+        schemaVersion: WORKFLOW_SCHEMA_VERSION,
+        nodes: [seededInput, authoredInput],
+        edges: [],
+      }),
+    );
+
+    expect(snapshot?.nodes[0].data.status).toBe("idle");
+    expect(snapshot?.nodes[1].data.status).toBe("completed");
+  });
+
   it("normalizes legacy specialist settings without changing revision edges", () => {
     const legacy = node("agent");
     Object.assign(legacy.data, {
