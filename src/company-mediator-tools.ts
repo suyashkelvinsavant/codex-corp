@@ -13,6 +13,7 @@ import type {
 import { ensureCompletionCriteria } from "./completion-criteria";
 import { composeAuthorizedMission } from "./mission-context";
 import type { MediatorQuestion, MediatorQuestionAnswer } from "./mediator-ui";
+import type { LocalTestSession } from "./local-test";
 import type { AppProjectMode, AppWorkspaceSelection } from "./workflow-chat";
 
 export const COMPANY_MEDIATOR_SYSTEM_PROMPT = `You are Byte for Codex Corp — the human-facing companion for a multi-specialist company graph (not a graph node yourself).
@@ -34,8 +35,10 @@ Steer the company with **tools** and talk to the operator. You do **not** implem
 
 ## Tools
 - Never invent run status, failures, node outputs, or artifacts — call tools first (company_status, company_list_nodes, node_*).
+- For failures, treat the runtime-owned criteria evaluation and terminal reason as the source of truth; traces are supporting evidence only. If a summary conflicts with verification, report the conflict and the verified result.
 - Only say the run started when company_run returns started: true. If the tool fails or returns started: false, report that exact result and do not claim a run began.
 - company_run / company_run_from / company_stop / company_set_mission / approval tools for control.
+- After a completed Release Bundle, report the local-test status from company_status. The operator must launch, test, and approve or give concrete feedback; never claim the app was tested without that evidence.
 - company_ask_operator for blocking structured questions when a decision is missing.
 - company_list_nodes + node_get / node_get_trace / node_get_events / node_task_progress for inspection.
 
@@ -49,6 +52,7 @@ export type MediatorHostContext = {
   running: boolean;
   runId: string | null;
   approvals: ApprovalRequest[];
+  localTest?: LocalTestSession | null;
   runHistory: RunRecord[];
   /** Side effects — optional for pure unit tests */
   actions?: {
@@ -116,7 +120,7 @@ export function companyMediatorDynamicTools(): DynamicToolSpecJson[] {
       type: "function",
       name: "company_status",
       description:
-        "Overall company run status, progress, and pending approvals.",
+        "Overall company run status, progress, pending approvals, terminal reason, and runtime-owned criteria failures when available.",
       inputSchema: emptyObject,
     },
     {
@@ -377,6 +381,18 @@ export async function executeCompanyMediatorTool(
           level: e.level,
         }));
         const input = ctx.nodes.find((n) => n.data.kind === "input");
+        const failedCriteria = ctx.nodes.flatMap((node) =>
+          (node.data.criteriaEvaluation ?? [])
+            .filter((criterion) => criterion.status === "fail")
+            .map((criterion) => ({
+              nodeId: node.id,
+              nodeLabel: node.data.label,
+              criterionId: criterion.id,
+              label: criterion.label,
+              enforcement: criterion.enforcement,
+              detail: trunc(criterion.detail, 800),
+            })),
+        );
         return ok({
           running: ctx.running,
           runId: ctx.runId,
@@ -392,6 +408,22 @@ export async function executeCompanyMediatorTool(
                 id: ctx.runHistory[0].id,
                 status: ctx.runHistory[0].status,
                 createdAt: ctx.runHistory[0].createdAt,
+                terminalReason: ctx.runHistory[0].terminalReason ?? null,
+              }
+            : null,
+          verification: {
+            source: "runtime criteriaEvaluation",
+            failedCriteria,
+          },
+          localTest: ctx.localTest
+            ? {
+                id: ctx.localTest.id,
+                runId: ctx.localTest.runId,
+                status: ctx.localTest.status,
+                entrypoint: ctx.localTest.plan.entrypoint,
+                command: ctx.localTest.plan.displayCommand,
+                feedback: ctx.localTest.feedback,
+                lastError: ctx.localTest.lastError ?? null,
               }
             : null,
           recentEvents: recent,
@@ -676,6 +708,7 @@ export function buildMediatorContextDigest(ctx: MediatorHostContext): string {
     `MISSION_STATE=${missionState}`,
     `MISSION_BRIEF (authorized store; not a chat reply template):\n${trunc(mission || "(empty)", 1500)}`,
     `NODES: ${nodes}`,
+    `LOCAL_TEST: ${ctx.localTest?.status ?? "none"}${ctx.localTest ? ` · ${ctx.localTest.plan.entrypoint}` : ""}`,
     `RECENT_EVENTS: ${recent || "(none)"}`,
     `MEDIATOR_HINT: For greetings, acknowledge and ask what they want the company to build or investigate. Do not announce a product plan from seed mission text.`,
   ].join("\n\n");

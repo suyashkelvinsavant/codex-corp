@@ -1,0 +1,41 @@
+{
+  "id": "revision-loop-evidence-routing",
+  "criterion": {
+    "id": "cmd-1",
+    "kind": "command",
+    "enforcement": "required",
+    "templateId": "npm_test"
+  },
+  "producerOutput": {
+    "status": "success",
+    "summary": "implementation done",
+    "data": {
+      "verification": {
+        "results": [
+          {
+            "id": "cmd-1",
+            "kind": "command",
+            "passed": false,
+            "detail": "npm_test exited 1 — missing export",
+            "method": "command:npm_test",
+            "enforcement": "required",
+            "source": "runtime"
+          }
+        ],
+        "requiredFailed": ["cmd-1"],
+        "passBitOwner": "runtime"
+      }
+    }
+  },
+  "expect": {
+    "failureClass": "verification",
+    "revisionFeedbackContains": "npm_test exited 1",
+    "reason": "a required verification row routes the exact failing evidence into the revision turn instead of letting the producer re-assert through text",
+    "persist": {
+      "failureClass": "verification",
+      "attemptRecord": true,
+      "criterionIds": ["cmd-1"],
+      "queryableVia": "node_attempts.diagnostics_json.failureClass / criterionIds (count_verification_revisions)"
+    }
+  }
+}

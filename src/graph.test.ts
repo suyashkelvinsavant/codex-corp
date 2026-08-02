@@ -7,6 +7,7 @@ import {
   validateWorkflow,
 } from "./graph";
 import { AgentOutputSchema } from "./model";
+import type { CriterionKind } from "./completion-criteria";
 import type { EdgeKind, FlowEdge, FlowNode, Kind } from "./model";
 
 const detailedPrompt = `You are a test specialist for graph validation.
@@ -245,6 +246,24 @@ describe("workflow graph core", () => {
       [edge("input", "agent"), edge("agent", "out")],
     );
     expect(problems.some((p) => p.id.includes("criterion-command"))).toBe(true);
+  });
+
+  it("rejects unknown criterion kinds so required gates fail closed", () => {
+    const agent = node("agent");
+    agent.data.completionCriteria = [
+      {
+        id: "typo-1",
+        label: "Artifacts",
+        kind: "artifct_exists" as unknown as CriterionKind,
+        enabled: true,
+        enforcement: "required",
+      },
+    ];
+    const problems = validateWorkflow(
+      [node("input", "input"), agent, node("out", "output")],
+      [edge("input", "agent"), edge("agent", "out")],
+    );
+    expect(problems.some((p) => p.id.includes("criterion-kind"))).toBe(true);
   });
 
   it("rejects parseable JSON that is not a valid JSON Schema", () => {

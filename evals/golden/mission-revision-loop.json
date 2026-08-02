@@ -1,0 +1,59 @@
+{
+  "id": "mission-revision-loop",
+  "runMode": "mission",
+  "mission": {
+    "text": "Review and rework a module until no hidden reasoning remains.",
+    "builderRole": "Reviewer",
+    "builderCriteria": [
+      {
+        "id": "hidden-1",
+        "label": "No hidden reasoning",
+        "kind": "no_hidden_reasoning",
+        "enforcement": "required"
+      }
+    ],
+    "revisionTarget": {
+      "completionCriteria": []
+    },
+    "maxRevisions": 2
+  },
+  "scriptedOutputs": [
+    {
+      "status": "success",
+      "summary": "Produced the module on the first pass.",
+      "data": { "filesWritten": ["src/module.ts"] },
+      "artifacts": [
+        { "id": "module", "name": "module.ts", "content": "export const answer = 42;" }
+      ]
+    },
+    {
+      "status": "success",
+      "summary": "Reviewed the module.",
+      "data": { "scratchpad": "need to double check this change" },
+      "artifacts": []
+    },
+    {
+      "status": "success",
+      "summary": "Revised the module per the review feedback.",
+      "data": { "filesWritten": ["src/module.ts"] },
+      "artifacts": [
+        { "id": "module", "name": "module.ts", "content": "export const answer = 42;" }
+      ]
+    },
+    {
+      "status": "success",
+      "summary": "Reviewed the revised module; it is clean now.",
+      "data": {},
+      "artifacts": []
+    }
+  ],
+  "expect": {
+    "runStatus": "completed",
+    "delivery": {
+      "bundleHash": "present",
+      "verification": "present"
+    },
+    "persistedVerificationAttempts": 1,
+    "reason": "a required verification failure routes a revision to the producer and re-reviews; after the producer removes the hidden-reasoning field the run completes, with at least one persisted failureClass:verification attempt record (node_attempts) per routing"
+  }
+}

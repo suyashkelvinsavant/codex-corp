@@ -24,11 +24,14 @@ mod app_settings;
 mod business_data;
 mod chat_data;
 pub(crate) mod codex_turn;
+pub mod golden;
+mod local_test;
 pub mod mcp_server;
 mod platform_process;
 mod runtime_ownership;
 mod verifier;
 mod workflow_runtime;
+mod workspace;
 
 /// Desktop MCP auto-start gate. Default **on** for hackathon continuity.
 /// Opt out with `CODEX_CORP_MCP_AUTO=0` (also accepts `false` / `off` / `no`).
@@ -1071,10 +1074,19 @@ pub(crate) fn default_chat_workspace_path() -> PathBuf {
     app_data_dir().join("workspaces").join("company-mediator")
 }
 
+pub(crate) fn is_app_managed_workspace(path: &Path) -> bool {
+    path.starts_with(app_data_dir().join("workspaces"))
+}
+
+pub(crate) fn prepare_greenfield_workspace(path: &Path, initialize: bool) -> Result<(), String> {
+    workspace::prepare_workspace_git(path, initialize).map(|_| ())
+}
+
 #[tauri::command]
 fn get_default_chat_workspace() -> Result<String, String> {
     let path = default_chat_workspace_path();
     std::fs::create_dir_all(&path).map_err(|error| error.to_string())?;
+    prepare_greenfield_workspace(&path, true)?;
     Ok(path.to_string_lossy().into_owned())
 }
 
@@ -1207,6 +1219,7 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
     app_settings::initialize(connection)?;
     business_data::initialize(connection)?;
     chat_data::initialize(connection)?;
+    local_test::initialize(connection)?;
     Ok(())
 }
 
@@ -1352,6 +1365,17 @@ fn command_for_codex(path: &Path, args: &[&str]) -> Command {
             .and_then(|value| value.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
+        // Windows cannot execute JavaScript modules as Win32 programs. Use
+        // the resolved Node runtime for explicit .js/.mjs/.cjs app-server
+        // paths, including the golden fake server.
+        if matches!(ext.as_str(), "js" | "mjs" | "cjs") {
+            if let Some(node) = find_node_exe() {
+                let mut command = Command::new(node);
+                command.arg(path).args(args);
+                prepare_command(&mut command);
+                return command;
+            }
+        }
         if ext == "ps1" {
             let mut command = Command::new("powershell.exe");
             command
@@ -1782,6 +1806,21 @@ fn validate_graph(graph: &GraphSnapshot) -> Vec<GraphProblem> {
                 let kind = crate::verifier::normalize_kind(&criterion.kind);
                 let kind = kind.as_str();
                 let required = criterion.platform || criterion.enforcement == "required";
+                // Fail closed at validation: an unknown kind cannot be silently
+                // downgraded (TS preview coerces unknown → advisory; Rust must not
+                // accept a required gate it cannot evaluate). Runtime also fails
+                // closed via evaluate_criterion's unknown-kind branch.
+                if !crate::verifier::is_known_kind(kind) {
+                    problems.push(problem(
+                        format!("criterion-kind-{}-{}", node.id, criterion.id),
+                        format!(
+                            "{}: unknown criterion kind: {kind}. Use one of structured_json, concise_summary, no_hidden_reasoning, claim, command, artifact_exists, architecture_policy.",
+                            node.data.label
+                        ),
+                        Some(node.id.clone()),
+                        None,
+                    ));
+                }
                 if required && kind == "claim" {
                     problems.push(problem(
                         format!("criterion-claim-required-{}-{}", node.id, criterion.id),
@@ -1858,7 +1897,11 @@ fn validate_graph(graph: &GraphSnapshot) -> Vec<GraphProblem> {
                         .unwrap_or(
                             crate::verifier::architecture::POLICY_NATIVE_RUNTIME_OWNERSHIP_V1,
                         );
-                    if policy != crate::verifier::architecture::POLICY_NATIVE_RUNTIME_OWNERSHIP_V1 {
+                    let supported = [
+                        crate::verifier::architecture::POLICY_NATIVE_RUNTIME_OWNERSHIP_V1,
+                        crate::verifier::architecture::POLICY_NATIVE_RUNTIME_OWNERSHIP_V2,
+                    ];
+                    if !supported.contains(&policy) {
                         problems.push(problem(
                             format!("criterion-arch-{}-{}", node.id, criterion.id),
                             format!(
@@ -2977,6 +3020,13 @@ async fn execute_mediator_turn(
         if !workspace.is_dir() {
             return Err("Selected app workspace is not a folder".into());
         }
+        let project_is_new = request
+            .project_mode
+            .as_deref()
+            .is_some_and(|mode| mode.eq_ignore_ascii_case("new"));
+        if project_is_new || is_app_managed_workspace(&workspace) {
+            prepare_greenfield_workspace(&workspace, true)?;
+        }
         let model = normalize_model_id(&request.model);
         if model.is_empty() {
             return Err("No Codex model for company mediator".into());
@@ -3993,6 +4043,10 @@ async fn start_codex_realtime(
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(default_chat_workspace_path);
+        std::fs::create_dir_all(&workspace).map_err(|error| error.to_string())?;
+        if is_app_managed_workspace(&workspace) {
+            prepare_greenfield_workspace(&workspace, true)?;
+        }
         let model = normalize_model_id(request.model.as_deref().unwrap_or(""));
         let base_instructions = request.base_instructions.unwrap_or_default();
         let mut developer_instructions = request.developer_instructions.unwrap_or_default();
@@ -6917,6 +6971,7 @@ pub fn run() {
         .manage(ApprovalBroker(Arc::new(Mutex::new(HashMap::new()))))
         .manage(ToolBroker(Arc::new(Mutex::new(HashMap::new()))))
         .manage(ProcessBroker(Arc::new(Mutex::new(HashMap::new()))))
+        .manage(local_test::LocalTestProcessRegistry::default())
         .manage(TurnStdinBroker(Arc::new(Mutex::new(HashMap::new()))))
         .manage(RealtimeBroker::default())
         .manage(runtime_owner)
@@ -7013,11 +7068,17 @@ pub fn run() {
             business_data::save_dashboard_feedback,
             chat_data::get_chat_store,
             chat_data::save_chat_store,
+            local_test::prepare_local_test,
+            local_test::get_local_test,
+            local_test::approve_local_test_launch,
+            local_test::submit_local_test_feedback,
+            local_test::stop_local_test,
             workflow_runtime::start_run,
             workflow_runtime::resume_run,
             workflow_runtime::stop_run,
             workflow_runtime::get_run,
             workflow_runtime::list_active_runs,
+            workflow_runtime::analytics_verification_loops,
             workflow_runtime::respond_run_approval,
             list_codex_voices,
             start_codex_realtime,
@@ -7317,6 +7378,23 @@ mod tests {
                 r#""C:\Tools\Codex&Preview\codex.cmd" app-server --stdio"#,
             ]
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn javascript_app_server_paths_use_node_runtime() {
+        // Attack vector: the golden runner supplies a .mjs server path, which
+        // Windows cannot execute directly as a Win32 application.
+        let node = find_node_exe().expect("Node.js is required for JavaScript app-server paths");
+        let script = Path::new(r"C:\Tools\Codex Preview\fake-codex-server.mjs");
+        let command = command_for_codex(script, &["app-server", "--stdio"]);
+        assert_eq!(command.get_program(), node.as_os_str());
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args[0], script.to_string_lossy());
+        assert_eq!(&args[1..], ["app-server", "--stdio"]);
     }
 
     #[test]

@@ -1,0 +1,14 @@
+{
+  "id": "spec-ambiguity-pause",
+  "producerOutput": {
+    "status": "needs_revision",
+    "summary": "acceptance criteria are ambiguous; clarification needed before implementation",
+    "data": {}
+  },
+  "expect": {
+    "failureClass": "specification",
+    "gate": "needs_human",
+    "action": "pause for human clarification",
+    "reason": "criteria conflict/incompleteness is not fixed by retrying — the node arms a needs_human gate for clarification (or routes to a configured escalation node) instead of failing the run"
+  }
+}

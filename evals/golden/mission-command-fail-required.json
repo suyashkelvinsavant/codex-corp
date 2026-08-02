@@ -1,0 +1,40 @@
+{
+  "id": "mission-command-fail-required",
+  "runMode": "mission",
+  "mission": {
+    "text": "Ship a component whose required verification script must pass.",
+    "builderRole": "Backend Engineer",
+    "builderCriteria": [
+      {
+        "id": "cmd-1",
+        "label": "Verification script green",
+        "kind": "command",
+        "templateId": "node_script",
+        "instruction": "verify.js",
+        "enforcement": "required"
+      }
+    ],
+    "workspaceFiles": {
+      "verify.js": "process.exit(1);\n"
+    }
+  },
+  "scriptedOutputs": [
+    {
+      "status": "success",
+      "summary": "Completed the component; the check should be green.",
+      "data": { "filesWritten": ["src/App.jsx"] },
+      "artifacts": [
+        { "id": "app", "name": "App.jsx", "content": "export default () => null;" }
+      ]
+    }
+  ],
+  "expect": {
+    "runStatus": "failed",
+    "delivery": {
+      "bundleHash": "absent",
+      "verification": "absent"
+    },
+    "terminalReasonContains": "node_script exited 1",
+    "reason": "a required command that exits non-zero is a verification failure: the run fails at the required gate with no revision edge, so no trusted delivery bundle is ever produced"
+  }
+}

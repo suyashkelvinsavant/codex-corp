@@ -44,6 +44,7 @@ import { DataLogSettings } from "./data-log-settings";
 import { HomePet } from "./home-pet";
 import { DashboardsPage } from "./dashboards-page";
 import type { PortfolioRunSummary } from "./dashboard-finance";
+import { deliveryStatusFromRun } from "./delivery-bundle";
 
 export type OverviewSection =
   "workflows" | "templates" | "executions" | "dashboards" | "settings";
@@ -557,27 +558,48 @@ export function OverviewPage({
                   <strong>Run company</strong>, and history will land here.
                 </li>
               )}
-              {runHistory.map((run) => (
-                <li key={run.id} className="execution-row">
-                  <div className={`execution-status ${run.status}`} />
-                  <div>
-                    <b>
-                      {run.status} · {run.id.slice(0, 8)}
-                    </b>
-                    <p>
-                      {new Date(run.createdAt).toLocaleString()} · workflow{" "}
-                      {run.workflowId}
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    className="workflow-edit"
-                    onClick={() => onEditWorkflow(run.workflowId)}
-                  >
-                    Open graph
-                  </button>
-                </li>
-              ))}
+              {runHistory.map((run) => {
+                const deliveryStatus = deliveryStatusFromRun({
+                  runStatus: run.status,
+                  nodesJson: run.nodesJson,
+                });
+                return (
+                  <li key={run.id} className="execution-row">
+                    <div className={`execution-status ${run.status}`} />
+                    <div>
+                      <b>
+                        {run.status} · {run.id.slice(0, 8)}
+                      </b>
+                      <p>
+                        {new Date(run.createdAt).toLocaleString()} · workflow{" "}
+                        {run.workflowId}
+                      </p>
+                    </div>
+                    <span
+                      className={`delivery-preview-chip delivery-preview-${deliveryStatus}`}
+                      title={
+                        deliveryStatus === "pending"
+                          ? "No runtime verification rows back this delivery yet."
+                          : deliveryStatus === "failed"
+                            ? "Runtime verification or artifact pair-compare contradicts this delivery."
+                            : "Runtime verification rows back this delivery."
+                      }
+                    >
+                      Delivery{" "}
+                      {deliveryStatus === "success"
+                        ? "trusted"
+                        : deliveryStatus}
+                    </span>
+                    <button
+                      type="button"
+                      className="workflow-edit"
+                      onClick={() => onEditWorkflow(run.workflowId)}
+                    >
+                      Open graph
+                    </button>
+                  </li>
+                );
+              })}
             </ul>
           </section>
         )}
@@ -832,7 +854,11 @@ export function OverviewPage({
                   Specialists run through the installed{" "}
                   <strong>Codex CLI app-server</strong>.
                 </p>
-                <p className={codexInfo.compatible ? "settings-ok" : "settings-warn"}>
+                <p
+                  className={
+                    codexInfo.compatible ? "settings-ok" : "settings-warn"
+                  }
+                >
                   {codexInfo.compatible ? (
                     <>
                       <CheckCircle2 size={14} />

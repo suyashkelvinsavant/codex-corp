@@ -111,6 +111,8 @@ import {
   prepareNodesForRun,
   resetExecutableNodeForRun,
   revisionCountForRunEvent,
+  shouldAcceptRunEvent,
+  type RunEventCursor,
 } from "./run-lifecycle";
 import { resolveActiveSkill } from "./creative-skills";
 import {
@@ -120,6 +122,11 @@ import {
   type CodexCapabilityInventory,
 } from "./codex-capabilities";
 import { defaultPlatformCriteria } from "./completion-criteria";
+import {
+  parseVerificationLoops,
+  type VerificationLoopReport,
+} from "./analytics";
+import type { DeliveryPreviewStatus } from "./delivery-bundle";
 import { isSpecialistKind } from "./model";
 import {
   ACTIVE_WORKFLOW_KEY,
@@ -181,6 +188,7 @@ import { initAppearance } from "./theme";
 import { useUiStore } from "./ui-store";
 import {
   appendMediatorEventToStore,
+  appendMediatorMessageToStore,
   hydrateChatStore,
   requestAppWorkspaceSelection,
   toCodexUserInputs,
@@ -188,9 +196,17 @@ import {
   type ChatAttachment,
 } from "./workflow-chat";
 import {
+  formatLocalTestPrompt,
+  isSafeLocalLaunchPlan,
+  prepareLocalTestRerun,
+  type LocalTestSession,
+} from "./local-test";
+import {
   isCodexAgentLifecycleEvent,
+  mediatorToolConfirmation,
   notificationFromRunEvent,
   parseStructuredApproval,
+  type MediatorConfirmation,
   type MediatorNotification,
   type MediatorQuestion,
   type MediatorQuestionAnswer,
@@ -217,7 +233,7 @@ import {
   type PortfolioRunSummary,
 } from "./dashboard-finance";
 import { CONTROL_KINDS, controlKindLabel, statusText } from "./node-display";
-import { isConcreteMission } from "./mission-context";
+import { isConcreteMission, missionBriefStatus } from "./mission-context";
 import {
   resolveNativeApproval,
   type NativeApprovalResolution,
@@ -787,11 +803,16 @@ function App() {
     },
   ]);
   const eventsRef = useRef<RunEvent[]>(events);
+  const lastRunEventCursor = useRef<RunEventCursor>({
+    runId: null,
+    sequence: 0,
+  });
   const [problems, setProblems] = useState<ReturnType<typeof validateWorkflow>>(
     [],
   );
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
   const approvalsRef = useRef<ApprovalRequest[]>([]);
+  const [localTest, setLocalTest] = useState<LocalTestSession | null>(null);
   const [activeApproval, setActiveApproval] = useState<ApprovalRequest | null>(
     null,
   );
@@ -802,14 +823,43 @@ function App() {
   const [activeQuestion, setActiveQuestion] = useState<MediatorQuestion | null>(
     null,
   );
+  const [activeConfirmation, setActiveConfirmation] =
+    useState<MediatorConfirmation | null>(null);
+  const confirmationResolver = useRef<((approved: boolean) => void) | null>(
+    null,
+  );
   const questionResolver = useRef<
     ((answer: MediatorQuestionAnswer | null) => void) | null
   >(null);
   const interactionQueue = useRef<Promise<void>>(Promise.resolve());
   const [questionFreeText, setQuestionFreeText] = useState("");
   const [questionSelected, setQuestionSelected] = useState<string[]>([]);
+  const askOperatorConfirmation = (confirmation: MediatorConfirmation) =>
+    new Promise<boolean>((resolve) => {
+      confirmationResolver.current?.(false);
+      confirmationResolver.current = resolve;
+      setActiveConfirmation(confirmation);
+      setApprovalCenterOpen(true);
+    });
+  const resolveOperatorConfirmation = (approved: boolean) => {
+    const resolve = confirmationResolver.current;
+    confirmationResolver.current = null;
+    setActiveConfirmation(null);
+    setApprovalCenterOpen(
+      activeQuestion !== null ||
+        approvalsRef.current.some((item) => item.status === "pending"),
+    );
+    resolve?.(approved);
+  };
   const [runId, setRunId] = useState<string | null>(null);
   const [runHistory, setRunHistory] = useState<RunRecord[]>([]);
+  /** Per-node verification→revision loops for the inspected run (P4 chip). */
+  const [verificationLoops, setVerificationLoops] = useState<
+    VerificationLoopReport[]
+  >([]);
+  /** Fail-closed Delivery status for the inspected run (P5 chip). */
+  const [inspectedDeliveryStatus, setInspectedDeliveryStatus] =
+    useState<DeliveryPreviewStatus>("pending");
   /** Compact lifetime totals for Dashboards (not active-workflow-only). */
   const [portfolioRunSummaries, setPortfolioRunSummaries] = useState<
     PortfolioRunSummary[]
@@ -1048,7 +1098,7 @@ function App() {
                 missionSource: source,
                 chatSessionId: sessionId ?? n.data.chatSessionId,
                 missionUpdatedAt: new Date().toISOString(),
-                status: "completed",
+                status: missionBriefStatus(text),
                 trace: [
                   ...n.data.trace,
                   source === "chat"
@@ -1071,6 +1121,7 @@ function App() {
     running,
     runId,
     approvals: approvalsRef.current,
+    localTest,
     runHistory,
     actions: {
       run: (mission) => {
@@ -1109,11 +1160,8 @@ function App() {
           "company_decline",
         ].includes(tool)
       ) {
-        const detail =
-          tool === "company_run_from"
-            ? "Start from this node and intentionally skip its ancestors?"
-            : `Allow Byte to ${tool.replace("company_", "").replace(/_/g, " ")}?`;
-        if (!window.confirm(detail)) {
+        const confirmation = mediatorToolConfirmation(tool);
+        if (confirmation && !(await askOperatorConfirmation(confirmation))) {
           return {
             success: false,
             text: JSON.stringify({ error: "Operator cancelled confirmation" }),
@@ -1191,11 +1239,8 @@ function App() {
             "company_decline",
           ].includes(tool)
         ) {
-          const detail =
-            tool === "company_run_from"
-              ? "Start from this node and intentionally skip its ancestors?"
-              : `Allow Byte to ${tool.replace("company_", "").replace(/_/g, " ")}?`;
-          if (!window.confirm(detail)) {
+          const confirmation = mediatorToolConfirmation(tool);
+          if (confirmation && !(await askOperatorConfirmation(confirmation))) {
             await invoke("respond_mediator_tool", {
               requestId,
               success: false,
@@ -1415,6 +1460,11 @@ function App() {
       "mediator.question.answered",
     );
   };
+  const closeDecisionCenter = () => {
+    if (activeConfirmation) resolveOperatorConfirmation(false);
+    if (activeQuestion) resolveMediatorQuestion(true);
+    setApprovalCenterOpen(false);
+  };
   const inspectRun = (record: RunRecord) => {
     setRunId(record.id);
     const rehydrated = rehydrateRunRecord(record);
@@ -1440,6 +1490,17 @@ function App() {
     if (shouldReplaceEdgesFromRun(rehydrated.edges)) setEdges(rehydrated.edges);
     setDrawer(true);
     setDrawerTab(rehydrated.deliveryArtifactPresent ? "artifacts" : "timeline");
+    // P5: the inspector shows the same fail-closed Delivery status as the
+    // overview list — derived from the output node verificationSummary +
+    // pair-compare, never contradiction a failed/cancelled run.
+    setInspectedDeliveryStatus(rehydrated.deliveryStatus);
+    // P4: verification-revision loop analytics chip (Native only — node_attempts).
+    setVerificationLoops([]);
+    if (isTauri()) {
+      invoke<unknown>("analytics_verification_loops", { runId: record.id })
+        .then((value) => setVerificationLoops(parseVerificationLoops(value)))
+        .catch(() => setVerificationLoops([]));
+    }
     emit(
       `Inspecting run ${record.id.slice(0, 8)} · ${record.status}`,
       "run.inspected",
@@ -1534,10 +1595,19 @@ function App() {
   };
   const updateNode = (patch: Partial<AgentData>) => {
     if (!selected) return;
+    const nextPatch: Partial<AgentData> = { ...patch };
+    if (
+      selected.data.kind === "input" &&
+      Object.prototype.hasOwnProperty.call(patch, "output")
+    ) {
+      nextPatch.status = missionBriefStatus(
+        typeof patch.output === "string" ? patch.output : selected.data.output,
+      );
+    }
     pushHistory();
     setNodes((ns) =>
       ns.map((n) =>
-        n.id === selected.id ? { ...n, data: { ...n.data, ...patch } } : n,
+        n.id === selected.id ? { ...n, data: { ...n.data, ...nextPatch } } : n,
       ),
     );
     markDirty();
@@ -1849,6 +1919,7 @@ function App() {
             kind === "input"
               ? "Describe the product request for the company."
               : undefined,
+          missionSource: kind === "input" ? "template" : undefined,
           cronExpression: kind === "cron" ? "0 9 * * 1-5" : undefined,
           cronTimezone:
             kind === "cron"
@@ -2526,10 +2597,190 @@ function App() {
       "warning",
     );
   };
-  const run = async (startNodeId?: string, missionOverride?: string) => {
+  const preparedLocalTestRuns = useRef(new Set<string>());
+  const prepareLocalTestForRun = async (completedRunId: string) => {
+    if (!isTauri() || preparedLocalTestRuns.current.has(completedRunId)) return;
+    preparedLocalTestRuns.current.add(completedRunId);
+    try {
+      const session = await invoke<LocalTestSession>("prepare_local_test", {
+        workflowId,
+        runId: completedRunId,
+      });
+      const planSafety = isSafeLocalLaunchPlan(
+        session.plan,
+        session.workspacePath,
+      );
+      if (!planSafety.ok) throw new Error(planSafety.reason);
+      setLocalTest(session);
+      appendMediatorMessageToStore(
+        workflowId,
+        formatLocalTestPrompt(session),
+        "test",
+      );
+      setApprovalCenterOpen(true);
+      setDrawer(true);
+      setDrawerTab("approvals");
+      emit(
+        "Release Bundle verified · local test launch is awaiting your approval",
+        "local-test.ready",
+      );
+    } catch (error) {
+      preparedLocalTestRuns.current.delete(completedRunId);
+      appendMediatorMessageToStore(
+        workflowId,
+        `The Release Bundle completed, but Codex Corp could not prepare a local test: ${String(error)}`,
+        "error",
+      );
+      emit(
+        `Local test preparation failed: ${String(error)}`,
+        "local-test.prepare.failed",
+        undefined,
+        "error",
+      );
+    }
+  };
+  const resolveLocalTestLaunch = async (approved: boolean) => {
+    if (!localTest || !isTauri()) return;
+    try {
+      const next = await invoke<LocalTestSession>("approve_local_test_launch", {
+        sessionId: localTest.id,
+        approved,
+      });
+      const planSafety = isSafeLocalLaunchPlan(next.plan, next.workspacePath);
+      if (!planSafety.ok) throw new Error(planSafety.reason);
+      setLocalTest(next);
+      if (next.status === "running") {
+        appendMediatorMessageToStore(
+          workflowId,
+          "The local app is running. Test it as a user, then use the test card below to approve it or request changes.",
+          "status",
+        );
+        emit(
+          "Local app started · test it in the selected workspace",
+          "local-test.started",
+        );
+      } else if (next.status === "declined") {
+        appendMediatorMessageToStore(
+          workflowId,
+          "Local testing was skipped. The verified Release Bundle remains available for review.",
+          "status",
+        );
+        emit(
+          "Local test launch declined",
+          "local-test.declined",
+          undefined,
+          "warning",
+        );
+      } else if (next.status === "launch_failed") {
+        throw new Error(next.lastError || "local app launch failed");
+      }
+      setApprovalCenterOpen(
+        activeQuestion !== null ||
+          approvalsRef.current.some((item) => item.status === "pending"),
+      );
+    } catch (error) {
+      appendMediatorMessageToStore(
+        workflowId,
+        `The local app could not be started: ${String(error)}`,
+        "error",
+      );
+      emit(
+        `Local test launch failed: ${String(error)}`,
+        "local-test.launch.failed",
+        undefined,
+        "error",
+      );
+    }
+  };
+  const submitLocalTestFeedback = async (
+    approved: boolean,
+    feedback: string,
+  ) => {
+    if (!localTest || !isTauri()) return;
+    try {
+      const next = await invoke<LocalTestSession>(
+        "submit_local_test_feedback",
+        {
+          sessionId: localTest.id,
+          approved,
+          feedback,
+        },
+      );
+      const planSafety = isSafeLocalLaunchPlan(next.plan, next.workspacePath);
+      if (!planSafety.ok) throw new Error(planSafety.reason);
+      setLocalTest(next);
+      if (approved) {
+        appendMediatorMessageToStore(
+          workflowId,
+          "Operator approved the local test. The Release Bundle is ready for handoff.",
+          "status",
+        );
+        emit("Local test approved by operator", "local-test.approved");
+        return;
+      }
+      const rerun = prepareLocalTestRerun(nodes, edges, feedback);
+      appendMediatorMessageToStore(
+        workflowId,
+        `Operator requested changes after local testing:\n${
+          rerun.ok ? rerun.feedback : feedback.trim()
+        }`,
+        "test",
+      );
+      if (!rerun.ok) {
+        emit(
+          `Local test feedback was saved, but ${rerun.error.toLowerCase()}`,
+          "local-test.rerun.unavailable",
+          undefined,
+          "error",
+        );
+        return;
+      }
+      emit(
+        `Local test feedback routed to ${rerun.rerunNode.data.label}`,
+        "local-test.feedback.routed",
+        rerun.rerunNode.id,
+      );
+      await run(rerun.rerunNode.id, undefined, rerun.nodes);
+    } catch (error) {
+      emit(
+        `Could not save local test feedback: ${String(error)}`,
+        "local-test.feedback.failed",
+        undefined,
+        "error",
+      );
+    }
+  };
+  const stopLocalTest = async () => {
+    if (!localTest || !isTauri()) return;
+    try {
+      const next = await invoke<LocalTestSession>("stop_local_test", {
+        sessionId: localTest.id,
+      });
+      setLocalTest(next);
+      emit(
+        "Local test process stopped",
+        "local-test.stopped",
+        undefined,
+        "warning",
+      );
+    } catch (error) {
+      emit(
+        `Could not stop the local test process: ${String(error)}`,
+        "local-test.stop.failed",
+        undefined,
+        "error",
+      );
+    }
+  };
+  const run = async (
+    startNodeId?: string,
+    missionOverride?: string,
+    nodesOverride?: FlowNode[],
+  ) => {
     if (running) return false;
+    const sourceNodes = nodesOverride ?? nodes;
     const authorizedNodes = missionOverride?.trim()
-      ? nodes.map((node) =>
+      ? sourceNodes.map((node) =>
           node.data.kind === "input"
             ? {
                 ...node,
@@ -2537,7 +2788,7 @@ function App() {
               }
             : node,
         )
-      : nodes;
+      : sourceNodes;
     const missionNode = authorizedNodes.find(
       (node) => node.data.kind === "input",
     );
@@ -2563,6 +2814,7 @@ function App() {
       return false;
     }
     setRunning(true);
+    setLocalTest(null);
     setDrawer(true);
     setDrawerTab("timeline");
     eventsRef.current = [];
@@ -2668,6 +2920,10 @@ function App() {
       } else if (e.key === "Escape") {
         if (contextMenu) {
           closeContextMenu();
+          return;
+        }
+        if (activeConfirmation || activeQuestion) {
+          closeDecisionCenter();
           return;
         }
         setSelectedEdge(null);
@@ -3053,7 +3309,65 @@ function App() {
   useEffect(() => {
     if (!isTauri()) return;
     let disposed = false;
+    void invoke<LocalTestSession | null>("get_local_test", { workflowId })
+      .then((session) => {
+        if (disposed) return;
+        if (session) {
+          const planSafety = isSafeLocalLaunchPlan(
+            session.plan,
+            session.workspacePath,
+          );
+          if (!planSafety.ok) {
+            setLocalTest(null);
+            return;
+          }
+          if (session.status === "launch_pending") {
+            setApprovalCenterOpen(true);
+            setDrawer(true);
+            setDrawerTab("approvals");
+          }
+        }
+        setLocalTest(session);
+      })
+      .catch(() => {
+        if (!disposed) setLocalTest(null);
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [workflowId]);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let disposed = false;
     const unlisteners: Promise<() => void>[] = [];
+    unlisteners.push(
+      listen<LocalTestSession>("local-test-event", (event) => {
+        if (disposed || event.payload.workflowId !== workflowId) return;
+        const planSafety = isSafeLocalLaunchPlan(
+          event.payload.plan,
+          event.payload.workspacePath,
+        );
+        if (!planSafety.ok) {
+          appendMediatorMessageToStore(
+            workflowId,
+            `The native local-test event was rejected: ${planSafety.reason}`,
+            "error",
+          );
+          return;
+        }
+        setLocalTest(event.payload);
+        if (event.payload.status === "exited") {
+          appendMediatorMessageToStore(
+            workflowId,
+            event.payload.lastError
+              ? `The local test process exited: ${event.payload.lastError}`
+              : "The local test process exited. You can still record the result in workflow chat.",
+            event.payload.lastError ? "error" : "test",
+          );
+        }
+      }),
+    );
     unlisteners.push(
       listen<{
         nodeId: string;
@@ -3387,6 +3701,23 @@ function App() {
         if (disposed) return;
         const payload = event.payload;
         if (runId && payload.runId !== runId) return;
+        if (
+          runId &&
+          !shouldAcceptRunEvent(
+            runId,
+            payload.runId,
+            payload.sequence,
+            lastRunEventCursor.current,
+          )
+        ) {
+          return;
+        }
+        if (runId) {
+          lastRunEventCursor.current = {
+            runId,
+            sequence: payload.sequence,
+          };
+        }
         const nodeStatus = nodeStatusForRunEvent(payload.eventType);
         if (
           payload.nodeId &&
@@ -3473,6 +3804,9 @@ function App() {
           setRunning(false);
           void loadRunHistoryFor(workflowId);
           void loadPortfolioRunSummaries();
+          if (payload.eventType === "run.completed") {
+            void prepareLocalTestForRun(payload.runId);
+          }
         }
         const diagTokens = extractTotalTokensFromPayload(payload.diagnostics);
         if (payload.nodeId && diagTokens > 0) {
@@ -3528,6 +3862,7 @@ function App() {
         <Suspense fallback={null}>
           <DecisionCenterModal
             approvals={approvals}
+            confirmation={activeConfirmation}
             question={activeQuestion}
             selectedOptions={questionSelected}
             freeText={questionFreeText}
@@ -3544,8 +3879,11 @@ function App() {
             onDecideApproval={(request, approved) =>
               void decideApprovalFor(request, approved)
             }
+            onResolveConfirmation={resolveOperatorConfirmation}
             onResolveQuestion={resolveMediatorQuestion}
-            onClose={() => setApprovalCenterOpen(false)}
+            localTest={localTest}
+            onResolveLocalTestLaunch={resolveLocalTestLaunch}
+            onClose={closeDecisionCenter}
           />
         </Suspense>
       )}
@@ -3815,9 +4153,13 @@ function App() {
             totalExecutable={nodes.filter((n) => n.data.kind !== "note").length}
             pendingDecisionCount={
               approvals.filter((item) => item.status === "pending").length +
-              (activeQuestion ? 1 : 0)
+              (activeQuestion ? 1 : 0) +
+              (localTest?.status === "launch_pending" ? 1 : 0)
             }
+            localTest={localTest}
             onOpenApprovals={() => setApprovalCenterOpen(true)}
+            onSubmitLocalTestFeedback={submitLocalTestFeedback}
+            onStopLocalTest={stopLocalTest}
             onBack={() => {
               setAppView("overview");
             }}
@@ -3936,7 +4278,8 @@ function App() {
             Approvals
             <span className="decision-count">
               {approvals.filter((item) => item.status === "pending").length +
-                (activeQuestion ? 1 : 0)}
+                (activeQuestion ? 1 : 0) +
+                (localTest?.status === "launch_pending" ? 1 : 0)}
             </span>
           </button>
           <button
@@ -4506,6 +4849,37 @@ function App() {
           </button>
           {drawer && (
             <div className="drawer-body">
+              {(verificationLoops.length > 0 ||
+                inspectedDeliveryStatus !== "pending") && (
+                <div className="drawer-verification-loops">
+                  {inspectedDeliveryStatus !== "pending" && (
+                    <span
+                      className={`delivery-preview-chip delivery-preview-${inspectedDeliveryStatus}`}
+                      title={
+                        inspectedDeliveryStatus === "failed"
+                          ? "Runtime verification or artifact pair-compare contradicts this delivery."
+                          : "Runtime verification rows back this delivery."
+                      }
+                    >
+                      Delivery{" "}
+                      {inspectedDeliveryStatus === "success"
+                        ? "trusted"
+                        : inspectedDeliveryStatus}
+                    </span>
+                  )}
+                  {verificationLoops.map((loop) => (
+                    <span
+                      key={loop.nodeId}
+                      className="verification-loops-chip"
+                      title={`criterionIds: ${loop.criterionIds.join(", ") || "—"}`}
+                    >
+                      {loop.verificationRevisions} verification loop
+                      {loop.verificationRevisions === 1 ? "" : "s"} ·{" "}
+                      {loop.nodeId}
+                    </span>
+                  ))}
+                </div>
+              )}
               <nav>
                 {(
                   [
@@ -4529,7 +4903,9 @@ function App() {
                     )}
                     {name === "approvals" && (
                       <span>
-                        {approvals.filter((a) => a.status === "pending").length}
+                        {approvals.filter((a) => a.status === "pending")
+                          .length +
+                          (localTest?.status === "launch_pending" ? 1 : 0)}
                       </span>
                     )}
                     {name === "problems" && problems.length > 0 && (

@@ -38,6 +38,16 @@ export function isConcreteMission(value: string | null | undefined): boolean {
   );
 }
 
+/**
+ * Derive the Mission brief's display state from its authorization content.
+ * A seed, greeting, or empty value is still waiting for operator intent.
+ */
+export function missionBriefStatus(
+  value: string | null | undefined,
+): "idle" | "completed" {
+  return isConcreteMission(value) ? "completed" : "idle";
+}
+
 /** Normalize constraint lines (trim, drop empties, de-dupe preserving order). */
 export function normalizeMissionConstraints(
   lines: string[] | undefined | null,

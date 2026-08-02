@@ -220,6 +220,13 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
             surfaces: MCP_ONLY,
         },
         ToolDefinition {
+            name: "analytics_verification_loops",
+            description:
+                "Per-node verification→revision loop analytics for a run (verificationRevisions + failing criterionIds from node_attempts).",
+            input_schema: object_schema(json!({ "runId": { "type": "string" } }), &["runId"]),
+            surfaces: MCP_AND_COMPANY,
+        },
+        ToolDefinition {
             name: "discover_codex",
             description: "Discover local Codex CLI / app-server availability.",
             input_schema: object_schema(json!({}), &[]),
@@ -320,6 +327,10 @@ pub fn dispatch(host: &McpHost, name: &str, arguments: Value) -> Result<Value, S
             host.get_run(run_id)
         }
         "list_active_runs" => host.list_active_runs(optional_str(&arguments, "workflowId")),
+        "analytics_verification_loops" => {
+            let run_id = required_str(&arguments, "runId")?;
+            host.analytics_verification_loops(&run_id)
+        }
         "discover_codex" => host.discover_codex_json(),
         "mcp_server_status" => Ok(redacted_status_value(super::lifecycle::status_embedded())),
         other => Err(format!("Unknown tool: {other}")),
@@ -389,6 +400,7 @@ mod tests {
         assert!(names.contains(&"respond_codex_approval"));
         assert!(names.contains(&"list_pending_codex_approvals"));
         assert!(names.contains(&"list_pending_run_approvals"));
+        assert!(names.contains(&"analytics_verification_loops"));
     }
 
     #[test]

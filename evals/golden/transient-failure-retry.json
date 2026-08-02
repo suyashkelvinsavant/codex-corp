@@ -1,0 +1,12 @@
+{
+  "id": "transient-failure-retry",
+  "attempts": [
+    { "status": "error", "error": "connection reset by peer", "fingerprint": "same" },
+    { "status": "error", "error": "connection reset by peer", "fingerprint": "same" }
+  ],
+  "expect": {
+    "failureClass": "transient",
+    "retryAction": "backoff",
+    "reason": "provider/network flakiness keeps identical inputs; backoff up to max_retries is the correct recovery (plateau must NOT fire for transient inputs)"
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "id": "mission-delivery-fail-closed",
+  "runMode": "mission",
+  "mission": {
+    "text": "Ship a component claiming self-attestation only.",
+    "builderRole": "Frontend Engineer",
+    "builderCriteria": [
+      {
+        "id": "claim-1",
+        "label": "Must not self-attest",
+        "kind": "claim",
+        "enforcement": "required"
+      }
+    ]
+  },
+  "scriptedOutputs": [
+    {
+      "status": "success",
+      "summary": "Completed the component; I pinky swear it works.",
+      "data": { "criteria": [{ "id": "claim-1", "passed": true, "evidence": "trust me" }] },
+      "artifacts": [{ "id": "app", "name": "App.jsx", "content": "export default () => null;" }]
+    }
+  ],
+  "expect": {
+    "runStatus": "failed",
+    "delivery": {
+      "bundleHash": "absent",
+      "verification": "absent"
+    },
+    "reason": "a required claim can never own the pass bit: the run fails at the verification gate (no revision edge to rework), so no trusted delivery bundle is ever produced — bundleHash and delivery verification summary are both absent"
+  }
+}

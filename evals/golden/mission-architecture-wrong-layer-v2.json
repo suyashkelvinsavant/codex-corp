@@ -1,0 +1,40 @@
+{
+  "id": "mission-architecture-wrong-layer-v2",
+  "runMode": "mission",
+  "mission": {
+    "text": "Ship an app that claims to own its runtime in TypeScript.",
+    "builderRole": "Frontend Engineer",
+    "builderCriteria": [
+      {
+        "id": "arch-1",
+        "label": "Native runtime ownership",
+        "kind": "architecture_policy",
+        "policyId": "native_runtime_ownership_v2",
+        "enforcement": "required"
+      }
+    ],
+    "workspaceFiles": {
+      "src-tauri/src/workflow_runtime.rs": "// native marker present",
+      "src/scheduler/job_runner.ts": "export function start() {\n  const queue: Job[] = [];\n  setInterval(() => { retry(queue); }, 5000);\n  while(true) { poll(queue); }\n}\n"
+    }
+  },
+  "scriptedOutputs": [
+    {
+      "status": "success",
+      "summary": "The runtime now lives in a producer-side scheduler.",
+      "data": { "filesWritten": ["src/scheduler/job_runner.ts"] },
+      "artifacts": [
+        { "id": "job", "name": "job_runner.ts", "content": "export function start() {}" }
+      ]
+    }
+  ],
+  "expect": {
+    "runStatus": "failed",
+    "delivery": {
+      "bundleHash": "absent",
+      "verification": "absent"
+    },
+    "terminalReasonContains": "src/scheduler/job_runner.ts",
+    "reason": "architecture v2 fails a producer-side scheduler/workflow module by shape (path infix + control flow), even though its name is not in v1's fixed suspect globs; the terminal reason must name the offending module"
+  }
+}

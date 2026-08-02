@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeTestWorkflow } from "./test-workflow-fixture";
 import { validateWorkflow } from "./graph";
+import { getPack } from "./node-packs/packs";
 import {
   cloneTemplateGraph,
   cloneTemplateGraphLaidOut,
@@ -21,6 +22,39 @@ import {
   getTemplate as getCatalogTemplate,
   planCatalogMigration,
 } from "./templates";
+
+const ADDITIONAL_BUILTIN_CONTRACTS = [
+  {
+    id: "product-launch-v1",
+    name: "Product launch",
+    requiredPacks: [
+      "product-manager",
+      "researcher",
+      "designer",
+      "frontend-engineer",
+      "qa-engineer",
+    ],
+    minimumNodeCount: 8,
+  },
+  {
+    id: "security-review-v1",
+    name: "Security review",
+    requiredPacks: ["architect", "security-reviewer", "code-reviewer"],
+    minimumNodeCount: 6,
+  },
+  {
+    id: "incident-response-v1",
+    name: "Incident response",
+    requiredPacks: [
+      "security-reviewer",
+      "architect",
+      "backend-engineer",
+      "qa-engineer",
+      "delivery-agent",
+    ],
+    minimumNodeCount: 8,
+  },
+] as const;
 
 describe("workflow catalog", () => {
   const values = new Map<string, string>();
@@ -66,12 +100,167 @@ describe("workflow catalog", () => {
             node.data.model === "gpt-5.6-luna" && node.data.effort === "medium",
         ),
     ).toBe(true);
+    expect(
+      software.nodes.find((node) => node.id === "input")?.data,
+    ).toMatchObject({
+      status: "idle",
+      output: "Describe the product request for the company.",
+      missionSource: "template",
+    });
     expect(isTemplateId(DEFAULT_TEMPLATE_ID)).toBe(false);
     expect(getTemplate("missing")).toMatchObject({
       id: DEFAULT_TEMPLATE_ID,
       nodes: [],
       edges: [],
     });
+  });
+
+  describe("additional built-in templates", () => {
+    it("registers exactly three additional templates with stable unique identities", () => {
+      const builtIns = listTemplates().filter(
+        (template) => template.templateOrigin === "built-in",
+      );
+      const ids = builtIns.map((template) => template.id);
+
+      expect(ids).toHaveLength(6);
+      expect(new Set(ids).size).toBe(ids.length);
+      expect(ids).toEqual(
+        expect.arrayContaining(
+          ADDITIONAL_BUILTIN_CONTRACTS.map((contract) => contract.id),
+        ),
+      );
+      expect(builtIns.map((template) => template.name)).toEqual(
+        expect.arrayContaining(
+          ADDITIONAL_BUILTIN_CONTRACTS.map((contract) => contract.name),
+        ),
+      );
+    });
+
+    it.each(ADDITIONAL_BUILTIN_CONTRACTS)(
+      "$name stays executable and cannot reference a missing pack or node",
+      (contract) => {
+        const template = getTemplate(contract.id);
+        const nodeIds = new Set(template.nodes.map((node) => node.id));
+
+        expect(template.nodes.length, contract.id).toBeGreaterThanOrEqual(
+          contract.minimumNodeCount,
+        );
+        expect(template.templateOrigin, contract.id).toBe("built-in");
+        expect(template.locked, contract.id).toBe(true);
+        expect(
+          template.nodes.some((node) => node.data.kind === "input"),
+          contract.id,
+        ).toBe(true);
+        expect(
+          template.nodes.some((node) => node.data.kind === "approval"),
+          contract.id,
+        ).toBe(true);
+        expect(
+          template.nodes.some((node) => node.data.kind === "output"),
+          contract.id,
+        ).toBe(true);
+        expect(
+          template.nodes
+            .filter((node) => node.data.kind === "agent")
+            .every((node) => getPack(node.data.packId ?? "")),
+          contract.id,
+        ).toBe(true);
+        expect(
+          template.edges.every(
+            (edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target),
+          ),
+          contract.id,
+        ).toBe(true);
+        expect(
+          validateWorkflow(template.nodes, template.edges).filter(
+            (problem) => problem.severity === "error",
+          ),
+          contract.id,
+        ).toEqual([]);
+      },
+    );
+
+    it.each(ADDITIONAL_BUILTIN_CONTRACTS)(
+      "$name uses the requested specialist packs and bounded execution defaults",
+      (contract) => {
+        const template = getTemplate(contract.id);
+        const packIds = template.nodes
+          .map((node) => node.data.packId)
+          .filter((packId): packId is string => Boolean(packId));
+        const agentNodes = template.nodes.filter(
+          (node) => node.data.kind === "agent",
+        );
+
+        expect(packIds).toEqual(
+          expect.arrayContaining([...contract.requiredPacks]),
+        );
+        expect(
+          agentNodes.every(
+            (node) =>
+              node.data.maxRetries === 2 &&
+              (node.data.timeoutSeconds ?? 0) >= 120 &&
+              (node.data.completionCriteria?.length ?? 0) > 0,
+          ),
+          contract.id,
+        ).toBe(true);
+      },
+    );
+
+    it.each(ADDITIONAL_BUILTIN_CONTRACTS)(
+      "$name keeps the release boundary human-controlled",
+      (contract) => {
+        const template = getTemplate(contract.id);
+        const byId = new Map(template.nodes.map((node) => [node.id, node]));
+        const output = template.nodes.find(
+          (node) => node.data.kind === "output",
+        );
+        const incoming = template.edges.filter(
+          (edge) => edge.target === output?.id,
+        );
+
+        expect(
+          template.nodes.filter((node) => node.data.kind === "approval"),
+        ).toHaveLength(1);
+        expect(incoming).toHaveLength(1);
+        expect(byId.get(incoming[0]?.source)?.data.kind).toBe("approval");
+        expect(
+          template.edges.some(
+            (edge) =>
+              byId.get(edge.source)?.data.kind === "agent" &&
+              byId.get(edge.target)?.data.kind === "output",
+          ),
+        ).toBe(false);
+      },
+    );
+
+    it.each(ADDITIONAL_BUILTIN_CONTRACTS)(
+      "$name includes a bounded revision path without leaking limits to other edges",
+      (contract) => {
+        const template = getTemplate(contract.id);
+        const revisionEdges = template.edges.filter(
+          (edge) => edge.data?.edgeType === "revision",
+        );
+        const nonRevisionEdges = template.edges.filter(
+          (edge) => edge.data?.edgeType !== "revision",
+        );
+
+        expect(revisionEdges.length, contract.id).toBeGreaterThan(0);
+        expect(
+          revisionEdges.every(
+            (edge) =>
+              Number.isInteger(edge.data?.maxRevisions) &&
+              (edge.data?.maxRevisions ?? 0) > 0,
+          ),
+          contract.id,
+        ).toBe(true);
+        expect(
+          nonRevisionEdges.every(
+            (edge) => edge.data?.maxRevisions === undefined,
+          ),
+          contract.id,
+        ).toBe(true);
+      },
+    );
   });
 
   describe("built-in revision limits", () => {

@@ -17,7 +17,7 @@ pub fn spawn_http(
     config: McpServerConfig,
     stop: Arc<AtomicBool>,
 ) -> Result<JoinHandle<()>, String> {
-    validate_bind_host(&config.host)?;
+    validate_bind_config(&config)?;
     let addr = super::socket_addr(&config.host, config.port);
     let listener = TcpListener::bind(&addr)
         .map_err(|error| format!("failed to bind MCP HTTP listener on {addr}: {error}"))?;
@@ -61,21 +61,41 @@ pub fn spawn_http(
         .map_err(|error| error.to_string())
 }
 
-fn validate_bind_host(host: &str) -> Result<(), String> {
-    let normalized = host.trim().to_ascii_lowercase();
-    let loopback = matches!(
-        normalized.as_str(),
-        "127.0.0.1" | "localhost" | "::1" | "[::1]"
-    );
+fn validate_bind_config(config: &McpServerConfig) -> Result<(), String> {
     let allow_non_loopback = std::env::var("CODEX_CORP_MCP_ALLOW_NON_LOOPBACK")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    if !loopback && !allow_non_loopback {
+    validate_bind_config_with_opt_in(config, allow_non_loopback)
+}
+
+fn validate_bind_config_with_opt_in(
+    config: &McpServerConfig,
+    allow_non_loopback: bool,
+) -> Result<(), String> {
+    validate_bind_host_with_opt_in(&config.host, allow_non_loopback)?;
+    if !is_loopback_host(&config.host) && config.auth_token.len() < 32 {
+        return Err(
+            "refusing non-loopback MCP bind with a bearer token shorter than 32 bytes".into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_bind_host_with_opt_in(host: &str, allow_non_loopback: bool) -> Result<(), String> {
+    let normalized = host.trim().to_ascii_lowercase();
+    if !is_loopback_host(&normalized) && !allow_non_loopback {
         return Err(format!(
             "refusing to bind MCP on non-loopback host '{host}' (set CODEX_CORP_MCP_ALLOW_NON_LOOPBACK=1 to override)"
         ));
     }
     Ok(())
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(
+        host.trim().to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "::1" | "[::1]"
+    )
 }
 
 /// One framed message extracted from a stdio MCP stream.
@@ -637,7 +657,19 @@ mod tests {
 
     #[test]
     fn rejects_non_loopback_by_default() {
-        assert!(validate_bind_host("127.0.0.1").is_ok());
-        assert!(validate_bind_host("0.0.0.0").is_err());
+        assert!(validate_bind_host_with_opt_in("127.0.0.1", false).is_ok());
+        assert!(validate_bind_host_with_opt_in("0.0.0.0", false).is_err());
+    }
+
+    #[test]
+    fn rejects_weak_token_for_opted_in_non_loopback_bind() {
+        let config = McpServerConfig {
+            host: "0.0.0.0".into(),
+            port: 8742,
+            stdio: false,
+            auth_token: "weak".into(),
+        };
+        assert!(validate_bind_host_with_opt_in(&config.host, true).is_ok());
+        assert!(validate_bind_config_with_opt_in(&config, true).is_err());
     }
 }

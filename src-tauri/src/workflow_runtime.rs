@@ -4,7 +4,7 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
@@ -14,9 +14,9 @@ use tauri::{Emitter, Manager};
 use crate::app_settings;
 use crate::verifier::{
     architecture_policy_failed, artifact_exists_failed, artifact_hash_set_key, attempt_fingerprint,
-    collect_upstream_artifacts, command_failed, delivery_pair_compare, freeze_approval_snapshot,
-    is_plateau, materialize_artifacts, ApprovedArtifact, DeliveryCompareResult,
-    ProcessCommandRunner,
+    classify_failure, collect_upstream_artifacts, command_failed, delivery_pair_compare,
+    freeze_approval_snapshot, is_plateau, materialize_artifacts, ApprovedArtifact,
+    DeliveryCompareResult, FailureClass, ProcessCommandRunner,
 };
 use crate::{
     execute_agent_internal, AgentRequest, AgentResult, ApprovalBroker, Database, ProcessBroker,
@@ -198,6 +198,10 @@ struct RuntimeNodeData {
     developer_instructions: String,
     #[serde(default)]
     output: Option<String>,
+    /// Operator observations from a completed local test, routed explicitly to
+    /// the next producer invocation.
+    #[serde(default)]
+    user_test_feedback: Vec<String>,
     #[serde(default)]
     completion_criteria: Vec<RuntimeCriterion>,
     #[serde(default = "default_retries")]
@@ -519,6 +523,112 @@ fn new_run_id() -> String {
     format!("run-{millis:x}-{counter:x}")
 }
 
+/// Persist a verification-driven revision routing as a `node_attempts`-style
+/// record (P3). The verification gate itself has no Codex attempt, so analytics
+/// would otherwise miss "verification → revision" loops per node. Each routing
+/// of a required verification failure writes a row carrying
+/// `failureClass:"verification"` and the failing criterion id(s), queryable via
+/// `count_verification_revisions`-style SQL on `node_attempts`.
+fn record_verification_revision(
+    context: &RunContext,
+    reviewer_node_id: &str,
+    routed_to_node_id: &str,
+    revision: u32,
+    criterion_ids: &[String],
+    feedback: &str,
+) {
+    let id = format!(
+        "{}:{reviewer_node_id}:verification:r{revision}",
+        context.run_id
+    );
+    let diagnostics = json!({
+        "failureClass": "verification",
+        "gate": "verification",
+        "criterionIds": criterion_ids,
+        "routedTo": routed_to_node_id,
+        "revision": revision,
+        "summary": feedback,
+    });
+    if let Ok(connection) = context.database.0.lock() {
+        let _ = connection.execute(
+            "INSERT OR REPLACE INTO node_attempts(id,run_id,node_id,attempt,revision,status,diagnostics_json,completed_at) VALUES(?1,?2,?3,?4,?5,'failed',?6,CURRENT_TIMESTAMP)",
+            params![id, context.run_id, reviewer_node_id, 0_i64, revision, diagnostics.to_string()],
+        );
+    }
+}
+
+/// Count verification-gate revisions routed for a node in a run (analytics for
+/// "verification → revision" loops). JSON1 is enabled on the shared SQLite.
+#[cfg(test)]
+fn count_verification_revisions(
+    connection: &rusqlite::Connection,
+    run_id: &str,
+    node_id: &str,
+) -> Result<u64, String> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM node_attempts
+             WHERE run_id=?1 AND node_id=?2
+               AND json_extract(diagnostics_json,'$.failureClass')='verification'
+               AND json_extract(diagnostics_json,'$.gate')='verification'",
+            params![run_id, node_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count as u64)
+        .map_err(|error| error.to_string())
+}
+
+/// Per-node verification-revision analytics (P4). Surfaces "how many
+/// verification → revision loops per node?" from `node_attempts`, including the
+/// failing criterion ids carried by `record_verification_revision`. Exposed as a
+/// Tauri command (`analytics_verification_loops`) and MCP tool.
+pub(crate) fn verification_loops_for_run(
+    connection: &rusqlite::Connection,
+    run_id: &str,
+) -> Result<Value, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT node_id, diagnostics_json
+             FROM node_attempts
+             WHERE run_id=?1
+               AND json_extract(diagnostics_json,'$.failureClass')='verification'
+               AND json_extract(diagnostics_json,'$.gate')='verification'
+             ORDER BY node_id",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![run_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut by_node: BTreeMap<String, (u64, BTreeSet<String>)> = BTreeMap::new();
+    for row in rows {
+        let (node_id, diagnostics) = row.map_err(|error| error.to_string())?;
+        let entry = by_node.entry(node_id).or_default();
+        entry.0 += 1;
+        if let Ok(value) = serde_json::from_str::<Value>(&diagnostics) {
+            if let Some(ids) = value.get("criterionIds").and_then(Value::as_array) {
+                for id in ids {
+                    if let Some(id) = id.as_str() {
+                        entry.1.insert(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let nodes: Vec<Value> = by_node
+        .into_iter()
+        .map(|(node_id, (revisions, criterion_ids))| {
+            json!({
+                "nodeId": node_id,
+                "verificationRevisions": revisions,
+                "criterionIds": criterion_ids.into_iter().collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Ok(json!({ "runId": run_id, "nodes": nodes }))
+}
+
 fn now_isoish() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
@@ -757,12 +867,20 @@ fn verification_result_row(output: &RuntimeOutput, criterion_id: &str) -> Option
     Some((passed, detail))
 }
 
+/// A required completion-criterion failure with the failing criterion id(s). The
+/// ids feed the persisted `failureClass:"verification"` attempt records (P3).
+#[derive(Debug, Clone)]
+struct RequiredCriteriaFailure {
+    message: String,
+    criterion_ids: Vec<String>,
+}
+
 fn required_criteria_failure(
     criteria: &[RuntimeCriterion],
     output: &RuntimeOutput,
     context: &RunContext,
     hard_criteria_gate: bool,
-) -> Option<String> {
+) -> Option<RequiredCriteriaFailure> {
     for criterion in criteria {
         let required =
             hard_criteria_gate || criterion.platform || criterion.enforcement == "required";
@@ -773,20 +891,26 @@ fn required_criteria_failure(
         // expensive host verifiers (command / architecture_policy).
         if let Some((passed, detail)) = verification_result_row(output, &criterion.id) {
             if !passed {
-                return Some(format!(
-                    "required completion criterion failed: {} — {}",
-                    criterion.label, detail
-                ));
+                return Some(RequiredCriteriaFailure {
+                    message: format!(
+                        "required completion criterion failed: {} — {}",
+                        criterion.label, detail
+                    ),
+                    criterion_ids: vec![criterion.id.clone()],
+                });
             }
             continue;
         }
         // Fallback only when no verification row exists (legacy / non-specialist).
         let eval = evaluate_criterion(criterion, output, context);
         if eval.failed {
-            return Some(format!(
-                "required completion criterion failed: {} — {}",
-                criterion.label, eval.detail
-            ));
+            return Some(RequiredCriteriaFailure {
+                message: format!(
+                    "required completion criterion failed: {} — {}",
+                    criterion.label, eval.detail
+                ),
+                criterion_ids: vec![criterion.id.clone()],
+            });
         }
     }
     None
@@ -1238,12 +1362,25 @@ fn compose_specialist_input(
     node: &RuntimeNode,
     revision_feedback: &str,
 ) -> Result<Value, String> {
-    let mission = context
+    let input_node = context
         .graph
         .nodes
         .iter()
-        .find(|candidate| candidate.data.kind == "input")
+        .find(|candidate| candidate.data.kind == "input");
+    let mission = input_node
         .and_then(|candidate| candidate.data.output.clone())
+        .unwrap_or_default();
+    let operator_test_feedback = input_node
+        .map(|candidate| {
+            candidate
+                .data
+                .user_test_feedback
+                .iter()
+                .rev()
+                .take(8)
+                .map(|feedback| feedback.chars().take(4_000).collect::<String>())
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     let outputs = context
         .outputs
@@ -1284,6 +1421,7 @@ fn compose_specialist_input(
         "workflowInput": mission,
         "upstreamOutputs": upstream_outputs,
         "revisionFeedback": revision_feedback,
+        "operatorTestFeedback": operator_test_feedback,
     }))
 }
 
@@ -1555,6 +1693,7 @@ async fn specialist_once(
                 } else {
                     output.summary.clone()
                 };
+                let failure_class = classify_failure(&error).as_str();
                 emit_event(
                     context,
                     "node.attempt.failed",
@@ -1571,6 +1710,7 @@ async fn specialist_once(
                         "revision": revision,
                         "attemptTokens": attempt_tokens,
                         "tokens": output.tokens,
+                        "failureClass": failure_class,
                         // Slim meta only — full content stays on RuntimeOutput for the retry adapter.
                         "artifactMeta": slim_artifact_meta(&output.artifacts),
                     }),
@@ -1578,7 +1718,7 @@ async fn specialist_once(
                 if let Ok(connection) = context.database.0.lock() {
                     let _ = connection.execute(
                         "INSERT OR REPLACE INTO node_attempts(id,run_id,node_id,attempt,revision,status,thread_id,turn_id,diagnostics_json,completed_at) VALUES(?1,?2,?3,?4,?5,'failed',?6,?7,?8,CURRENT_TIMESTAMP)",
-                        params![format!("{}:{}:{}",context.run_id,node.id,attempt_id),context.run_id,node.id,attempt,revision,output.thread_id,output.turn_id,json!({"elapsedMs":elapsed_ms,"reportedFailure":true,"summary":error,"attemptTokens":attempt_tokens}).to_string()],
+                        params![format!("{}:{}:{}",context.run_id,node.id,attempt_id),context.run_id,node.id,attempt,revision,output.thread_id,output.turn_id,json!({"elapsedMs":elapsed_ms,"reportedFailure":true,"summary":error,"attemptTokens":attempt_tokens,"failureClass":failure_class}).to_string()],
                     );
                 }
                 // Return Ok with status=failure so the retry adapter can record artifact
@@ -1607,6 +1747,7 @@ async fn specialist_once(
         Err(error) => {
             let attempt_tokens = token_meter.load(Ordering::SeqCst);
             let cumulative_tokens = record_node_tokens(context, &node.id, attempt_tokens);
+            let failure_class = classify_failure(&error).as_str();
             emit_event(
                 context,
                 "node.attempt.failed",
@@ -1614,12 +1755,12 @@ async fn specialist_once(
                 Some(&node.id),
                 Some(&attempt_id),
                 format!("{} attempt failed: {error}", node.data.label),
-                json!({"elapsedMs":elapsed_ms,"error":error,"attempt":attempt,"revision":revision,"attemptTokens":attempt_tokens,"tokens":cumulative_tokens}),
+                json!({"elapsedMs":elapsed_ms,"error":error,"attempt":attempt,"revision":revision,"attemptTokens":attempt_tokens,"tokens":cumulative_tokens,"failureClass":failure_class}),
             );
             if let Ok(connection) = context.database.0.lock() {
                 let _ = connection.execute(
                     "INSERT OR REPLACE INTO node_attempts(id,run_id,node_id,attempt,revision,status,diagnostics_json,completed_at) VALUES(?1,?2,?3,?4,?5,'failed',?6,CURRENT_TIMESTAMP)",
-                    params![format!("{}:{}:{}",context.run_id,node.id,attempt_id),context.run_id,node.id,attempt,revision,json!({"elapsedMs":elapsed_ms,"error":error,"attemptTokens":attempt_tokens}).to_string()],
+                    params![format!("{}:{}:{}",context.run_id,node.id,attempt_id),context.run_id,node.id,attempt,revision,json!({"elapsedMs":elapsed_ms,"error":error,"attemptTokens":attempt_tokens,"failureClass":failure_class}).to_string()],
                 );
             }
             Err(error)
@@ -1641,9 +1782,12 @@ fn specialist_thread_id_for_attempt(
 enum RetryErrorClass {
     Transient,
     Contract,
+    /// Permission / sandbox denial → request authorization or reroute (P2).
+    Capability,
+    /// Acceptance-criteria ambiguity / incompleteness → pause for human (P2).
+    Specification,
     Fatal,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RetryStopReason {
     Plateau,
@@ -1651,59 +1795,57 @@ enum RetryStopReason {
     ContractExhausted,
     MaxRetries,
     Interrupted,
+    /// Capability/specification recovery armed a needs_human gate that was
+    /// declined or timed out (run stops only after the human path failed).
+    NeedsHuman,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RetryAction {
     Stop(RetryStopReason),
-    RetryTransient { backoff_ms: u64 },
-    RetryContractRepair { new_extra: String },
+    RetryTransient {
+        backoff_ms: u64,
+    },
+    RetryContractRepair {
+        new_extra: String,
+    },
+    /// Strategy-aware recovery for capability/specification classes: arm a
+    /// human gate instead of failing the run; `class` records the intact
+    /// failure class on the gate.
+    NeedsHuman {
+        class: FailureClass,
+    },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryActionOutcome {
+    Stop,
+    Retry,
+    RetryAfterHuman,
+}
+
+fn retry_limit_after_human_approval(attempt: u32, retry_limit: u32) -> u32 {
+    if attempt >= retry_limit {
+        retry_limit.saturating_add(1)
+    } else {
+        retry_limit
+    }
+}
+
+/// Retry-policy projection of the full failure taxonomy (single source of truth for
+/// `RetryErrorClass` behavior; `FailureClass` carries the richer recorded category).
 fn classify_retry_error(error: &str) -> RetryErrorClass {
-    let lower = error.to_ascii_lowercase();
-    // Prefer specific phrases over bare substrings (avoid "json"/"429"/"connection" false positives).
-    if (lower.contains("wall-clock budget") && lower.contains("exceeded"))
-        || (lower.contains("hard-deadline")
-            && lower.contains("active budget")
-            && lower.contains("exceeded"))
-        || lower.contains("timed out")
-        || lower.contains("timeout")
-        || lower.contains("rate limit")
-        || lower.contains("rate-limit")
-        || lower.contains("ratelimit")
-        || lower.contains("too many requests")
-        || lower.contains("status 429")
-        || lower.contains("http 429")
-        || lower.contains("error 429")
-        || lower.contains("connection reset")
-        || lower.contains("connection refused")
-        || lower.contains("connection timed")
-        || lower.contains("econnreset")
-        || lower.contains("econnrefused")
-        || lower.contains("broken pipe")
-        || lower.contains("temporarily unavailable")
-        || lower.contains("network unreachable")
-        || lower.contains("network error")
-    {
-        return RetryErrorClass::Transient;
+    match classify_failure(error) {
+        FailureClass::Transient => RetryErrorClass::Transient,
+        FailureClass::Contract => RetryErrorClass::Contract,
+        FailureClass::Capability => RetryErrorClass::Capability,
+        FailureClass::Specification => RetryErrorClass::Specification,
+        // Verification / plateau / fatal all stop today; the richer class is
+        // what gets recorded for strategy-aware recovery.
+        FailureClass::Verification | FailureClass::Plateau | FailureClass::Fatal => {
+            RetryErrorClass::Fatal
+        }
     }
-    if lower.contains("failed to parse")
-        || lower.contains("parse error")
-        || lower.contains("error parsing json")
-        || lower.contains("invalid json")
-        || lower.contains("json parse")
-        || lower.contains("schema validation")
-        || lower.contains("output schema")
-        || lower.contains("output_schema")
-        || lower.contains("deserialize")
-        || lower.contains("structured output")
-        || lower.contains("invalid response")
-        || lower.contains("validation failed")
-    {
-        return RetryErrorClass::Contract;
-    }
-    RetryErrorClass::Fatal
 }
 
 /// Content hashes from materialized artifacts (for plateau hash-set keys).
@@ -1857,6 +1999,24 @@ fn next_retry_action(
     contract_repair_used: bool,
     original_extra: &str,
 ) -> RetryAction {
+    // Strategy-aware recovery (P2): capability/specification failures cannot be
+    // fixed by re-prompting. Arm a needs_human gate on the FIRST such failure
+    // (before max-retries/plateau) — retrying won't grant a permission or
+    // clarify acceptance criteria. The gate records the intact failure class;
+    // the run only stops if the human path is declined or never resolves.
+    match classify_failure(error) {
+        FailureClass::Capability => {
+            return RetryAction::NeedsHuman {
+                class: FailureClass::Capability,
+            }
+        }
+        FailureClass::Specification => {
+            return RetryAction::NeedsHuman {
+                class: FailureClass::Specification,
+            }
+        }
+        _ => {}
+    }
     if attempt >= max_retries {
         return RetryAction::Stop(RetryStopReason::MaxRetries);
     }
@@ -1888,6 +2048,11 @@ fn next_retry_action(
         },
         RetryErrorClass::Contract => RetryAction::Stop(RetryStopReason::ContractExhausted),
         RetryErrorClass::Fatal => RetryAction::Stop(RetryStopReason::Fatal),
+        // Unreachable: capability/specification return NeedsHuman earlier, but
+        // the classifier projection still needs exhaustive arms here.
+        RetryErrorClass::Capability | RetryErrorClass::Specification => {
+            RetryAction::Stop(RetryStopReason::NeedsHuman)
+        }
     }
 }
 
@@ -1909,6 +2074,10 @@ fn format_retry_stop_error(
         ),
         Some(RetryStopReason::ContractExhausted) => format!(
             "{label} stopped after contract repair exhausted (attempt {attempts_used}/{}): {last_error}",
+            max_retries + 1
+        ),
+        Some(RetryStopReason::NeedsHuman) => format!(
+            "{label} armed a needs_human gate but no human unblocked it (attempt {attempts_used}/{}): {last_error}",
             max_retries + 1
         ),
         Some(RetryStopReason::Interrupted) => {
@@ -1933,6 +2102,7 @@ async fn specialist_with_retries(
     let mut effective_extra = extra_instruction.to_string();
     let mut stop_reason: Option<RetryStopReason> = None;
     let mut attempts_used: u32 = 0;
+    let mut retry_limit = node.data.max_retries;
     // Seed from any prior node output (e.g. previous revision) so plateau can compare
     // against last known artifact identity when the next attempt fails.
     let mut last_known_hash_set = context
@@ -1950,14 +2120,18 @@ async fn specialist_with_retries(
         .and_then(|candidate| candidate.data.output.clone())
         .unwrap_or_default();
 
-    for attempt in 0..=node.data.max_retries {
+    let mut attempt = 0_u32;
+    loop {
+        if attempt > retry_limit {
+            break;
+        }
         if context.stop.load(Ordering::SeqCst) {
             stop_reason = Some(RetryStopReason::Interrupted);
             break;
         }
 
         let fingerprint = attempt_fingerprint(&node.data.role, &mission, &effective_extra);
-        attempts_used = attempt + 1;
+        attempts_used = attempt.saturating_add(1);
 
         match specialist_once(context, node, attempt, revision, &effective_extra).await {
             // status=failure is returned as Ok so we can record artifact hash-sets for plateau.
@@ -1983,13 +2157,13 @@ async fn specialist_with_retries(
                 let action = next_retry_action(
                     &error,
                     attempt,
-                    node.data.max_retries,
+                    retry_limit,
                     &fingerprints,
                     &hash_sets,
                     contract_repair_used,
                     extra_instruction,
                 );
-                if apply_retry_action(
+                match apply_retry_action(
                     context,
                     node,
                     action,
@@ -2002,7 +2176,12 @@ async fn specialist_with_retries(
                 )
                 .await
                 {
-                    break;
+                    RetryActionOutcome::Stop => break,
+                    RetryActionOutcome::Retry => attempt = attempt.saturating_add(1),
+                    RetryActionOutcome::RetryAfterHuman => {
+                        retry_limit = retry_limit_after_human_approval(attempt, retry_limit);
+                        attempt = attempt.saturating_add(1);
+                    }
                 }
             }
             // Ok includes verification-failed success outputs — revision owns that path.
@@ -2023,13 +2202,13 @@ async fn specialist_with_retries(
                 let action = next_retry_action(
                     &error,
                     attempt,
-                    node.data.max_retries,
+                    retry_limit,
                     &fingerprints,
                     &hash_sets,
                     contract_repair_used,
                     extra_instruction,
                 );
-                if apply_retry_action(
+                match apply_retry_action(
                     context,
                     node,
                     action,
@@ -2042,21 +2221,48 @@ async fn specialist_with_retries(
                 )
                 .await
                 {
-                    break;
+                    RetryActionOutcome::Stop => break,
+                    RetryActionOutcome::Retry => attempt = attempt.saturating_add(1),
+                    RetryActionOutcome::RetryAfterHuman => {
+                        retry_limit = retry_limit_after_human_approval(attempt, retry_limit);
+                        attempt = attempt.saturating_add(1);
+                    }
                 }
             }
         }
     }
     Err(format_retry_stop_error(
         &node.data.label,
-        node.data.max_retries,
+        retry_limit,
         attempts_used,
         &last_error,
         stop_reason,
     ))
 }
 
-/// Apply a retry decision; returns true when the retry loop should break.
+fn revision_gate_state(
+    criteria: &[RuntimeCriterion],
+    output: &RuntimeOutput,
+    context: &RunContext,
+    hard_criteria_gate: bool,
+) -> (Option<RequiredCriteriaFailure>, Option<String>) {
+    let required_failure = if output.status == "needs_revision" {
+        None
+    } else {
+        required_criteria_failure(criteria, output, context, hard_criteria_gate)
+    };
+    let reason = if output.status == "needs_revision" {
+        Some(output.summary.clone())
+    } else {
+        required_failure
+            .as_ref()
+            .map(|failure| failure.message.clone())
+    };
+    (required_failure, reason)
+}
+
+/// Apply a retry decision and report whether the caller should stop, retry, or
+/// consume a human-approved recovery attempt beyond the configured limit.
 #[allow(clippy::too_many_arguments)]
 async fn apply_retry_action(
     context: &RunContext,
@@ -2068,7 +2274,7 @@ async fn apply_retry_action(
     contract_repair_used: &mut bool,
     effective_extra: &mut String,
     stop_reason: &mut Option<RetryStopReason>,
-) -> bool {
+) -> RetryActionOutcome {
     match action {
         RetryAction::Stop(reason) => {
             *stop_reason = Some(reason);
@@ -2076,6 +2282,12 @@ async fn apply_retry_action(
                 RetryStopReason::Plateau => "retry.plateau",
                 RetryStopReason::MaxRetries => "retry.exhausted",
                 _ => "retry.stopped",
+            };
+            // Plateau is a stop-level class; other stops keep their attempt class.
+            let failure_class = if reason == RetryStopReason::Plateau {
+                FailureClass::Plateau.as_str()
+            } else {
+                classify_failure(error).as_str()
             };
             emit_event(
                 context,
@@ -2091,10 +2303,11 @@ async fn apply_retry_action(
                     "attempt": attempt,
                     "error": error,
                     "reason": format!("{reason:?}"),
+                    "failureClass": failure_class,
                     "fingerprints": fingerprints,
                 }),
             );
-            true
+            RetryActionOutcome::Stop
         }
         RetryAction::RetryTransient { backoff_ms } => {
             emit_event(
@@ -2111,13 +2324,14 @@ async fn apply_retry_action(
                     "attempt": attempt,
                     "error": error,
                     "backoffMs": backoff_ms,
+                    "failureClass": FailureClass::Transient.as_str(),
                 }),
             );
             let _ = tauri::async_runtime::spawn_blocking(move || {
                 std::thread::sleep(Duration::from_millis(backoff_ms));
             })
             .await;
-            false
+            RetryActionOutcome::Retry
         }
         RetryAction::RetryContractRepair { new_extra } => {
             *contract_repair_used = true;
@@ -2132,9 +2346,79 @@ async fn apply_retry_action(
                     "{} contract/schema failure; one repair retry",
                     node.data.label
                 ),
-                json!({ "attempt": attempt, "error": error }),
+                json!({
+                    "attempt": attempt,
+                    "error": error,
+                    "failureClass": FailureClass::Contract.as_str(),
+                }),
             );
-            false
+            RetryActionOutcome::Retry
+        }
+        RetryAction::NeedsHuman { class } => {
+            let failure_class = class.as_str();
+            // Record the intact attempt class (capability | specification) on a
+            // node.attempt.failed-style event so analytics never lose the class
+            // to a plateau/fatal overwrite.
+            emit_event(
+                context,
+                "node.attempt.failed",
+                "warning",
+                Some(&node.id),
+                None,
+                format!(
+                    "{} needs human decision after {} failure: {error}",
+                    node.data.label, failure_class
+                ),
+                json!({
+                    "attempt": attempt,
+                    "error": error,
+                    "gate": "needs_human",
+                    "failureClass": failure_class,
+                    "strategy": "request authorization or route to a capable node / pause for human clarification",
+                }),
+            );
+            emit_event(
+                context,
+                "retry.needs_human",
+                "warning",
+                Some(&node.id),
+                None,
+                format!(
+                    "{} armed needs_human gate ({failure_class})",
+                    node.data.label
+                ),
+                json!({
+                    "attempt": attempt,
+                    "error": error,
+                    "failureClass": failure_class,
+                }),
+            );
+            let detail = match class {
+                FailureClass::Capability => format!(
+                    "{} hit a capability boundary (permission / unavailable tool). Retrying the same prompt will not grant access — grant authorization, route to a capable node, or approve to proceed anyway.",
+                    node.data.label
+                ),
+                FailureClass::Specification => format!(
+                    "{} hit a specification open question (ambiguous/incomplete acceptance criteria). Pausing for human clarification — clarify the criteria or approve to proceed anyway.",
+                    node.data.label
+                ),
+                _ => format!(
+                    "{} requires a human decision before continuing: {error}",
+                    node.data.label
+                ),
+            };
+            match await_operator_approval(context, node, "needs_human", &detail).await {
+                // Human unblocked the node → let the retry loop take another
+                // attempt with the same inputs (the data plane may have changed:
+                // permission granted, criteria clarified).
+                Ok(_) => RetryActionOutcome::RetryAfterHuman,
+                // Gate declined or timed out → stop with the intact class, but
+                // as a needs_human stop (never a silent fatal).
+                Err(_) => {
+                    *stop_reason = Some(RetryStopReason::NeedsHuman);
+                    RetryActionOutcome::Stop
+                }
+            }
         }
     }
 }
@@ -2154,16 +2438,12 @@ async fn execute_specialist_with_revision(
                 .as_ref()
                 .is_some_and(|data| data.edge_type == "revision")
     });
-    let mut reason = if output.status == "needs_revision" {
-        Some(output.summary.clone())
-    } else {
-        required_criteria_failure(
-            &node.data.completion_criteria,
-            &output,
-            context,
-            node.data.hard_criteria_gate,
-        )
-    };
+    let (mut required_failure, mut reason) = revision_gate_state(
+        &node.data.completion_criteria,
+        &output,
+        context,
+        node.data.hard_criteria_gate,
+    );
     let Some(edge) = revision_edge else {
         if let Some(reason) = reason {
             return Err(NodeExecutionFailure::owned(
@@ -2188,6 +2468,19 @@ async fn execute_specialist_with_revision(
         let Some(feedback) = reason.take() else {
             return Ok(output);
         };
+        // P3: each routing of a REQUIRED VERIFICATION failure persists an
+        // attempt record (failureClass:"verification" + failing criterion ids)
+        // so "verification → revision" loops are queryable, not re-parsed.
+        if let Some(required) = required_failure.take() {
+            record_verification_revision(
+                context,
+                &node.id,
+                &target.id,
+                revision,
+                &required.criterion_ids,
+                &required.message,
+            );
+        }
         emit_event(
             context,
             "revision.routed",
@@ -2226,16 +2519,18 @@ async fn execute_specialist_with_revision(
         .await
         .map_err(|error| NodeExecutionFailure::owned(&node.id, error))?;
         emit_advisory_failures(context, node, &output);
-        reason = if output.status == "needs_revision" {
-            Some(output.summary.clone())
-        } else {
-            required_criteria_failure(
-                &node.data.completion_criteria,
-                &output,
-                context,
-                node.data.hard_criteria_gate,
-            )
-        };
+        (required_failure, reason) = revision_gate_state(
+            &node.data.completion_criteria,
+            &output,
+            context,
+            node.data.hard_criteria_gate,
+        );
+        if reason.is_none() {
+            // A re-review is authoritative for the current revision. Do not
+            // fall through to the exhaustion error after the final allowed
+            // revision has actually passed every required host gate.
+            return Ok(output);
+        }
     }
     Err(NodeExecutionFailure::owned(
         &node.id,
@@ -2302,11 +2597,12 @@ async fn await_operator_approval(
         );
     }
     let stop = context.stop.clone();
+    let approval_timeout = operator_approval_timeout(gate, context.app.is_none());
     let wait_result = tauri::async_runtime::spawn_blocking(move || {
         wait_for_approval(
             &receiver,
             &stop,
-            Duration::from_secs(30 * 60),
+            approval_timeout,
             Duration::from_millis(250),
         )
     })
@@ -2435,6 +2731,41 @@ async fn approval_node(context: &RunContext, node: &RuntimeNode) -> Result<Runti
         turn_id: None,
         tokens: 0,
     })
+}
+
+/// Headless `needs_human` gate deadline (P1). In headless / CI there is no
+/// operator watching the broker, so a capability/specification gate must fail
+/// closed within a short configurable window instead of stalling a batch run
+/// for the interactive 30-minute default.
+const DEFAULT_NEEDS_HUMAN_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 30 * 60;
+
+/// Gate-scoped operator approval delay. `needs_human` uses the short headless
+/// window (`CODEX_CORP_NEEDS_HUMAN_TIMEOUT_SECS`, default 30s); interactive
+/// approval gates keep the long operator window.
+fn operator_approval_timeout(gate: &str, headless: bool) -> Duration {
+    if gate == "needs_human" && headless {
+        Duration::from_secs(parse_needs_human_timeout(
+            std::env::var("CODEX_CORP_NEEDS_HUMAN_TIMEOUT_SECS")
+                .ok()
+                .as_deref(),
+        ))
+    } else {
+        Duration::from_secs(DEFAULT_APPROVAL_TIMEOUT_SECS)
+    }
+}
+
+/// Parse `CODEX_CORP_NEEDS_HUMAN_TIMEOUT_SECS` (seconds). Unset/invalid → the
+/// conservative 30s default; values clamp to [1, 3600] so a batch run can
+/// never hang for an hour but always grants the gate at least 1s to resolve.
+fn parse_needs_human_timeout(raw: Option<&str>) -> u64 {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return DEFAULT_NEEDS_HUMAN_TIMEOUT_SECS;
+    };
+    match raw.parse::<u64>() {
+        Ok(secs) => secs.clamp(1, 3600),
+        Err(_) => DEFAULT_NEEDS_HUMAN_TIMEOUT_SECS,
+    }
 }
 
 fn wait_for_approval(
@@ -3076,7 +3407,7 @@ async fn run_worker(
                 Some(&node_id),
                 None,
                 format!("{node_id} terminally failed: {error}"),
-                json!({"status":"failed","error":error}),
+                json!({"status":"failed","error":error,"failureClass":classify_failure(&error).as_str()}),
             );
             terminal_error = Some(format!("node {node_id} terminally failed: {error}"));
             context.stop.store(true, Ordering::SeqCst);
@@ -3287,6 +3618,9 @@ async fn start_run_core(
         std::fs::create_dir_all(path).map_err(|error| error.to_string())?;
         if !path.is_dir() {
             return Err("Selected app workspace is not a folder".into());
+        }
+        if crate::is_app_managed_workspace(path) {
+            crate::prepare_greenfield_workspace(path, true)?;
         }
     }
     if target_workspace.is_none() && graph_has_enabled_host_io_criteria(&graph) {
@@ -3503,6 +3837,20 @@ pub(crate) fn get_run(
             },
         )
         .map_err(|_| "run not found".into())
+}
+
+/// Expose per-node verification→revision loop analytics for a run (P4).
+/// Same query surface as the MCP tool `analytics_verification_loops`.
+#[tauri::command]
+pub(crate) fn analytics_verification_loops(
+    run_id: String,
+    database: tauri::State<'_, Database>,
+) -> Result<Value, String> {
+    let connection = database
+        .0
+        .lock()
+        .map_err(|_| "database lock poisoned".to_string())?;
+    verification_loops_for_run(&connection, &run_id)
 }
 
 #[tauri::command]
@@ -3904,6 +4252,7 @@ mod tests {
                 base_instructions: String::new(),
                 developer_instructions: String::new(),
                 output: None,
+                user_test_feedback: Vec::new(),
                 completion_criteria: Vec::new(),
                 max_retries: 0,
                 approval_policy: default_approval(),
@@ -3968,6 +4317,7 @@ mod tests {
                 base_instructions: String::new(),
                 developer_instructions: String::new(),
                 output: None,
+                user_test_feedback: Vec::new(),
                 completion_criteria: Vec::new(),
                 max_retries: 0,
                 approval_policy: "never".into(),
@@ -4331,6 +4681,131 @@ mod tests {
     }
 
     #[test]
+    fn retry_class_projection_covers_capability_and_specification() {
+        assert_eq!(
+            classify_retry_error("workspace write denied: sandbox policy is read-only"),
+            RetryErrorClass::Capability
+        );
+        assert_eq!(
+            classify_retry_error(
+                "acceptance criteria are ambiguous; clarification needed before implementation"
+            ),
+            RetryErrorClass::Specification
+        );
+        assert_eq!(
+            classify_retry_error("criterion npm_test exited 1"),
+            RetryErrorClass::Fatal
+        );
+    }
+
+    #[test]
+    fn next_retry_action_capability_arms_needs_human_gate() {
+        assert_eq!(
+            next_retry_action(
+                "workspace write denied: sandbox policy is read-only",
+                0,
+                2,
+                &[],
+                &[],
+                false,
+                ""
+            ),
+            RetryAction::NeedsHuman {
+                class: FailureClass::Capability
+            }
+        );
+        // Even at the last attempt: gate instead of MaxRetries (P2).
+        assert_eq!(
+            next_retry_action(
+                "permission denied: not authorized for workspace.write",
+                2,
+                2,
+                &[],
+                &[],
+                false,
+                ""
+            ),
+            RetryAction::NeedsHuman {
+                class: FailureClass::Capability
+            }
+        );
+        // Plateau must NOT override a capability gate (same inputs are expected).
+        let empty = artifact_hash_set_key(&[]);
+        assert_eq!(
+            next_retry_action(
+                "workspace write denied: sandbox policy is read-only",
+                1,
+                2,
+                &["a".into(), "a".into()],
+                &[empty.clone(), empty],
+                false,
+                ""
+            ),
+            RetryAction::NeedsHuman {
+                class: FailureClass::Capability
+            }
+        );
+    }
+
+    #[test]
+    fn approved_needs_human_gate_grants_a_recovery_attempt_at_the_limit() {
+        // Attack vector: an approval arriving on the final configured attempt
+        // must not be discarded by the inclusive retry loop.
+        assert_eq!(retry_limit_after_human_approval(0, 0), 1);
+        assert_eq!(retry_limit_after_human_approval(2, 2), 3);
+        // Approval before the boundary does not inflate the retry budget.
+        assert_eq!(retry_limit_after_human_approval(1, 2), 2);
+        // Saturation must remain bounded for hostile configuration values.
+        assert_eq!(
+            retry_limit_after_human_approval(u32::MAX, u32::MAX),
+            u32::MAX
+        );
+    }
+
+    #[test]
+    fn next_retry_action_specification_arms_needs_human_gate() {
+        assert_eq!(
+            next_retry_action(
+                "acceptance criteria are ambiguous; clarification needed before implementation",
+                0,
+                2,
+                &[],
+                &[],
+                false,
+                ""
+            ),
+            RetryAction::NeedsHuman {
+                class: FailureClass::Specification
+            }
+        );
+    }
+
+    #[test]
+    fn format_retry_stop_error_needs_human_message() {
+        let message = format_retry_stop_error(
+            "Builder",
+            2,
+            1,
+            "workspace write denied",
+            Some(RetryStopReason::NeedsHuman),
+        );
+        assert!(message.contains("needs_human"), "{message}");
+        assert!(message.contains("no human unblocked"), "{message}");
+    }
+
+    #[test]
+    fn format_retry_stop_error_max_retries_message() {
+        let message = format_retry_stop_error(
+            "Builder",
+            2,
+            3,
+            "still broken",
+            Some(RetryStopReason::MaxRetries),
+        );
+        assert!(message.contains("exhausted 2 retries"), "{message}");
+    }
+
+    #[test]
     fn next_retry_action_plateau_for_non_transient_including_empty_sets() {
         // Transient still never plateaus even with identical empty sets.
         let empty = artifact_hash_set_key(&[]);
@@ -4599,7 +5074,7 @@ mod tests {
         let mut context = sample_run_context(None);
         context.graph = serde_json::from_value(json!({
             "nodes": [
-                {"id":"input","data":{"label":"Input","role":"Input","kind":"input","output":"mission"}},
+                {"id":"input","data":{"label":"Input","role":"Input","kind":"input","output":"mission","userTestFeedback":["save button is inert"]}},
                 {"id":"a","data":{"label":"A","role":"A","kind":"agent"}},
                 {"id":"unrelated","data":{"label":"Secret","role":"Secret","kind":"agent"}},
                 {"id":"review","data":{"label":"Review","role":"Review","kind":"agent"}},
@@ -4637,6 +5112,10 @@ mod tests {
         assert_eq!(
             composed["revisionFeedback"],
             json!([{"message":"fix this"}])
+        );
+        assert_eq!(
+            composed["operatorTestFeedback"],
+            json!(["save button is inert"])
         );
         assert!(!composed.to_string().contains("secret"));
     }
@@ -4739,6 +5218,7 @@ mod tests {
                 base_instructions: String::new(),
                 developer_instructions: String::new(),
                 output: None,
+                user_test_feedback: Vec::new(),
                 completion_criteria: criteria,
                 max_retries: 0,
                 approval_policy: default_approval(),
@@ -4872,6 +5352,289 @@ mod tests {
                 assert!(passed, "SSOT pass must not trigger required failure");
             }
         }
+    }
+
+    #[test]
+    fn a_passed_re_review_clears_the_revision_gate() {
+        let context = sample_run_context(None);
+        let criteria = vec![RuntimeCriterion {
+            id: "npm_test".into(),
+            label: "Unit tests".into(),
+            kind: "command".into(),
+            enabled: true,
+            platform: false,
+            enforcement: "required".into(),
+            instruction: None,
+            template_id: Some("npm_test".into()),
+            artifact_name: None,
+            artifact_path: None,
+            policy_id: None,
+        }];
+        let output = sample_output(
+            "success",
+            "QA passed after the builder revision.",
+            json!({
+                "verification": {
+                    "results": [{
+                        "id": "npm_test",
+                        "passed": true,
+                        "detail": "npm_test exited 0"
+                    }]
+                }
+            }),
+        );
+
+        let (failure, reason) = revision_gate_state(&criteria, &output, &context, false);
+
+        assert!(failure.is_none(), "a passed host row must clear the gate");
+        assert!(reason.is_none(), "a passed re-review must stop the loop");
+    }
+
+    #[test]
+    fn a_failed_re_review_keeps_the_revision_gate_open() {
+        let context = sample_run_context(None);
+        let criteria = vec![RuntimeCriterion {
+            id: "npm_test".into(),
+            label: "Unit tests".into(),
+            kind: "command".into(),
+            enabled: true,
+            platform: false,
+            enforcement: "required".into(),
+            instruction: None,
+            template_id: Some("npm_test".into()),
+            artifact_name: None,
+            artifact_path: None,
+            policy_id: None,
+        }];
+        let output = sample_output(
+            "success",
+            "QA completed with a host failure.",
+            json!({
+                "verification": {
+                    "results": [{
+                        "id": "npm_test",
+                        "passed": false,
+                        "detail": "npm_test exited 1"
+                    }]
+                }
+            }),
+        );
+
+        let (failure, reason) = revision_gate_state(&criteria, &output, &context, false);
+
+        assert!(failure.is_some(), "a failed host row must remain blocking");
+        assert!(
+            reason.is_some(),
+            "the blocking detail must route to revision"
+        );
+    }
+
+    #[test]
+    fn needs_revision_output_stays_revision_owned_without_fabricating_a_host_failure() {
+        let context = sample_run_context(None);
+        let output = sample_output(
+            "needs_revision",
+            "The cart count still disagrees with rendered lines.",
+            json!({}),
+        );
+
+        let (failure, reason) = revision_gate_state(&[], &output, &context, false);
+
+        assert!(failure.is_none());
+        assert_eq!(
+            reason.as_deref(),
+            Some("The cart count still disagrees with rendered lines.")
+        );
+    }
+
+    #[test]
+    fn verification_revision_routes_persist_attempt_records() {
+        // P3: each required-verification revision routing writes a node_attempts
+        // record carrying failureClass:"verification" + failing criterion ids,
+        // queryable via count_verification_revisions without re-parsing delivery.
+        let context = sample_run_context(None);
+        {
+            let connection = context.database.0.lock().unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE node_attempts (
+                        id TEXT PRIMARY KEY,
+                        run_id TEXT NOT NULL,
+                        node_id TEXT NOT NULL,
+                        attempt INTEGER NOT NULL,
+                        revision INTEGER NOT NULL DEFAULT 0,
+                        status TEXT NOT NULL,
+                        thread_id TEXT,
+                        turn_id TEXT,
+                        diagnostics_json TEXT NOT NULL DEFAULT '{}',
+                        started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        completed_at TEXT
+                    );",
+                )
+                .unwrap();
+        }
+        record_verification_revision(
+            &context,
+            "reviewer",
+            "builder",
+            1,
+            &["cmd-1".into()],
+            "required completion criterion failed: Unit tests — npm_test exited 1",
+        );
+        record_verification_revision(
+            &context,
+            "reviewer",
+            "builder",
+            2,
+            &["cmd-1".into(), "arch-1".into()],
+            "still failing",
+        );
+        record_verification_revision(&context, "other-reviewer", "builder", 1, &["x".into()], "x");
+        {
+            let connection = context.database.0.lock().unwrap();
+            assert_eq!(
+                count_verification_revisions(&connection, "run-test", "reviewer").unwrap(),
+                2
+            );
+            assert_eq!(
+                count_verification_revisions(&connection, "run-test", "other-reviewer").unwrap(),
+                1
+            );
+            assert_eq!(
+                count_verification_revisions(&connection, "run-test", "builder").unwrap(),
+                0
+            );
+            // Failing criterion ids preserved intact and queryable.
+            let with_cmd: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM node_attempts
+                     WHERE run_id='run-test' AND node_id='reviewer'
+                       AND json_extract(diagnostics_json,'$.failureClass')='verification'
+                       AND json_extract(diagnostics_json,'$.criterionIds[0]')='cmd-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(with_cmd, 2);
+            let second_criterion: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM node_attempts
+                     WHERE run_id='run-test'
+                       AND json_extract(diagnostics_json,'$.criterionIds[1]')='arch-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(second_criterion, 1);
+            // routedTo persisted for loop analytics.
+            let routed: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM node_attempts
+                     WHERE run_id='run-test' AND node_id='reviewer'
+                       AND json_extract(diagnostics_json,'$.routedTo')='builder'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(routed, 2);
+        }
+    }
+
+    #[test]
+    fn verification_loops_for_run_aggregates_per_node() {
+        // P4: the analytics query surface must group per node and preserve the
+        // failing criterion ids (deduped) exactly like the inspector chip uses.
+        let context = sample_run_context(None);
+        {
+            let connection = context.database.0.lock().unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE node_attempts (
+                        id TEXT PRIMARY KEY,
+                        run_id TEXT NOT NULL,
+                        node_id TEXT NOT NULL,
+                        attempt INTEGER NOT NULL,
+                        revision INTEGER NOT NULL DEFAULT 0,
+                        status TEXT NOT NULL,
+                        thread_id TEXT,
+                        turn_id TEXT,
+                        diagnostics_json TEXT NOT NULL DEFAULT '{}',
+                        started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        completed_at TEXT
+                    );",
+                )
+                .unwrap();
+        }
+        record_verification_revision(
+            &context,
+            "reviewer",
+            "producer",
+            1,
+            &["cmd-1".into(), "arch-1".into()],
+            "required completion criterion failed: Unit tests — npm_test exited 1",
+        );
+        record_verification_revision(
+            &context,
+            "reviewer",
+            "producer",
+            2,
+            &["cmd-1".into()],
+            "still failing",
+        );
+        record_verification_revision(&context, "qa", "producer", 1, &["hidden-1".into()], "nope");
+        // A non-verification attempt must not count toward loop analytics.
+        {
+            let connection = context.database.0.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO node_attempts(id,run_id,node_id,attempt,revision,status,diagnostics_json)
+                     VALUES('x1','run-test','reviewer',0,0,'failed',
+                            '{\"failureClass\":\"capability\",\"summary\":\"denied\"}')",
+                    [],
+                )
+                .unwrap();
+            // Attack vector: a forged failureClass without the verification gate
+            // must not be promoted into a verification loop.
+            connection
+                .execute(
+                    "INSERT INTO node_attempts(id,run_id,node_id,attempt,revision,status,diagnostics_json)
+                     VALUES('x2','run-test','spoofed',0,0,'failed',
+                            '{\"failureClass\":\"verification\",\"summary\":\"npm test exited 1\"}')",
+                    [],
+                )
+                .unwrap();
+        }
+        let connection = context.database.0.lock().unwrap();
+        let value = verification_loops_for_run(&connection, "run-test").unwrap();
+        assert_eq!(value["runId"], "run-test");
+        let nodes = value["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 2, "capability row must be excluded: {value}");
+        let reviewer = nodes
+            .iter()
+            .find(|node| node["nodeId"] == "reviewer")
+            .expect("reviewer present");
+        assert_eq!(reviewer["verificationRevisions"], 2);
+        let ids: Vec<&str> = reviewer["criterionIds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["arch-1", "cmd-1"],
+            "criterion ids deduped + sorted"
+        );
+        let qa = nodes
+            .iter()
+            .find(|node| node["nodeId"] == "qa")
+            .expect("qa present");
+        assert_eq!(qa["verificationRevisions"], 1);
+        assert_eq!(
+            qa["criterionIds"][0].as_str(),
+            Some("hidden-1"),
+            "per-node criterion ids ride the record"
+        );
     }
 
     #[test]
@@ -5091,6 +5854,97 @@ mod tests {
             Duration::from_millis(10),
         )
         .unwrap());
+    }
+
+    #[test]
+    fn approval_wait_times_out_without_an_operator() {
+        let (_sender, receiver) = mpsc::channel();
+        let stop = AtomicBool::new(false);
+        let started = Instant::now();
+        let result = wait_for_approval(
+            &receiver,
+            &stop,
+            Duration::from_millis(150),
+            Duration::from_millis(10),
+        );
+        assert_eq!(result.unwrap_err(), "operator approval timed out");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn needs_human_timeout_parses_defaults_clamps_per_gate() {
+        assert_eq!(parse_needs_human_timeout(None), 30);
+        assert_eq!(parse_needs_human_timeout(Some("")), 30);
+        assert_eq!(parse_needs_human_timeout(Some("nonsense")), 30);
+        assert_eq!(parse_needs_human_timeout(Some("0")), 1);
+        assert_eq!(parse_needs_human_timeout(Some("999999")), 3600);
+        assert_eq!(parse_needs_human_timeout(Some("5")), 5);
+        // Headless needs_human resolves fail-closed within the short window by
+        // default, while the desktop gate keeps the interactive timeout.
+        let needs_human = operator_approval_timeout("needs_human", true).as_secs();
+        assert!(
+            (1..=30).contains(&needs_human),
+            "needs_human must default <=30s, was {needs_human}s"
+        );
+        assert_eq!(
+            operator_approval_timeout("needs_human", false).as_secs(),
+            30 * 60
+        );
+        // Other approval gates keep the long operator window in both modes.
+        assert_eq!(
+            operator_approval_timeout("approval", true).as_secs(),
+            30 * 60
+        );
+        assert_eq!(
+            operator_approval_timeout("post-node-approval", false).as_secs(),
+            30 * 60
+        );
+    }
+
+    #[test]
+    fn needs_human_gate_declines_fast_and_stays_resolvable() {
+        let context = sample_run_context(None);
+        let graph: RuntimeGraph = serde_json::from_value(json!({
+            "nodes": [{"id":"builder","data":{"label":"Builder","role":"Builder","kind":"agent"}}],
+            "edges": []
+        }))
+        .unwrap();
+        let node = graph.nodes[0].clone();
+
+        let span_context = context.clone();
+        let span = std::thread::spawn(move || {
+            tauri::async_runtime::block_on(await_operator_approval(
+                &span_context,
+                &node,
+                "needs_human",
+                "capability boundary hit",
+            ))
+        });
+
+        // Poll the broker until the gate arms, then decline it as an operator would.
+        let mut sender = None;
+        let request_id = "run-test::builder::needs_human";
+        for _ in 0..100 {
+            sender = context.run_approvals.0.lock().unwrap().remove(request_id);
+            if sender.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let sender = sender.expect("needs_human gate must arm in the broker");
+        sender.send(false).unwrap();
+
+        let started = Instant::now();
+        let result = span.join().unwrap();
+        assert!(result.is_err(), "decline must fail the gate");
+        assert!(
+            result.unwrap_err().contains("declined"),
+            "gate decline should surface as decline, not hang"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "declined gate must resolve fast, not wait the full window"
+        );
     }
 
     #[test]

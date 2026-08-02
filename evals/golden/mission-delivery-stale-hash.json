@@ -1,0 +1,53 @@
+{
+  "id": "mission-delivery-stale-hash",
+  "runMode": "mission",
+  "mission": {
+    "text": "Release a bundle, but a post-approval agent adds an unfrozen artifact.",
+    "builderRole": "Frontend Engineer",
+    "builderCriteria": [
+      {
+        "id": "structured-1",
+        "label": "Structured output valid",
+        "kind": "structured_json",
+        "enforcement": "required"
+      }
+    ],
+    "postApprovalAgent": {
+      "completionCriteria": [
+        {
+          "id": "structured-2",
+          "label": "Structured output valid",
+          "kind": "structured_json",
+          "enforcement": "required"
+        }
+      ]
+    }
+  },
+  "scriptedOutputs": [
+    {
+      "status": "success",
+      "summary": "Built the approved release artifacts.",
+      "data": { "filesWritten": ["src/App.jsx"] },
+      "artifacts": [
+        { "id": "app", "name": "App.jsx", "content": "export default () => null;" }
+      ]
+    },
+    {
+      "status": "success",
+      "summary": "Added an extra artifact after approval.",
+      "data": { "filesWritten": ["extra.ts"] },
+      "artifacts": [
+        { "id": "extra", "name": "extra.ts", "content": "export const extra = 1;" }
+      ]
+    }
+  ],
+  "expect": {
+    "runStatus": "failed",
+    "delivery": {
+      "bundleHash": "absent",
+      "verification": "absent"
+    },
+    "terminalReasonContains": "pair-compare",
+    "reason": "the approval node freezes the artifact snapshot before the enhancement agent runs; the live release set then gains an unfrozen key, so the delivery pair-compare gate fails closed and the terminal reason names pair-compare"
+  }
+}

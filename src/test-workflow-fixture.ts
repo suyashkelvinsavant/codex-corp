@@ -37,7 +37,7 @@ function node(id: string, kind: Kind, label: string, index: number): FlowNode {
       label,
       role,
       kind,
-      status: kind === "input" ? "completed" : "idle",
+      status: "idle",
       model: kind === "agent" || kind === "creative" ? "" : "Control",
       effort: "low",
       tools: kind === "agent" || kind === "creative" ? quality.tools : [],
@@ -51,6 +51,7 @@ function node(id: string, kind: Kind, label: string, index: number): FlowNode {
       tokens: 0,
       trace: ["Test fixture"],
       color: "#55d6be",
+      missionSource: kind === "input" ? "template" : undefined,
       completionCriteria:
         kind === "agent" || kind === "creative"
           ? defaultPlatformCriteria()

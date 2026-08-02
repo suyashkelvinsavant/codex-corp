@@ -1,0 +1,33 @@
+{
+  "id": "architecture-wrong-layer-unanticipated",
+  "criterion": {
+    "id": "arch-2",
+    "kind": "architecture_policy",
+    "enforcement": "required",
+    "policyId": "native_runtime_ownership_v2"
+  },
+  "workspaceSignals": {
+    "policyId": "native_runtime_ownership_v2",
+    "nativeMarkers": ["src-tauri/src/workflow_runtime.rs"],
+    "files": [
+      {
+        "path": "src-tauri/src/workflow_runtime.rs",
+        "content": "// native runtime owner marker"
+      },
+      {
+        "path": "src/scheduler/job_runner.ts",
+        "content": "export function start() {\n  const queue: Job[] = [];\n  setInterval(() => { retryFailed(queue); }, 5000);\n}"
+      }
+    ]
+  },
+  "producerOutput": {
+    "status": "success",
+    "summary": "Runtime scheduling now lives in TypeScript under src/scheduler",
+    "data": { "criteria": [{ "id": "arch-2", "passed": true }] }
+  },
+  "expect": {
+    "requiredFailed": true,
+    "failureClass": "verification",
+    "reason": "native_runtime_ownership_v1 only matches known suspect globs (src/scheduler/job_runner.ts is unanticipated); v2 catches it by shape — path infix + retry/tick/schedule control flow — so the wrong-layer scheduler fails even with an unanticipated name."
+  }
+}
