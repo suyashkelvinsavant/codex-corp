@@ -179,7 +179,7 @@ describe("persistence helpers", () => {
     );
   });
 
-  it("repairs the affected v2 Software Company policy without overriding a current explicit choice", () => {
+  it("repairs the affected Software Company policy across v2 and v4 saved snapshots", () => {
     const softwareNodes = [
       node("input", "input"),
       node("pm"),
@@ -192,7 +192,7 @@ describe("persistence helpers", () => {
     for (const specialist of softwareNodes.filter(
       (item) => item.data.kind === "agent",
     )) {
-      specialist.data.approvalPolicy = "never";
+      specialist.data.approvalPolicy = "on-request";
       specialist.data.sandboxProfile = "workspace-write";
       specialist.data.workspacePolicy = "workflow";
     }
@@ -247,30 +247,80 @@ describe("persistence helpers", () => {
         data: { edgeType: "revision" as const, maxRevisions: 2 },
       },
     ];
-    const migrated = parseWorkflowSnapshot(
-      JSON.stringify({ schemaVersion: 2, nodes: softwareNodes, edges }),
-    );
-    expect(
-      migrated?.nodes
-        .filter((item) => item.data.kind === "agent")
-        .every((item) => item.data.approvalPolicy === "on-request"),
-    ).toBe(true);
-    expect(migrated?.migrationNotices).toContain(
-      "Restored on-request approvals for the affected Software Company workflow so dependency setup can request permission.",
-    );
+    for (const sourceVersion of [2, WORKFLOW_SCHEMA_VERSION]) {
+      const migrated = parseWorkflowSnapshot(
+        JSON.stringify({
+          schemaVersion: sourceVersion,
+          nodes: softwareNodes,
+          edges,
+        }),
+      );
+      const migratedBuilder = migrated?.nodes.find(
+        (item) => item.id === "builder",
+      );
+      const migratedOthers = migrated?.nodes.filter(
+        (item) => item.data.kind === "agent" && item.id !== "builder",
+      );
+      expect(migratedBuilder?.data.packId).toBe("builder");
+      expect(migratedBuilder?.data.approvalPolicy).toBe("never");
+      expect(migratedBuilder?.data.sandboxProfile).toBe("danger-full-access");
+      expect(
+        migratedBuilder?.data.developerInstructions,
+      ).toMatch(
+        /do not ask for human approval|do not request human permission/i,
+      );
+      expect(
+        migratedOthers?.every(
+          (item) => item.data.approvalPolicy === "on-request",
+        ),
+      ).toBe(true);
+      expect(
+        migratedOthers?.every(
+          (item) => item.data.sandboxProfile === "workspace-write",
+        ),
+      ).toBe(true);
+      expect(migrated?.migrationNotices).toContain(
+        "Upgraded the Software Company builder to autonomous build/test/package-install permissions and kept other specialists on-request.",
+      );
+    }
 
+    // A current snapshot that already uses the new builder pack and autonomy
+    // values must not be overwritten.
+    const currentNodes: FlowNode[] = JSON.parse(
+      JSON.stringify(softwareNodes),
+    );
+    const currentBuilderData = currentNodes.find(
+      (item) => item.id === "builder",
+    )!.data;
+    currentBuilderData.packId = "builder";
+    currentBuilderData.approvalPolicy = "never";
+    currentBuilderData.sandboxProfile = "danger-full-access";
+    currentBuilderData.tools = [
+      "Workspace read",
+      "Workspace write",
+      "Shell",
+      "Apply patch",
+      "Network",
+      "Build",
+      "Test",
+      "Package install",
+    ];
     const current = parseWorkflowSnapshot(
       JSON.stringify({
         schemaVersion: WORKFLOW_SCHEMA_VERSION,
-        nodes: softwareNodes,
+        nodes: currentNodes,
         edges,
       }),
     );
-    expect(
-      current?.nodes
-        .filter((item) => item.data.kind === "agent")
-        .every((item) => item.data.approvalPolicy === "never"),
-    ).toBe(true);
+    const currentBuilder = current?.nodes.find(
+      (item) => item.id === "builder",
+    );
+    expect(currentBuilder?.data.packId).toBe("builder");
+    expect(currentBuilder?.data.approvalPolicy).toBe("never");
+    expect(currentBuilder?.data.sandboxProfile).toBe("danger-full-access");
+    expect(current?.migrationNotices ?? []).not.toContain(
+      "Upgraded the Software Company builder to autonomous build/test/package-install permissions and kept other specialists on-request.",
+    );
   });
 
   it("repairs persisted role skill hints without dropping explicit connector selections", () => {

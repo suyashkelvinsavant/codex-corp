@@ -87,9 +87,13 @@ export function normalizeWorkflowSnapshot(
   const migrationNotices: string[] = [];
   let removedPackSkillHints = false;
   let repairedMissionStatus = false;
-  const affectedSoftwareCompanyPolicy =
-    sourceVersion === 2 &&
-    isAffectedSoftwareCompanyPolicy(snapshot.nodes, snapshot.edges);
+  // Detect the pre-autonomy Software Company template regardless of schema
+  // version, so v3/v4 saved snapshots created before the builder pack split are
+  // also upgraded to the autonomous builder.
+  const affectedSoftwareCompanyPolicy = isAffectedSoftwareCompanyPolicy(
+    snapshot.nodes,
+    snapshot.edges,
+  );
   const hasLegacyDeliveryControl =
     sourceVersion < 4 && snapshot.nodes.some(isLegacyDeliveryControl);
   if (resetLegacyApproval) {
@@ -104,7 +108,7 @@ export function normalizeWorkflowSnapshot(
   }
   if (affectedSoftwareCompanyPolicy) {
     migrationNotices.push(
-      "Restored on-request approvals for the affected Software Company workflow so dependency setup can request permission.",
+      "Upgraded the Software Company builder to autonomous build/test/package-install permissions and kept other specialists on-request.",
     );
   }
   if (hasLegacyDeliveryControl) {
@@ -120,6 +124,7 @@ export function normalizeWorkflowSnapshot(
       maxRevisions: _maxRevisions,
       ...data
     } = legacy;
+    const packForNode = data.packId ? getPack(data.packId) : undefined;
     return {
       ...node,
       data: {
@@ -155,13 +160,42 @@ export function normalizeWorkflowSnapshot(
             })()
           : {}),
         workspacePolicy:
-          legacy.workspacePolicy === "workflow" ? "workflow" : "isolated",
+          legacy.workspacePolicy === "workflow" ||
+          legacy.workspacePolicy === "isolated"
+            ? legacy.workspacePolicy
+            : packForNode?.workspacePolicy ?? "isolated",
         // Before schema v2 this flag was decorative. Do not silently turn an
         // old saved graph into a blocking post-node approval workflow.
         ...(isPreApprovalGateSnapshot ? { requiresApproval: false } : {}),
         ...(affectedSoftwareCompanyPolicy &&
         (data.kind === "agent" || data.kind === "creative")
-          ? { approvalPolicy: "on-request" as const }
+          ? node.id === "builder"
+            ? (() => {
+                const builderPack = getPack("builder");
+                return builderPack
+                  ? {
+                      packId: "builder" as const,
+                      packVersion: builderPack.version,
+                      tools: [...builderPack.tools],
+                      skillHints: [...builderPack.skillHints],
+                      baseInstructions: builderPack.baseInstructions,
+                      developerInstructions: builderPack.developerInstructions,
+                      prompt: builderPack.developerInstructions,
+                      description: builderPack.description,
+                      sandboxProfile: "danger-full-access" as const,
+                      approvalPolicy: "never" as const,
+                      workspacePolicy: "workflow" as const,
+                    }
+                  : {
+                      sandboxProfile: "danger-full-access" as const,
+                      approvalPolicy: "never" as const,
+                      workspacePolicy: "workflow" as const,
+                    };
+              })()
+            : {
+                approvalPolicy: "on-request" as const,
+                sandboxProfile: "workspace-write" as const,
+              }
           : {}),
       },
     } as FlowNode;
@@ -216,7 +250,7 @@ function isAffectedSoftwareCompanyPolicy(
     !specialists.every(
       (node) =>
         node.data.packId === expectedPacks.get(node.id) &&
-        node.data.approvalPolicy === "never" &&
+        node.data.approvalPolicy === "on-request" &&
         node.data.sandboxProfile === "workspace-write" &&
         node.data.workspacePolicy === "workflow",
     )

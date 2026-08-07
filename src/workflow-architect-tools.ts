@@ -3,7 +3,7 @@ import { defaultPlatformCriteria } from "./completion-criteria";
 import { DEFAULT_NODE_EFFORT, DEFAULT_NODE_MODEL_ID } from "./codex-models";
 import { validateWorkflow } from "./graph";
 import { kindPopColor } from "./kind-colors";
-import type { FlowEdge, FlowNode, Kind } from "./model";
+import type { AgentData, FlowEdge, FlowNode, Kind } from "./model";
 import { isSpecialistKind } from "./model";
 import {
   bumpWorkflowVersion,
@@ -14,8 +14,10 @@ import {
 import {
   ensureSpecialistQuality,
   isWeakSpecialistPrompt,
+  type EnsuredSpecialistFields,
 } from "./specialist-defaults";
 import { latestArchitectDashboardDigestPersisted } from "./dashboard-finance";
+import { listNodeExperience, formatExperienceDigest } from "./node-experience";
 import type {
   DynamicToolSpecJson,
   ToolExecResult,
@@ -32,7 +34,7 @@ You are responsible for every agent and creative node working at its best. For e
 - Set a clear role label and description so operators understand the node.
 - Prefer ≥120 characters of substantive prompt text; validation rejects weak placeholders.
 
-If a DASHBOARD_FEEDBACK digest is present in context, use it to prefer lower-burn graphs, tighten high-cost specialists, and align designs with profitable workflows.
+If a DASHBOARD_FEEDBACK digest is present in context, use it to prefer lower-burn graphs, tighten high-cost specialists, and align designs with profitable workflows. Before creating or patching a specialist node, call workflow_node_experience to ground the change in that node's historical run outcomes (recurring failure classes, token burn, latency).
 
 You have CRUD access to unlocked workflows. A locked workflow is programmatically read-only: never attempt to update, patch, repair, add/remove nodes or edges, or delete it. You may inspect, validate, open, or duplicate a locked workflow and edit the duplicate. If the operator insists on changing the original, ask them to disable its Byte lock in the workflow editor; never ask for or claim an override. For destructive deletion, explain the target and ask for explicit confirmation first. Prefer focused specialist nodes with precise prompts, least-privilege tools/skills, typed handoffs, human gates for irreversible actions, and a final output node. After every mutation sequence, call workflow_validate. Do not describe a workflow as ready while validation errors remain. Summarize exactly what changed and flag remaining risks. Do not run company workflows or implement product code.`;
 
@@ -91,6 +93,24 @@ export function workflowArchitectDynamicTools(): DynamicToolSpecJson[] {
         },
         ["path", "operator", "trueBranch", "falseBranch"],
       ),
+      sandboxProfile: {
+        type: "string",
+        enum: ["read-only", "workspace-write", "danger-full-access"],
+        description:
+          "Codex sandbox profile. Builder/ops roles that run builds, tests, or package installs need danger-full-access.",
+      },
+      approvalPolicy: {
+        type: "string",
+        enum: ["on-request", "untrusted", "never"],
+        description:
+          "When Codex must ask for human approval. Use 'never' only for trusted autonomous build/ops roles.",
+      },
+      workspacePolicy: {
+        type: "string",
+        enum: ["isolated", "workflow"],
+        description:
+          "Whether the node runs in an isolated per-node directory or the shared workflow workspace.",
+      },
     },
     ["id", "label", "role", "kind"],
   );
@@ -123,7 +143,7 @@ export function workflowArchitectDynamicTools(): DynamicToolSpecJson[] {
       type: "function",
       name: "workflow_create",
       description:
-        "Create a complete workflow graph. Nodes are specialist/control definitions; edges connect node ids.",
+        "Create a complete workflow graph. Nodes are specialist/control definitions that may also declare sandbox, approval, and workspace policies; edges connect node ids.",
       inputSchema: object(
         {
           id: { type: "string", description: "Stable kebab-case id" },
@@ -194,7 +214,7 @@ export function workflowArchitectDynamicTools(): DynamicToolSpecJson[] {
       type: "function",
       name: "workflow_patch_node",
       description:
-        "Safely change one node's prompt, role, kind, tools, skills, model, effort, approval requirement, or description without replacing the rest of the graph.",
+        "Safely change one node's prompt, role, kind, tools, skills, model, effort, approval requirement, sandbox/approval/workspace policy, or description without replacing the rest of the graph.",
       inputSchema: object(
         {
           id: { type: "string" },
@@ -220,6 +240,24 @@ export function workflowArchitectDynamicTools(): DynamicToolSpecJson[] {
             model: { type: "string" },
             effort: { type: "string" },
             requiresApproval: { type: "boolean" },
+            sandboxProfile: {
+              type: "string",
+              enum: ["read-only", "workspace-write", "danger-full-access"],
+              description:
+                "Codex sandbox profile. Builder/ops roles that run builds, tests, or package installs need danger-full-access.",
+            },
+            approvalPolicy: {
+              type: "string",
+              enum: ["on-request", "untrusted", "never"],
+              description:
+                "When Codex must ask for human approval. Use 'never' only for trusted autonomous build/ops roles.",
+            },
+            workspacePolicy: {
+              type: "string",
+              enum: ["isolated", "workflow"],
+              description:
+                "Whether the node runs in an isolated per-node directory or the shared workflow workspace.",
+            },
           }),
         },
         ["id", "nodeId", "patch"],
@@ -228,7 +266,8 @@ export function workflowArchitectDynamicTools(): DynamicToolSpecJson[] {
     {
       type: "function",
       name: "workflow_add_node",
-      description: "Add one configured node to an existing workflow.",
+      description:
+        "Add one configured node to an existing workflow. You may set sandbox, approval, and workspace policies.",
       inputSchema: object({ id: { type: "string" }, node: nodeSchema }, [
         "id",
         "node",
@@ -272,6 +311,19 @@ export function workflowArchitectDynamicTools(): DynamicToolSpecJson[] {
       description: "Open a workflow in the visual graph editor.",
       inputSchema: object({ id: { type: "string" } }, ["id"]),
     },
+    {
+      type: "function",
+      name: "workflow_node_experience",
+      description:
+        "Durable run experience for a node pattern in this workflow (success/failure outcomes, recurring failure classes, tokens, latency). Use before creating or patching a specialist node so the prompt, tools, and skills can be grounded in past performance.",
+      inputSchema: object(
+        {
+          id: { type: "string" },
+          nodeId: { type: "string" },
+        },
+        ["id", "nodeId"],
+      ),
+    },
   ];
 }
 
@@ -282,6 +334,31 @@ function slug(value: unknown) {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-|-$/g, "");
 }
+
+/** Merge a specialist node's data with the pack defaults from `ensureSpecialistQuality`.
+ *  This keeps the pack policy ownership in one place and prevents UI/Architect
+ *  creation paths from dropping `sandboxProfile`, `approvalPolicy`, or `workspacePolicy`.
+ */
+function applySpecialistQuality(
+  data: AgentData,
+  quality: EnsuredSpecialistFields,
+): AgentData {
+  return {
+    ...data,
+    packId: quality.packId,
+    packVersion: quality.packVersion,
+    baseInstructions: quality.baseInstructions,
+    developerInstructions: quality.developerInstructions,
+    prompt: quality.prompt,
+    tools: quality.tools,
+    skills: quality.skills,
+    description: quality.description,
+    sandboxProfile: quality.sandboxProfile,
+    approvalPolicy: quality.approvalPolicy,
+    workspacePolicy: quality.workspacePolicy ?? "workflow",
+  };
+}
+
 function makeNodes(rawNodes: any[]): FlowNode[] {
   return rawNodes.map((raw, index) => {
     if (raw?.data?.kind && raw?.position) {
@@ -291,18 +368,19 @@ function makeNodes(rawNodes: any[]): FlowNode[] {
           kind: cloned.data.kind,
           role: cloned.data.role,
           label: cloned.data.label,
+          packId: cloned.data.packId,
+          packVersion: cloned.data.packVersion,
+          baseInstructions: cloned.data.baseInstructions,
+          developerInstructions: cloned.data.developerInstructions,
           prompt: cloned.data.prompt,
           tools: cloned.data.tools,
           skills: cloned.data.skills,
           description: cloned.data.description,
+          sandboxProfile: cloned.data.sandboxProfile,
+          approvalPolicy: cloned.data.approvalPolicy,
+          workspacePolicy: cloned.data.workspacePolicy,
         });
-        cloned.data = {
-          ...cloned.data,
-          prompt: quality.prompt,
-          tools: quality.tools,
-          skills: quality.skills,
-          description: quality.description,
-        };
+        cloned.data = applySpecialistQuality(cloned.data, quality);
       }
       return cloned;
     }
@@ -327,11 +405,52 @@ function makeNodes(rawNodes: any[]): FlowNode[] {
       kind,
       role,
       label,
+      packId: raw.packId,
+      packVersion: raw.packVersion,
+      baseInstructions: raw.baseInstructions,
+      developerInstructions: raw.developerInstructions,
       prompt: raw.prompt || "",
       tools: raw.tools || [],
       skills: raw.skills || [],
       description: raw.description || "",
+      sandboxProfile: raw.sandboxProfile,
+      approvalPolicy: raw.approvalPolicy,
+      workspacePolicy: raw.workspacePolicy,
     });
+
+    const baseData: AgentData = {
+      label,
+      role,
+      kind,
+      status: kind === "input" ? "completed" : "idle",
+      model: raw.model || (isSpecialistKind(kind) ? DEFAULT_NODE_MODEL_ID : ""),
+      effort:
+        raw.effort || (isSpecialistKind(kind) ? DEFAULT_NODE_EFFORT : "low"),
+      tools: raw.tools || [],
+      skills: raw.skills || [],
+      prompt: raw.prompt || "",
+      description: raw.description || "",
+      inputSchema: raw.inputSchema,
+      outputSchema: raw.outputSchema,
+      conditionRule: raw.conditionRule,
+      cronExpression: raw.cronExpression,
+      cronTimezone: raw.cronTimezone,
+      cronEnabled: raw.cronEnabled,
+      duration: "—",
+      tokens: 0,
+      trace: ["Configured by Byte"],
+      requiresApproval: Boolean(raw.requiresApproval),
+      completionCriteria:
+        kind === "agent" || kind === "creative"
+          ? defaultPlatformCriteria()
+          : undefined,
+      color: kindPopColor(kind),
+    };
+
+    const data = isSpecialistKind(kind)
+      ? applySpecialistQuality(baseData, quality)
+      : baseData;
+
     return {
       id: slug(raw.id) || `node-${index + 1}`,
       type: "corpNode",
@@ -339,37 +458,7 @@ function makeNodes(rawNodes: any[]): FlowNode[] {
         x: 80 + (index % 4) * 310,
         y: 120 + Math.floor(index / 4) * 230,
       },
-      data: {
-        label,
-        role,
-        kind,
-        status: kind === "input" ? "completed" : "idle",
-        model:
-          raw.model || (isSpecialistKind(kind) ? DEFAULT_NODE_MODEL_ID : ""),
-        effort:
-          raw.effort || (isSpecialistKind(kind) ? DEFAULT_NODE_EFFORT : "low"),
-        tools: isSpecialistKind(kind) ? quality.tools : raw.tools || [],
-        skills: isSpecialistKind(kind) ? quality.skills : raw.skills || [],
-        prompt: isSpecialistKind(kind) ? quality.prompt : raw.prompt || "",
-        description: isSpecialistKind(kind)
-          ? quality.description
-          : raw.description || "",
-        inputSchema: raw.inputSchema,
-        outputSchema: raw.outputSchema,
-        conditionRule: raw.conditionRule,
-        cronExpression: raw.cronExpression,
-        cronTimezone: raw.cronTimezone,
-        cronEnabled: raw.cronEnabled,
-        duration: "—",
-        tokens: 0,
-        trace: ["Configured by Byte"],
-        requiresApproval: Boolean(raw.requiresApproval),
-        completionCriteria:
-          kind === "agent" || kind === "creative"
-            ? defaultPlatformCriteria()
-            : undefined,
-        color: kindPopColor(kind),
-      },
+      data,
     } satisfies FlowNode;
   });
 }
@@ -514,6 +603,7 @@ export async function executeWorkflowArchitectTool(
       "workflow_validate",
       "workflow_open_editor",
       "workflow_duplicate",
+      "workflow_node_experience",
     ]);
     if (exists.locked && !nonMutating.has(name))
       return fail(
@@ -590,6 +680,9 @@ export async function executeWorkflowArchitectTool(
         "cronExpression",
         "cronTimezone",
         "cronEnabled",
+        "sandboxProfile",
+        "approvalPolicy",
+        "workspacePolicy",
       ];
       const patch = Object.fromEntries(
         Object.entries(args.patch ?? {}).filter(([key]) =>
@@ -610,6 +703,10 @@ export async function executeWorkflowArchitectTool(
             kind: nextKind,
             role: String(mergedData.role ?? nodes[nodeIndex].data.role),
             label: String(mergedData.label ?? nodes[nodeIndex].data.label),
+            baseInstructions: mergedData.baseInstructions as string | undefined,
+            developerInstructions: mergedData.developerInstructions as
+              | string
+              | undefined,
             prompt: String(mergedData.prompt ?? ""),
             tools: Array.isArray(mergedData.tools)
               ? (mergedData.tools as string[])
@@ -620,21 +717,22 @@ export async function executeWorkflowArchitectTool(
             description: String(
               mergedData.description ?? nodes[nodeIndex].data.description ?? "",
             ),
+            sandboxProfile: mergedData.sandboxProfile as
+              | AgentData["sandboxProfile"]
+              | undefined,
+            approvalPolicy: mergedData.approvalPolicy as
+              | AgentData["approvalPolicy"]
+              | undefined,
+            workspacePolicy: mergedData.workspacePolicy as
+              | AgentData["workspacePolicy"]
+              | undefined,
           })
         : null;
       nodes[nodeIndex] = {
         ...nodes[nodeIndex],
-        data: {
-          ...mergedData,
-          ...(quality
-            ? {
-                prompt: quality.prompt,
-                tools: quality.tools,
-                skills: quality.skills,
-                description: quality.description,
-              }
-            : {}),
-        },
+        data: quality
+          ? applySpecialistQuality(mergedData as AgentData, quality)
+          : (mergedData as AgentData),
       };
       const candidate = { ...exists, nodes };
       const problems = introducedWorkflowProblems(exists, candidate);
@@ -732,6 +830,26 @@ export async function executeWorkflowArchitectTool(
         return ok({ applied: false, repaired, remaining });
       const saved = await saveNext(actions, candidate);
       return ok({ applied: true, repaired, remaining, version: saved.version });
+    }
+    if (name === "workflow_node_experience") {
+      const node = exists.nodes.find((n) => n.id === String(args.nodeId));
+      if (!node) return fail(`Node ${args.nodeId} not found in workflow ${id}`);
+      const records = await listNodeExperience({
+        workflowId: id,
+        nodeId: node.id,
+        role: node.data.role,
+        model: node.data.model,
+        effort: node.data.effort,
+      });
+      return ok({
+        workflowId: id,
+        nodeId: node.id,
+        role: node.data.role,
+        model: node.data.model,
+        effort: node.data.effort,
+        digest: formatExperienceDigest(records),
+        records: records.slice(0, 20),
+      });
     }
     return fail(`Unknown tool: ${name}`);
   } catch (error) {

@@ -39,10 +39,7 @@ pub(crate) fn get_chat_store(
     app: tauri::AppHandle,
 ) -> Result<Option<String>, String> {
     let database = app.state::<Database>();
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = crate::workflow_runtime::database_guard_for(&database);
     connection
         .query_row(
             "SELECT store_json FROM chat_stores WHERE workflow_id=?1",
@@ -61,10 +58,7 @@ pub(crate) fn save_chat_store(
 ) -> Result<(), String> {
     validate_store(&workflow_id, &store_json)?;
     let database = app.state::<Database>();
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = crate::workflow_runtime::database_guard_for(&database);
     connection
         .execute(
             "INSERT INTO chat_stores(workflow_id,store_json,updated_at)

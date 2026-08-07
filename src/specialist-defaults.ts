@@ -35,6 +35,9 @@ export type SpecialistDefaults = {
   skills: string[];
   skillHints: string[];
   description: string;
+  sandboxProfile?: "read-only" | "workspace-write" | "danger-full-access";
+  approvalPolicy?: "on-request" | "untrusted" | "never";
+  workspacePolicy?: "isolated" | "workflow";
 };
 
 function fromInstantiation(inst: PackInstantiation): SpecialistDefaults {
@@ -48,6 +51,9 @@ function fromInstantiation(inst: PackInstantiation): SpecialistDefaults {
     skills: [...inst.skills],
     skillHints: [...inst.skillHints],
     description: inst.description,
+    sandboxProfile: inst.sandboxProfile,
+    approvalPolicy: inst.approvalPolicy,
+    workspacePolicy: inst.workspacePolicy,
   };
 }
 
@@ -103,6 +109,9 @@ export type SpecialistNodeFields = {
   tools?: string[];
   skills?: string[];
   description?: string;
+  sandboxProfile?: "read-only" | "workspace-write" | "danger-full-access";
+  approvalPolicy?: "on-request" | "untrusted" | "never";
+  workspacePolicy?: "isolated" | "workflow";
 };
 
 /** Fields always populated by ensureSpecialistQuality for specialists. */
@@ -116,6 +125,9 @@ export type EnsuredSpecialistFields = {
   skills: string[];
   skillHints: string[];
   description: string;
+  sandboxProfile: "read-only" | "workspace-write" | "danger-full-access" | undefined;
+  approvalPolicy: "on-request" | "untrusted" | "never" | undefined;
+  workspacePolicy: "isolated" | "workflow" | undefined;
 };
 
 /**
@@ -137,6 +149,9 @@ export function ensureSpecialistQuality<T extends SpecialistNodeFields>(
       skills: data.skills ? [...data.skills] : [],
       skillHints: [],
       description: data.description ?? "",
+      sandboxProfile: undefined,
+      approvalPolicy: undefined,
+      workspacePolicy: undefined,
     };
   }
 
@@ -183,6 +198,9 @@ export function ensureSpecialistQuality<T extends SpecialistNodeFields>(
     skills: [...skills],
     skillHints: [...defaults.skillHints],
     description,
+    sandboxProfile: migrated.sandboxProfile ?? defaults.sandboxProfile,
+    approvalPolicy: migrated.approvalPolicy ?? defaults.approvalPolicy,
+    workspacePolicy: migrated.workspacePolicy ?? defaults.workspacePolicy,
   };
 }
 

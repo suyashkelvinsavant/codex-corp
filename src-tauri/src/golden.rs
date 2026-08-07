@@ -13,9 +13,10 @@
 //! Isolated per run: fresh `CODEX_CORP_DATA_DIR` (new SQLite), fresh workspace,
 //! and `CODEX_CORP_ACTIVE_PATH` pointed at the scripted fake server.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -48,10 +49,11 @@ pub fn run_golden_mission(fixture_path: &str, fake_server_path: &str) -> Result<
         }));
     }
 
-    let _environment_guard = GOLDEN_ENV_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .map_err(|_| "golden environment lock poisoned".to_string())?;
+    let _environment_guard = crate::workflow_runtime::poison_aware_lock(
+        GOLDEN_ENV_LOCK.get_or_init(|| Mutex::new(())),
+        "golden environment",
+        None,
+    );
     // Validate all fixture-controlled process settings before creating files
     // or mutating the parent process environment.
     let fixture_env = fixture_env_overrides(&fixture)?;
@@ -237,7 +239,7 @@ fn run_mission_isolated(fixture: &Value, workspace: &Path, id: &str) -> Result<V
     let graph_json = serde_json::to_string(&graph).map_err(|error| error.to_string())?;
     let workflow_id = format!("golden-wf-{id}");
     {
-        let connection = database.0.lock().map_err(|_| "database lock poisoned")?;
+        let connection = crate::workflow_runtime::database_guard_for(&database);
         connection
             .execute(
                 "INSERT OR REPLACE INTO workflows(id,name,graph_json,template_json,updated_at) VALUES(?1,?2,?3,NULL,CURRENT_TIMESTAMP)",
@@ -345,30 +347,33 @@ fn await_terminal_run(
         // Auto-approve any run gate for this run (approval node and any
         // needs_human gate). Mirrors respond_run_approval's key contract.
         if auto_approve {
-            if let Ok(mut pending) = run_approvals.0.lock() {
-                let keys: Vec<String> = pending
-                    .keys()
-                    .filter(|key| key.starts_with(&format!("{run_id}::")))
-                    .cloned()
-                    .collect();
-                for key in keys {
-                    if let Some(sender) = pending.remove(&key) {
-                        let _ = sender.send(true);
-                    }
+            let mut pending = crate::workflow_runtime::poison_aware_lock(
+                &run_approvals.0,
+                "run approval broker",
+                None,
+            );
+            let keys: Vec<String> = pending
+                .keys()
+                .filter(|key| key.starts_with(&format!("{run_id}::")))
+                .cloned()
+                .collect();
+            for key in keys {
+                if let Some(sender) = pending.remove(&key) {
+                    let _ = sender.send(true);
                 }
             }
         }
 
-        let snapshot: Option<(String, Option<String>)> =
-            database.0.lock().ok().and_then(|connection| {
-                connection
-                    .query_row(
-                        "SELECT status, terminal_reason FROM runs WHERE id=?1",
-                        params![run_id],
-                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-                    )
-                    .ok()
-            });
+        let snapshot: Option<(String, Option<String>)> = {
+            let connection = crate::workflow_runtime::database_guard_for(database);
+            connection
+                .query_row(
+                    "SELECT status, terminal_reason FROM runs WHERE id=?1",
+                    params![run_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .ok()
+        };
         if let Some((status, reason)) = snapshot.as_ref() {
             if matches!(
                 status.as_str(),
@@ -392,22 +397,16 @@ fn await_terminal_run(
 /// Count persisted verification attempt records (P3 routing rows carry
 /// `failureClass:"verification"` + criterion ids on `node_attempts`).
 fn count_verification_attempt_records(database: &Database, run_id: &str) -> u64 {
-    database
-        .0
-        .lock()
-        .ok()
-        .and_then(|connection| {
-            connection
-                .query_row(
-                    "SELECT COUNT(*) FROM node_attempts
-                     WHERE run_id=?1
-                       AND json_extract(diagnostics_json,'$.failureClass')='verification'
-                       AND json_extract(diagnostics_json,'$.gate')='verification'",
-                    params![run_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .ok()
-        })
+    let connection = crate::workflow_runtime::database_guard_for(database);
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM node_attempts
+             WHERE run_id=?1
+               AND json_extract(diagnostics_json,'$.failureClass')='verification'
+               AND json_extract(diagnostics_json,'$.gate')='verification'",
+            params![run_id],
+            |row| row.get::<_, i64>(0),
+        )
         .unwrap_or(0) as u64
 }
 
@@ -438,7 +437,7 @@ fn read_builder_verification(database: &Database, run_id: &str) -> Value {
 
 /// Read a node's persisted output_json (RuntimeOutput serialized camelCase).
 fn node_output_json(database: &Database, run_id: &str, node_id: &str) -> Option<Value> {
-    let connection = database.0.lock().ok()?;
+    let connection = crate::workflow_runtime::database_guard_for(database);
     let raw: String = connection
         .query_row(
             "SELECT output_json FROM node_executions WHERE run_id=?1 AND node_id=?2",

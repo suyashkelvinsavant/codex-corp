@@ -1,4 +1,5 @@
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use parking_lot::{Condvar, Mutex, MutexGuard};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -9,7 +10,7 @@ use std::{
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc, Arc, Condvar, Mutex,
+        mpsc, Arc,
     },
     time::Duration,
 };
@@ -68,6 +69,24 @@ fn default_agent_output_schema() -> Value {
 /// Shared SQLite handle. `Arc` so desktop, headless, and the MCP server share one connection pool.
 #[derive(Clone)]
 pub(crate) struct Database(pub(crate) Arc<Mutex<Connection>>);
+
+/// Lock a runtime broker. The `name`/`run_id` parameters are retained for
+/// call-site compatibility; the implementation is a direct `parking_lot` lock.
+pub(crate) fn runtime_lock<'a, T: ?Sized>(
+    mutex: &'a Mutex<T>,
+    _name: &str,
+    _run_id: Option<&str>,
+) -> MutexGuard<'a, T> {
+    mutex.lock()
+}
+
+/// Guard the shared SQLite connection for command handlers that do not have a
+/// `RunContext` (e.g. direct Tauri commands). Lives in `lib.rs` because the
+/// `Database` type is owned by this module.
+pub(crate) fn db_guard_for(database: &Database) -> MutexGuard<'_, Connection> {
+    database.0.lock()
+}
+
 #[derive(Clone)]
 pub(crate) struct ApprovalBroker(pub(crate) Arc<Mutex<HashMap<String, PendingInteraction>>>);
 
@@ -91,9 +110,8 @@ struct PendingProcessInteractions {
 
 impl Drop for PendingProcessInteractions {
     fn drop(&mut self) {
-        if let Ok(mut pending) = self.broker.0.lock() {
-            pending.retain(|_, interaction| interaction.process_key != self.process_key);
-        }
+        let mut pending = self.broker.0.lock();
+        pending.retain(|_, interaction| interaction.process_key != self.process_key);
     }
 }
 /// Broker for dynamic tool call results (JSON text content from the UI host).
@@ -119,9 +137,8 @@ struct TurnRegistration {
 
 impl Drop for TurnRegistration {
     fn drop(&mut self) {
-        if let Ok(mut turns) = self.broker.0.lock() {
-            turns.remove(&self.key);
-        }
+        let mut turns = self.broker.0.lock();
+        turns.remove(&self.key);
     }
 }
 
@@ -233,14 +250,18 @@ impl RealtimeAudioChunk {
 }
 impl Drop for ProcessRegistration {
     fn drop(&mut self) {
-        // Kill without wait while holding the mutex — wait can hang and deadlocks
-        // any other kill path that also locks the same Arc<Mutex<Child>>.
-        let _ = self.child.lock().map(|mut child| {
+        // Kill without waiting, then release the child lock before touching the
+        // broker. Holding the child lock while acquiring the process broker
+        // inverts the safe cleanup order (broker clone -> child kill) used by
+        // `kill_run_processes` and can deadlock or hang any broker->child path.
+        {
+            let mut child =
+                crate::workflow_runtime::poison_aware_lock(&self.child, "child process", None);
             let _ = child.kill();
-        });
-        if let Ok(mut processes) = self.broker.0.lock() {
-            processes.remove(&self.node_id);
         }
+        let mut processes =
+            crate::workflow_runtime::poison_aware_lock(&self.broker.0, "process broker", None);
+        processes.remove(&self.node_id);
     }
 }
 
@@ -325,10 +346,7 @@ fn persist_hook_record(
     database: &Database,
     record: &app_settings::HookRunRecord,
 ) -> Result<(), String> {
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = crate::workflow_runtime::database_guard_for(database);
     app_settings::persist_hook_run_with_connection(&connection, record)
 }
 
@@ -365,11 +383,13 @@ pub(crate) fn parse_headless_codex_approval_policy(raw: &str) -> HeadlessCodexAp
         "auto_decline" | "decline" | "deny" => HeadlessCodexApprovalPolicy::AutoDecline,
         "wait" | "manual" => HeadlessCodexApprovalPolicy::Wait,
         "auto_accept" | "accept" => HeadlessCodexApprovalPolicy::AutoAccept,
+        // Headless default is fail-closed. Builders with danger-full-access + approvalPolicy=never
+        // are handled by the dedicated auto-accept branch in execute_agent_internal.
         _ => HeadlessCodexApprovalPolicy::AutoDecline,
     }
 }
 
-/// Parse `CODEX_CORP_HEADLESS_APPROVAL`. Default is `auto_accept` for unattended VMs.
+/// Parse `CODEX_CORP_HEADLESS_APPROVAL`. Default is `auto_decline` for unattended VMs.
 pub(crate) fn headless_codex_approval_policy() -> HeadlessCodexApprovalPolicy {
     parse_headless_codex_approval_policy(
         &std::env::var("CODEX_CORP_HEADLESS_APPROVAL").unwrap_or_default(),
@@ -377,9 +397,8 @@ pub(crate) fn headless_codex_approval_policy() -> HeadlessCodexApprovalPolicy {
 }
 
 pub(crate) fn kill_app_server_child(child: &Arc<Mutex<Child>>) {
-    if let Ok(mut guard) = child.lock() {
-        let _ = guard.kill();
-    }
+    let mut guard = child.lock();
+    let _ = guard.kill();
 }
 
 #[derive(Debug, Serialize)]
@@ -800,19 +819,13 @@ fn recv_with_operator_pause<T>(
     outer_deadline: &Arc<Mutex<PausableDeadline>>,
 ) -> Result<Result<T, mpsc::RecvTimeoutError>, String> {
     let paused_at = std::time::Instant::now();
-    outer_deadline
-        .lock()
-        .map_err(|_| "outer agent deadline lock poisoned".to_string())?
-        .pause(paused_at);
+    outer_deadline.lock().pause(paused_at);
     turn_deadline.pause(paused_at);
 
     let result = receiver.recv_timeout(timeout);
     let resumed_at = std::time::Instant::now();
     turn_deadline.resume(resumed_at);
-    outer_deadline
-        .lock()
-        .map_err(|_| "outer agent deadline lock poisoned".to_string())?
-        .resume(resumed_at);
+    outer_deadline.lock().resume(resumed_at);
     Ok(result)
 }
 
@@ -869,6 +882,17 @@ fn build_agent_thread_start_params(
         params["sandbox"] = json!(sandbox);
     }
     params
+}
+
+/// Map an internal sandbox profile name to a Codex app-server `SandboxMode`.
+/// Unknown or legacy values fall back to `workspace-write` for safety.
+fn codex_sandbox_mode(profile: &str) -> &'static str {
+    match profile {
+        "read-only" => "read-only",
+        "workspace-write" => "workspace-write",
+        "danger-full-access" => "danger-full-access",
+        _ => "workspace-write",
+    }
 }
 
 fn build_agent_turn_start_params(
@@ -1217,6 +1241,7 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
     let _ = connection.execute("ALTER TABLE artifacts ADD COLUMN byte_length INTEGER", []);
     let _ = connection.execute("ALTER TABLE artifacts ADD COLUMN storage_path TEXT", []);
     app_settings::initialize(connection)?;
+    workflow_runtime::initialize_database(connection)?;
     business_data::initialize(connection)?;
     chat_data::initialize(connection)?;
     local_test::initialize(connection)?;
@@ -1474,12 +1499,10 @@ pub(crate) fn send_json_timed(
     let (tx, rx) = mpsc::channel();
     let stdin = Arc::clone(stdin);
     std::thread::spawn(move || {
-        let result = (|| {
-            let mut guard = stdin
-                .lock()
-                .map_err(|_| "stdin lock poisoned".to_string())?;
+        let result = {
+            let mut guard = crate::workflow_runtime::poison_aware_lock(&stdin, "stdin", None);
             send_json(&mut *guard, value)
-        })();
+        };
         let _ = tx.send(result);
     });
     match rx.recv_timeout(timeout) {
@@ -2344,7 +2367,8 @@ fn save_workflow(
     snapshot: WorkflowSnapshot,
     database: tauri::State<'_, Database>,
 ) -> Result<(), String> {
-    database.0.lock().map_err(|_| "database lock poisoned".to_string())?
+    let connection = crate::workflow_runtime::database_guard_for(&database);
+    connection
         .execute(
             "INSERT INTO workflows (id, name, graph_json, workspace_path, template_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP)
              ON CONFLICT(id) DO UPDATE SET name=excluded.name, graph_json=excluded.graph_json, workspace_path=COALESCE(excluded.workspace_path,workflows.workspace_path), template_json=COALESCE(excluded.template_json,workflows.template_json), updated_at=CURRENT_TIMESTAMP",
@@ -2355,10 +2379,7 @@ fn save_workflow(
 
 #[tauri::command]
 fn list_workflow_catalog(database: tauri::State<'_, Database>) -> Result<Vec<String>, String> {
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = crate::workflow_runtime::database_guard_for(&database);
     let mut statement = connection
         .prepare("SELECT id,name,graph_json,template_json FROM workflows ORDER BY updated_at,id")
         .map_err(|error| error.to_string())?;
@@ -2407,10 +2428,8 @@ fn save_workflow_catalog_item(
     let nodes = template.get("nodes").cloned().unwrap_or_else(|| json!([]));
     let edges = template.get("edges").cloned().unwrap_or_else(|| json!([]));
     let graph_json = json!({ "nodes": nodes, "edges": edges }).to_string();
-    database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?
+    let connection = crate::workflow_runtime::database_guard_for(&database);
+    connection
         .execute(
             "INSERT INTO workflows(id,name,graph_json,template_json,updated_at) VALUES(?1,?2,?3,?4,CURRENT_TIMESTAMP)
              ON CONFLICT(id) DO UPDATE SET name=excluded.name,graph_json=excluded.graph_json,template_json=excluded.template_json,updated_at=CURRENT_TIMESTAMP",
@@ -2422,13 +2441,16 @@ fn save_workflow_catalog_item(
 
 #[tauri::command]
 fn delete_workflow(id: String, database: tauri::State<'_, Database>) -> Result<(), String> {
-    database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?
+    let mut connection = crate::workflow_runtime::database_guard_for(&database);
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    transaction
         .execute("DELETE FROM workflows WHERE id=?1", params![id])
         .map_err(|error| error.to_string())?;
-    Ok(())
+    crate::workflow_runtime::delete_node_experience_for_workflow(&transaction, &id)
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -2436,10 +2458,7 @@ fn load_workflow(
     id: String,
     database: tauri::State<'_, Database>,
 ) -> Result<Option<String>, String> {
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = crate::workflow_runtime::database_guard_for(&database);
     let mut statement = connection
         .prepare("SELECT graph_json FROM workflows WHERE id=?1")
         .map_err(|error| error.to_string())?;
@@ -2487,10 +2506,7 @@ fn load_workflow_record(
     id: String,
     database: tauri::State<'_, Database>,
 ) -> Result<Option<LoadedWorkflowRecord>, String> {
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = crate::workflow_runtime::database_guard_for(&database);
     load_workflow_record_from_connection(&connection, &id)
 }
 
@@ -2605,10 +2621,7 @@ fn list_runs(
     workflow_id: String,
     database: tauri::State<'_, Database>,
 ) -> Result<Vec<RunRecord>, String> {
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = crate::workflow_runtime::database_guard_for(&database);
     let mut records = {
         let mut statement = connection.prepare(
             "SELECT id,workflow_id,status,created_at,events_json,COALESCE(nodes_json,''),COALESCE(edges_json,''),terminal_reason,resumable,pinned,last_event_seq FROM runs WHERE workflow_id=?1 ORDER BY created_at DESC LIMIT 50"
@@ -2857,10 +2870,7 @@ fn load_portfolio_run_summaries(
 fn list_portfolio_run_summaries(
     database: tauri::State<'_, Database>,
 ) -> Result<Vec<PortfolioRunSummary>, String> {
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = crate::workflow_runtime::database_guard_for(&database);
     load_portfolio_run_summaries(&connection)
 }
 
@@ -2870,10 +2880,7 @@ fn respond_codex_approval(
     decision: String,
     broker: tauri::State<'_, ApprovalBroker>,
 ) -> Result<(), String> {
-    let pending = broker
-        .0
-        .lock()
-        .map_err(|_| "approval broker lock poisoned".to_string())?
+    let pending = crate::workflow_runtime::poison_aware_lock(&broker.0, "approval broker", None)
         .remove(&request_id)
         .ok_or("approval request is no longer pending")?;
     if pending.kind != PendingInteractionKind::Approval {
@@ -2893,10 +2900,7 @@ fn respond_user_input(
     payload: Value,
     broker: tauri::State<'_, ApprovalBroker>,
 ) -> Result<(), String> {
-    let pending = broker
-        .0
-        .lock()
-        .map_err(|_| "approval broker lock poisoned".to_string())?
+    let pending = crate::workflow_runtime::poison_aware_lock(&broker.0, "approval broker", None)
         .remove(&request_id)
         .ok_or("user input request is no longer pending")?;
     if pending.kind == PendingInteractionKind::Approval {
@@ -2922,10 +2926,7 @@ fn respond_mediator_tool(
         "content": content,
     })
     .to_string();
-    let sender = broker
-        .0
-        .lock()
-        .map_err(|_| "tool broker lock poisoned".to_string())?
+    let sender = crate::workflow_runtime::poison_aware_lock(&broker.0, "tool broker", None)
         .remove(&request_id)
         .ok_or("tool call is no longer pending")?;
     sender.send(payload).map_err(|error| error.to_string())
@@ -3061,10 +3062,7 @@ async fn execute_mediator_turn(
             }
         });
         let child = Arc::new(Mutex::new(child));
-        process_broker
-            .0
-            .lock()
-            .map_err(|_| "process broker lock poisoned".to_string())?
+        crate::workflow_runtime::poison_aware_lock(&process_broker.0, "process broker", None)
             .insert("company-mediator".into(), child.clone());
         let _registration = ProcessRegistration {
             node_id: "company-mediator".into(),
@@ -3317,10 +3315,7 @@ async fn execute_mediator_turn(
                     .and_then(Value::as_str)
                     .map(str::to_string);
                 let (tx, rx) = mpsc::channel();
-                tool_broker
-                    .0
-                    .lock()
-                    .map_err(|_| "tool broker lock poisoned".to_string())?
+                crate::workflow_runtime::poison_aware_lock(&tool_broker.0, "tool broker", None)
                     .insert(request_id.clone(), tx);
                 emit_optional(&app,
                     "mediator-tool-call",
@@ -3341,11 +3336,7 @@ async fn execute_mediator_turn(
                             .to_string()
                     },
                 );
-                tool_broker
-                    .0
-                    .lock()
-                    .ok()
-                    .and_then(|mut m| m.remove(&request_id));
+                tool_broker.0.lock().remove(&request_id);
                 let parsed: Value = serde_json::from_str(&tool_payload)
                     .unwrap_or(json!({"success":false,"content":tool_payload}));
                 let success = parsed
@@ -3558,7 +3549,12 @@ fn spawn_realtime_dispatcher(
                         .unwrap_or_else(|| id.to_string());
                     let request_id = format!("realtime::{session_key}::{raw_id}");
                     let (sender, receiver) = mpsc::channel();
-                    if let Ok(mut pending) = tool_broker.0.lock() {
+                    {
+                        let mut pending = crate::workflow_runtime::poison_aware_lock(
+                            &tool_broker.0,
+                            "tool broker",
+                            None,
+                        );
                         pending.insert(request_id.clone(), sender);
                     }
                     let _ = app.emit(
@@ -3583,18 +3579,33 @@ fn spawn_realtime_dispatcher(
                                 json!({"success":false,"content":"{\"error\":\"tool host timeout\"}"})
                                     .to_string()
                             });
-                        if let Ok(mut pending) = pending_tools.0.lock() {
+                        {
+                            let mut pending = crate::workflow_runtime::poison_aware_lock(
+                                &pending_tools.0,
+                                "tool broker",
+                                None,
+                            );
                             pending.remove(&request_id);
                         }
                         let parsed: Value = serde_json::from_str(&result)
                             .unwrap_or(json!({"success":false,"content":result}));
-                        let session = sessions
-                            .0
-                            .lock()
-                            .ok()
-                            .and_then(|active| active.get(&key).cloned());
+                        let session = crate::workflow_runtime::poison_aware_lock(
+                            &sessions.0,
+                            "realtime broker",
+                            None,
+                        )
+                        .get(&key)
+                        .cloned();
                         if let Some(session) = session {
-                            let stdin = session.lock().ok().map(|session| session.stdin.clone());
+                            let stdin = Some(
+                                crate::workflow_runtime::poison_aware_lock(
+                                    &session,
+                                    "realtime session",
+                                    None,
+                                )
+                                .stdin
+                                .clone(),
+                            );
                             if let Some(stdin) = stdin {
                                 let _ = send_json_timed(
                                     &stdin,
@@ -3618,7 +3629,12 @@ fn spawn_realtime_dispatcher(
                         .unwrap_or_else(|| id.to_string());
                     let request_id = format!("realtime::{session_key}::{raw_id}");
                     let (sender, receiver) = mpsc::channel();
-                    if let Ok(mut pending) = approval_broker.0.lock() {
+                    {
+                        let mut pending = crate::workflow_runtime::poison_aware_lock(
+                            &approval_broker.0,
+                            "approval broker",
+                            None,
+                        );
                         pending.insert(
                             request_id.clone(),
                             PendingInteraction {
@@ -3670,16 +3686,31 @@ fn spawn_realtime_dispatcher(
                             json!({"action":"cancel","content":{},"_meta":null})
                         };
                         let result = receiver.recv_timeout(timeout).ok().unwrap_or(cancellation);
-                        if let Ok(mut pending) = pending_interactions.0.lock() {
+                        {
+                            let mut pending = crate::workflow_runtime::poison_aware_lock(
+                                &pending_interactions.0,
+                                "approval broker",
+                                None,
+                            );
                             pending.remove(&request_id);
                         }
-                        let session = sessions
-                            .0
-                            .lock()
-                            .ok()
-                            .and_then(|active| active.get(&key).cloned());
+                        let session = crate::workflow_runtime::poison_aware_lock(
+                            &sessions.0,
+                            "realtime broker",
+                            None,
+                        )
+                        .get(&key)
+                        .cloned();
                         if let Some(session) = session {
-                            let stdin = session.lock().ok().map(|session| session.stdin.clone());
+                            let stdin = Some(
+                                crate::workflow_runtime::poison_aware_lock(
+                                    &session,
+                                    "realtime session",
+                                    None,
+                                )
+                                .stdin
+                                .clone(),
+                            );
                             if let Some(stdin) = stdin {
                                 let _ = send_json_timed(
                                     &stdin,
@@ -3698,7 +3729,12 @@ fn spawn_realtime_dispatcher(
                         .unwrap_or_else(|| id.to_string());
                     let request_id = format!("realtime::{session_key}::{raw_id}");
                     let (sender, receiver) = mpsc::channel();
-                    if let Ok(mut pending) = approval_broker.0.lock() {
+                    {
+                        let mut pending = crate::workflow_runtime::poison_aware_lock(
+                            &approval_broker.0,
+                            "approval broker",
+                            None,
+                        );
                         pending.insert(
                             request_id.clone(),
                             PendingInteraction {
@@ -3730,16 +3766,31 @@ fn spawn_realtime_dispatcher(
                             .ok()
                             .and_then(|value| value.as_str().map(str::to_string))
                             .unwrap_or_else(|| "decline".into());
-                        if let Ok(mut pending) = pending_interactions.0.lock() {
+                        {
+                            let mut pending = crate::workflow_runtime::poison_aware_lock(
+                                &pending_interactions.0,
+                                "approval broker",
+                                None,
+                            );
                             pending.remove(&request_id);
                         }
-                        let session = sessions
-                            .0
-                            .lock()
-                            .ok()
-                            .and_then(|active| active.get(&key).cloned());
+                        let session = crate::workflow_runtime::poison_aware_lock(
+                            &sessions.0,
+                            "realtime broker",
+                            None,
+                        )
+                        .get(&key)
+                        .cloned();
                         if let Some(session) = session {
-                            let stdin = session.lock().ok().map(|session| session.stdin.clone());
+                            let stdin = Some(
+                                crate::workflow_runtime::poison_aware_lock(
+                                    &session,
+                                    "realtime session",
+                                    None,
+                                )
+                                .stdin
+                                .clone(),
+                            );
                             if let Some(stdin) = stdin {
                                 let _ = send_json_timed(
                                     &stdin,
@@ -3784,12 +3835,20 @@ fn spawn_realtime_dispatcher(
                         .and_then(Value::as_str)
                         .map(str::to_string);
                     // Update the session in the broker with the returned IDs.
-                    if let Ok(sessions) = broker.0.lock() {
+                    {
+                        let sessions = crate::workflow_runtime::poison_aware_lock(
+                            &broker.0,
+                            "realtime broker",
+                            None,
+                        );
                         if let Some(session_arc) = sessions.get(&session_key) {
-                            if let Ok(mut session) = session_arc.lock() {
-                                session.realtime_session_id = realtime_session_id.clone();
-                                session.version = version.clone();
-                            }
+                            let mut session = crate::workflow_runtime::poison_aware_lock(
+                                session_arc,
+                                "realtime session",
+                                None,
+                            );
+                            session.realtime_session_id = realtime_session_id.clone();
+                            session.version = version.clone();
                         }
                     }
                     let _ = app.emit(
@@ -3871,21 +3930,14 @@ fn spawn_realtime_dispatcher(
                     // non-reentrant Mutex). Removing clears the session's
                     // back-reference first so Drop's own removal is a no-op,
                     // then drops the Arc outside the lock.
-                    let removed = broker
-                        .0
-                        .lock()
-                        .ok()
-                        .and_then(|mut sessions| sessions.remove(&session_key));
-                    if let Some(session) = removed.as_ref() {
-                        if let Ok(session) = session.lock() {
-                            let (closed, wake) = &*session.closed;
-                            if let Ok(mut value) = closed.lock() {
-                                *value = true;
-                                wake.notify_all();
-                            }
-                        }
+                    let removed = broker.0.lock().remove(&session_key);
+                    if let Some(session) = removed {
+                        let session = session.lock();
+                        let (closed, wake) = &*session.closed;
+                        let mut value = closed.lock();
+                        *value = true;
+                        wake.notify_all();
                     }
-                    drop(removed);
                     let _ = app.emit(
                         "codex-realtime-error",
                         json!({ "sessionKey": session_key, "threadId": thread_id, "message": message }),
@@ -3900,21 +3952,14 @@ fn spawn_realtime_dispatcher(
                         .unwrap_or("closed")
                         .to_string();
                     // Same drop-outside-lock discipline as the error branch.
-                    let removed = broker
-                        .0
-                        .lock()
-                        .ok()
-                        .and_then(|mut sessions| sessions.remove(&session_key));
-                    if let Some(session) = removed.as_ref() {
-                        if let Ok(session) = session.lock() {
-                            let (closed, wake) = &*session.closed;
-                            if let Ok(mut value) = closed.lock() {
-                                *value = true;
-                                wake.notify_all();
-                            }
-                        }
+                    let removed = broker.0.lock().remove(&session_key);
+                    if let Some(session) = removed {
+                        let session = session.lock();
+                        let (closed, wake) = &*session.closed;
+                        let mut value = closed.lock();
+                        *value = true;
+                        wake.notify_all();
                     }
-                    drop(removed);
                     let _ = app.emit(
                         "codex-realtime-closed",
                         json!({ "sessionKey": session_key, "threadId": thread_id, "reason": reason }),
@@ -3926,21 +3971,14 @@ fn spawn_realtime_dispatcher(
             }
         }
         if !terminal {
-            let removed = broker
-                .0
-                .lock()
-                .ok()
-                .and_then(|mut sessions| sessions.remove(&session_key));
-            if let Some(session) = removed.as_ref() {
-                if let Ok(session) = session.lock() {
-                    let (closed, wake) = &*session.closed;
-                    if let Ok(mut value) = closed.lock() {
-                        *value = true;
-                        wake.notify_all();
-                    }
-                }
+            let removed = broker.0.lock().remove(&session_key);
+            if let Some(session) = removed {
+                let session = session.lock();
+                let (closed, wake) = &*session.closed;
+                let mut value = closed.lock();
+                *value = true;
+                wake.notify_all();
             }
-            drop(removed);
             let _ = app.emit(
                 "codex-realtime-error",
                 json!({
@@ -3951,10 +3989,12 @@ fn spawn_realtime_dispatcher(
             );
         }
         let prefix = format!("realtime::{session_key}::");
-        if let Ok(mut pending) = tool_broker.0.lock() {
+        {
+            let mut pending = tool_broker.0.lock();
             pending.retain(|key, _| !key.starts_with(&prefix));
         }
-        if let Ok(mut pending) = approval_broker.0.lock() {
+        {
+            let mut pending = approval_broker.0.lock();
             pending.retain(|key, _| !key.starts_with(&prefix));
         };
     });
@@ -4027,10 +4067,7 @@ async fn start_codex_realtime(
         if request.surface != "company" && request.surface != "architect" {
             return Err("realtime surface must be 'company' or 'architect'".into());
         }
-        if broker
-            .0
-            .lock()
-            .map_err(|_| "broker lock poisoned".to_string())?
+        if crate::workflow_runtime::poison_aware_lock(&broker.0, "realtime broker", None)
             .contains_key(&request.session_key)
         {
             return Err(format!("session '{}' already exists", request.session_key));
@@ -4099,10 +4136,7 @@ async fn start_codex_realtime(
 
         let child_arc = Arc::new(Mutex::new(child));
         let process_key = format!("realtime-{}", request.session_key);
-        process_broker
-            .0
-            .lock()
-            .map_err(|_| "process broker lock poisoned".to_string())?
+        crate::workflow_runtime::poison_aware_lock(&process_broker.0, "process broker", None)
             .insert(process_key.clone(), child_arc.clone());
 
         let _child_for_cleanup = child_arc.clone();
@@ -4313,10 +4347,7 @@ async fn start_codex_realtime(
             closed: Arc::new((Mutex::new(false), Condvar::new())),
         }));
         {
-            let mut sessions = broker
-                .0
-                .lock()
-                .map_err(|_| "broker lock poisoned".to_string())?;
+            let mut sessions = crate::workflow_runtime::poison_aware_lock(&broker.0, "realtime broker", None);
             if sessions.contains_key(&request.session_key) {
                 return Err(format!("session '{}' already exists", request.session_key));
             }
@@ -4382,18 +4413,15 @@ async fn append_codex_realtime_audio(
         // every audio frame and blocks the dispatcher's session-state updates
         // (/started writes back into the session while holding the broker lock).
         let session_arc = {
-            let sessions = broker
-                .0
-                .lock()
-                .map_err(|_| "broker lock poisoned".to_string())?;
+            let sessions =
+                crate::workflow_runtime::poison_aware_lock(&broker.0, "realtime broker", None);
             sessions
                 .get(&request.session_key)
                 .cloned()
                 .ok_or_else(|| format!("session '{}' not found", request.session_key))?
         };
-        let session = session_arc
-            .lock()
-            .map_err(|_| "session lock poisoned".to_string())?;
+        let session =
+            crate::workflow_runtime::poison_aware_lock(&session_arc, "realtime session", None);
         request.audio.validate()?;
         let id = session.next_id.fetch_add(1, Ordering::SeqCst);
         send_json_timed(
@@ -4423,18 +4451,15 @@ async fn append_codex_realtime_text(
     tauri::async_runtime::spawn_blocking(move || {
         // Same drop-the-map-lock-before-send discipline as append_audio.
         let session_arc = {
-            let sessions = broker
-                .0
-                .lock()
-                .map_err(|_| "broker lock poisoned".to_string())?;
+            let sessions =
+                crate::workflow_runtime::poison_aware_lock(&broker.0, "realtime broker", None);
             sessions
                 .get(&request.session_key)
                 .cloned()
                 .ok_or_else(|| format!("session '{}' not found", request.session_key))?
         };
-        let session = session_arc
-            .lock()
-            .map_err(|_| "session lock poisoned".to_string())?;
+        let session =
+            crate::workflow_runtime::poison_aware_lock(&session_arc, "realtime session", None);
         let id = session.next_id.fetch_add(1, Ordering::SeqCst);
         send_json_timed(
             &session.stdin,
@@ -4463,18 +4488,15 @@ async fn append_codex_realtime_speech(
     tauri::async_runtime::spawn_blocking(move || {
         // Same drop-the-map-lock-before-send discipline as append_audio.
         let session_arc = {
-            let sessions = broker
-                .0
-                .lock()
-                .map_err(|_| "broker lock poisoned".to_string())?;
+            let sessions =
+                crate::workflow_runtime::poison_aware_lock(&broker.0, "realtime broker", None);
             sessions
                 .get(&request.session_key)
                 .cloned()
                 .ok_or_else(|| format!("session '{}' not found", request.session_key))?
         };
-        let session = session_arc
-            .lock()
-            .map_err(|_| "session lock poisoned".to_string())?;
+        let session =
+            crate::workflow_runtime::poison_aware_lock(&session_arc, "realtime session", None);
         let id = session.next_id.fetch_add(1, Ordering::SeqCst);
         send_json_timed(
             &session.stdin,
@@ -4505,49 +4527,37 @@ async fn stop_codex_realtime(
         // the map and drop the map lock before sending so a slow app-server
         // write cannot block the dispatcher or other append calls.
         let session_arc = {
-            let sessions = broker
-                .0
-                .lock()
-                .map_err(|_| "broker lock poisoned".to_string())?;
+            let sessions = broker.0.lock();
             sessions.get(&session_key).cloned()
         };
-        let close_signal = session_arc.as_ref().and_then(|session_arc| {
-            session_arc
-                .lock()
-                .ok()
-                .map(|session| session.closed.clone())
+        let close_signal = session_arc.as_ref().map(|session_arc| {
+            let session = session_arc.lock();
+            session.closed.clone()
         });
         if let Some(session_arc) = session_arc {
-            if let Ok(session) = session_arc.lock() {
-                let id = session.next_id.fetch_add(1, Ordering::SeqCst);
-                let _ = send_json_timed(
-                    &session.stdin,
-                    json!({
-                        "jsonrpc":"2.0",
-                        "id": id,
-                        "method": "thread/realtime/stop",
-                        "params": {
-                            "threadId": session.thread_id
-                        }
-                    }),
-                    Duration::from_secs(5),
-                );
-            }
+            let session = session_arc.lock();
+            let id = session.next_id.fetch_add(1, Ordering::SeqCst);
+            let _ = send_json_timed(
+                &session.stdin,
+                json!({
+                    "jsonrpc":"2.0",
+                    "id": id,
+                    "method": "thread/realtime/stop",
+                    "params": {
+                        "threadId": session.thread_id
+                    }
+                }),
+                Duration::from_secs(5),
+            );
         }
         // Wait on the terminal signal instead of a fixed sleep. The dispatcher
         // signals for closed, error, and EOF; timeout falls back to force cleanup.
         if let Some(signal) = close_signal {
             let (closed, wake) = &*signal;
-            if let Ok(value) = closed.lock() {
-                let _ = wake.wait_timeout_while(value, Duration::from_secs(2), |closed| !*closed);
-            }
+            let mut value = closed.lock();
+            let _ = wake.wait_while_for(&mut value, |closed| !*closed, Duration::from_secs(2));
         }
-        let removed = broker
-            .0
-            .lock()
-            .ok()
-            .and_then(|mut sessions| sessions.remove(&session_key));
-        drop(removed);
+        let _removed = broker.0.lock().remove(&session_key);
         Ok(())
     })
     .await
@@ -4701,10 +4711,9 @@ async fn list_codex_capabilities(cwd: Option<String>) -> Result<CodexCapabilityI
                 let mut reader = BufReader::new(err);
                 let mut line = String::new();
                 while reader.read_line(&mut line).unwrap_or(0) > 0 {
-                    if let Ok(mut guard) = sink.lock() {
-                        if guard.len() < 4000 {
-                            guard.push_str(&line);
-                        }
+                    let mut guard = sink.lock();
+                    if guard.len() < 4000 {
+                        guard.push_str(&line);
                     }
                     line.clear();
                 }
@@ -4712,10 +4721,7 @@ async fn list_codex_capabilities(cwd: Option<String>) -> Result<CodexCapabilityI
         }
         let mut reader = BufReader::new(stdout);
         let fail = |message: String| {
-            let detail = stderr_buf
-                .lock()
-                .map(|value| value.trim().to_string())
-                .unwrap_or_default();
+            let detail = stderr_buf.lock().trim().to_string();
             if detail.is_empty() {
                 message
             } else {
@@ -5053,10 +5059,9 @@ async fn list_codex_models() -> Result<Vec<CodexModelOption>, String> {
                 let mut reader = BufReader::new(err);
                 let mut line = String::new();
                 while reader.read_line(&mut line).unwrap_or(0) > 0 {
-                    if let Ok(mut guard) = sink.lock() {
-                        if guard.len() < 4000 {
-                            guard.push_str(&line);
-                        }
+                    let mut guard = sink.lock();
+                    if guard.len() < 4000 {
+                        guard.push_str(&line);
                     }
                     line.clear();
                 }
@@ -5065,10 +5070,7 @@ async fn list_codex_models() -> Result<Vec<CodexModelOption>, String> {
         let mut reader = BufReader::new(stdout);
 
         let fail = |msg: String| -> String {
-            let err = stderr_buf
-                .lock()
-                .map(|g| g.trim().to_string())
-                .unwrap_or_default();
+            let err = stderr_buf.lock().trim().to_string();
             if err.is_empty() {
                 msg
             } else {
@@ -5317,10 +5319,9 @@ async fn write_codex_config(key: String, value: serde_json::Value) -> Result<(),
                 let mut reader = BufReader::new(err);
                 let mut line = String::new();
                 while reader.read_line(&mut line).unwrap_or(0) > 0 {
-                    if let Ok(mut guard) = sink.lock() {
-                        if guard.len() < 4000 {
-                            guard.push_str(&line);
-                        }
+                    let mut guard = sink.lock();
+                    if guard.len() < 4000 {
+                        guard.push_str(&line);
                     }
                     line.clear();
                 }
@@ -5329,10 +5330,7 @@ async fn write_codex_config(key: String, value: serde_json::Value) -> Result<(),
         let mut reader = BufReader::new(stdout);
 
         let fail = |msg: String| -> String {
-            let err = stderr_buf
-                .lock()
-                .map(|g| g.trim().to_string())
-                .unwrap_or_default();
+            let err = stderr_buf.lock().trim().to_string();
             if err.is_empty() {
                 msg
             } else {
@@ -5589,10 +5587,9 @@ async fn list_codex_voices() -> Result<RealtimeVoicesListInner, String> {
                 let mut reader = BufReader::new(err);
                 let mut line = String::new();
                 while reader.read_line(&mut line).unwrap_or(0) > 0 {
-                    if let Ok(mut guard) = sink.lock() {
-                        if guard.len() < 4000 {
-                            guard.push_str(&line);
-                        }
+                    let mut guard = sink.lock();
+                    if guard.len() < 4000 {
+                        guard.push_str(&line);
                     }
                     line.clear();
                 }
@@ -5601,10 +5598,7 @@ async fn list_codex_voices() -> Result<RealtimeVoicesListInner, String> {
         let mut reader = BufReader::new(stdout);
 
         let fail = |msg: String| -> String {
-            let err = stderr_buf
-                .lock()
-                .map(|g| g.trim().to_string())
-                .unwrap_or_default();
+            let err = stderr_buf.lock().trim().to_string();
             if err.is_empty() {
                 msg
             } else {
@@ -5959,11 +5953,12 @@ pub(crate) async fn execute_agent_internal(
                     process_key: process_key.clone(),
                     broker: broker.clone(),
                 };
-                process_broker
-                    .0
-                    .lock()
-                    .map_err(|_| "process broker lock poisoned".to_string())?
-                    .insert(process_key.clone(), child.clone());
+                crate::workflow_runtime::poison_aware_lock(
+                    &process_broker.0,
+                    "process broker",
+                    None,
+                )
+                .insert(process_key.clone(), child.clone());
                 let _registration = ProcessRegistration {
                     node_id: process_key.clone(),
                     broker: process_broker.clone(),
@@ -6060,11 +6055,7 @@ pub(crate) async fn execute_agent_internal(
                     "never" => "never",
                     _ => "on-request",
                 };
-                let sandbox = if request.sandbox_profile == "read-only" {
-                    "read-only"
-                } else {
-                    "workspace-write"
-                };
+                let sandbox = codex_sandbox_mode(&request.sandbox_profile);
                 let thread_params = build_agent_thread_start_params(
                     &request,
                     &model,
@@ -6218,18 +6209,19 @@ pub(crate) async fn execute_agent_internal(
                     .to_string();
                 // Register only after turn/start returns both authoritative IDs.
                 // The guard removes the entry on every exit path.
-                turn_stdin_broker
-                    .0
-                    .lock()
-                    .map_err(|_| "turn stdin broker lock poisoned".to_string())?
-                    .insert(
-                        process_key.clone(),
-                        ActiveTurnHandle {
-                            stdin: stdin.clone(),
-                            thread_id: thread_id.clone(),
-                            turn_id: turn_id.clone(),
-                        },
-                    );
+                crate::workflow_runtime::poison_aware_lock(
+                    &turn_stdin_broker.0,
+                    "turn stdin broker",
+                    None,
+                )
+                .insert(
+                    process_key.clone(),
+                    ActiveTurnHandle {
+                        stdin: stdin.clone(),
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                    },
+                );
                 let _turn_registration = TurnRegistration {
                     key: process_key.clone(),
                     broker: turn_stdin_broker.clone(),
@@ -6431,22 +6423,23 @@ pub(crate) async fn execute_agent_internal(
                                 .unwrap_or_else(|| id.to_string());
                             let broker_request_id = format!("{process_key}::{request_id}");
                             let (sender, receiver) = mpsc::channel();
-                            broker
-                                .0
-                                .lock()
-                                .map_err(|_| "approval broker lock poisoned".to_string())?
-                                .insert(
-                                    broker_request_id.clone(),
-                                    PendingInteraction {
-                                        kind: if method == "item/tool/requestUserInput" {
-                                            PendingInteractionKind::UserInput
-                                        } else {
-                                            PendingInteractionKind::Elicitation
-                                        },
-                                        process_key: process_key.clone(),
-                                        sender,
+                            crate::workflow_runtime::poison_aware_lock(
+                                &broker.0,
+                                "approval broker",
+                                None,
+                            )
+                            .insert(
+                                broker_request_id.clone(),
+                                PendingInteraction {
+                                    kind: if method == "item/tool/requestUserInput" {
+                                        PendingInteractionKind::UserInput
+                                    } else {
+                                        PendingInteractionKind::Elicitation
                                     },
-                                );
+                                    process_key: process_key.clone(),
+                                    sender,
+                                },
+                            );
                             let event_name = if method == "item/tool/requestUserInput" {
                                 "codex-user-input-requested"
                             } else {
@@ -6485,11 +6478,7 @@ pub(crate) async fn execute_agent_internal(
                                 &worker_outer_deadline,
                             )?
                             .unwrap_or_else(|_| cancellation.clone());
-                            broker
-                                .0
-                                .lock()
-                                .ok()
-                                .and_then(|mut pending| pending.remove(&broker_request_id));
+                            broker.0.lock().remove(&broker_request_id);
                             let _ = send_json_timed(
                                 &stdin,
                                 json!({"jsonrpc":"2.0","id":id,"result":response_payload}),
@@ -6503,24 +6492,46 @@ pub(crate) async fn execute_agent_internal(
                                 .map(str::to_string)
                                 .unwrap_or_else(|| id.to_string());
                             let broker_request_id = format!("{process_key}::{request_id}");
-                            // A request under `never` violates the configured contract; decline it
-                            // fail-closed instead of silently broadening the node's authority.
+                            // A request under `never` should not normally arrive because the
+                            // app-server is told not to ask. Fail-closed for non-privileged nodes,
+                            // but accept it when the node has explicitly selected the most
+                            // permissive `danger-full-access` sandbox (i.e. builders that are
+                            // allowed to install packages, build, and test without operator friction).
                             // Headless (no AppHandle): CODEX_CORP_HEADLESS_APPROVAL policy applies
-                            // for non-never approval policies (default auto_accept).
+                            // for non-never approval policies (default auto_decline).
                             let decision = if approval_policy == "never" {
-                                emit_optional(
-                                    &app,
-                                    "codex-agent-event",
-                                    NormalizedAgentEvent {
-                                        node_id: request.node_id.clone(),
-                                        event_type: "approval.auto_decline".into(),
-                                        message: "Declined unexpected approval request (approvalPolicy=never)".into(),
-                                        thread_id: Some(thread_id.clone()),
-                                        turn_id: Some(turn_id.clone()),
-                                        tokens: None,
-                                    },
-                                );
-                                "decline".to_string()
+                                if request.sandbox_profile == "danger-full-access" {
+                                    emit_optional(
+                                        &app,
+                                        "codex-agent-event",
+                                        NormalizedAgentEvent {
+                                            node_id: request.node_id.clone(),
+                                            event_type: "approval.auto_accept".into(),
+                                            message: "Auto-accepted approval request (approvalPolicy=never, sandbox=danger-full-access)".into(),
+                                            thread_id: Some(thread_id.clone()),
+                                            turn_id: Some(turn_id.clone()),
+                                            tokens: None,
+                                        },
+                                    );
+                                    eprintln!(
+                                        "[codex-corp] requestApproval auto-accepted for danger-full-access node; requestId={broker_request_id}"
+                                    );
+                                    "accept".to_string()
+                                } else {
+                                    emit_optional(
+                                        &app,
+                                        "codex-agent-event",
+                                        NormalizedAgentEvent {
+                                            node_id: request.node_id.clone(),
+                                            event_type: "approval.auto_decline".into(),
+                                            message: "Declined unexpected approval request (approvalPolicy=never)".into(),
+                                            thread_id: Some(thread_id.clone()),
+                                            turn_id: Some(turn_id.clone()),
+                                            tokens: None,
+                                        },
+                                    );
+                                    "decline".to_string()
+                                }
                             } else if app.is_none() {
                                 match headless_codex_approval_policy() {
                                     HeadlessCodexApprovalPolicy::AutoAccept => {
@@ -6561,20 +6572,19 @@ pub(crate) async fn execute_agent_internal(
                                     }
                                     HeadlessCodexApprovalPolicy::Wait => {
                                         let (sender, receiver) = mpsc::channel();
-                                        broker
-                                            .0
-                                            .lock()
-                                            .map_err(|_| {
-                                                "approval broker lock poisoned".to_string()
-                                            })?
-                                            .insert(
-                                                broker_request_id.clone(),
-                                                PendingInteraction {
-                                                    kind: PendingInteractionKind::Approval,
-                                                    process_key: process_key.clone(),
-                                                    sender,
-                                                },
-                                            );
+                                        crate::workflow_runtime::poison_aware_lock(
+                                            &broker.0,
+                                            "approval broker",
+                                            None,
+                                        )
+                                        .insert(
+                                            broker_request_id.clone(),
+                                            PendingInteraction {
+                                                kind: PendingInteractionKind::Approval,
+                                                process_key: process_key.clone(),
+                                                sender,
+                                            },
+                                        );
                                         emit_optional(
                                             &app,
                                             "codex-approval-requested",
@@ -6608,18 +6618,19 @@ pub(crate) async fn execute_agent_internal(
                                 }
                             } else {
                                 let (sender, receiver) = mpsc::channel();
-                                broker
-                                    .0
-                                    .lock()
-                                    .map_err(|_| "approval broker lock poisoned".to_string())?
-                                    .insert(
-                                        broker_request_id.clone(),
-                                        PendingInteraction {
-                                            kind: PendingInteractionKind::Approval,
-                                            process_key: process_key.clone(),
-                                            sender,
-                                        },
-                                    );
+                                crate::workflow_runtime::poison_aware_lock(
+                                    &broker.0,
+                                    "approval broker",
+                                    None,
+                                )
+                                .insert(
+                                    broker_request_id.clone(),
+                                    PendingInteraction {
+                                        kind: PendingInteractionKind::Approval,
+                                        process_key: process_key.clone(),
+                                        sender,
+                                    },
+                                );
                                 emit_optional(
                                     &app,
                                     "codex-approval-requested",
@@ -6644,11 +6655,7 @@ pub(crate) async fn execute_agent_internal(
                                 .and_then(|value| value.as_str().map(str::to_string))
                                 .unwrap_or_else(|| "decline".into())
                             };
-                            broker
-                                .0
-                                .lock()
-                                .ok()
-                                .and_then(|mut pending| pending.remove(&broker_request_id));
+                            broker.0.lock().remove(&broker_request_id);
                             emit_optional(
                                 &app,
                                 "codex-approval-resolved",
@@ -6817,18 +6824,15 @@ pub(crate) async fn execute_agent_internal(
         });
         let hard_secs = outer_agent_deadline_seconds(wall_secs);
         let out = loop {
-            let remaining = outer_deadline
-                .lock()
-                .map_err(|_| "outer agent deadline lock poisoned".to_string())?
-                .remaining(std::time::Instant::now());
+            let remaining = crate::workflow_runtime::poison_aware_lock(
+                &outer_deadline,
+                "outer agent deadline",
+                None,
+            )
+            .remaining(std::time::Instant::now());
             if remaining.is_zero() {
                 agent_trace(&format!("spawn_blocking HARD_DEADLINE node={node_for_log}"));
-                if let Some(child) = timeout_broker
-                    .0
-                    .lock()
-                    .ok()
-                    .and_then(|processes| processes.get(&timeout_process_key).cloned())
-                {
+                if let Some(child) = timeout_broker.0.lock().get(&timeout_process_key).cloned() {
                     kill_app_server_child(&child);
                 }
                 break Err(format!(
@@ -7078,6 +7082,7 @@ pub fn run() {
             workflow_runtime::stop_run,
             workflow_runtime::get_run,
             workflow_runtime::list_active_runs,
+            workflow_runtime::list_node_experience,
             workflow_runtime::analytics_verification_loops,
             workflow_runtime::respond_run_approval,
             list_codex_voices,
@@ -7713,6 +7718,17 @@ readline.createInterface({{ input: process.stdin }}).on('line', (line) => {{
         );
         assert_eq!(thread["sandbox"], "workspace-write");
         assert!(thread.get("permissions").is_none());
+
+        let danger = build_agent_thread_start_params(
+            &request,
+            "gpt-test",
+            Path::new("C:/workspace"),
+            "never",
+            "danger-full-access",
+        );
+        assert_eq!(danger["sandbox"], "danger-full-access");
+        assert_eq!(danger["approvalPolicy"], "never");
+
         assert_eq!(thread["personality"], "none");
         let turn = build_agent_turn_start_params(
             &request,
@@ -7723,6 +7739,18 @@ readline.createInterface({{ input: process.stdin }}).on('line', (line) => {{
             &[],
         );
         assert!(turn.get("collaborationMode").is_none());
+    }
+
+    #[test]
+    fn codex_sandbox_mode_rejects_unknown_profiles_safely() {
+        assert_eq!(codex_sandbox_mode("read-only"), "read-only");
+        assert_eq!(codex_sandbox_mode("workspace-write"), "workspace-write");
+        assert_eq!(
+            codex_sandbox_mode("danger-full-access"),
+            "danger-full-access"
+        );
+        assert_eq!(codex_sandbox_mode("custom"), "workspace-write");
+        assert_eq!(codex_sandbox_mode(""), "workspace-write");
     }
 
     #[test]
@@ -8277,18 +8305,18 @@ readline.createInterface({{ input: process.stdin }}).on('line', (line) => {{
         let broker = RealtimeBroker::default();
         let session = build_test_session(broker.clone(), "session-a");
         {
-            let mut sessions = broker.0.lock().unwrap();
+            let mut sessions = broker.0.lock();
             sessions.insert("session-a".into(), session.clone());
         }
         // Back-reference is already set by build_test_session.
-        assert_eq!(broker.0.lock().unwrap().len(), 1);
+        assert_eq!(broker.0.lock().len(), 1);
 
         // Drop our handle AND the broker's handle by removing then dropping.
-        let removed = broker.0.lock().unwrap().remove("session-a");
+        let removed = broker.0.lock().remove("session-a");
         drop(removed);
         // The session's own Drop runs its deregistration path; since it's
         // already gone, the broker stays empty (idempotent removal).
-        assert_eq!(broker.0.lock().unwrap().len(), 0);
+        assert_eq!(broker.0.lock().len(), 0);
     }
 
     #[test]
@@ -8298,13 +8326,12 @@ readline.createInterface({{ input: process.stdin }}).on('line', (line) => {{
         // and tries to remove again. This must not panic or deadlock.
         let broker = RealtimeBroker::default();
         let session = build_test_session(broker.clone(), "session-b");
-        broker.0.lock().unwrap().insert("session-b".into(), session);
+        broker.0.lock().insert("session-b".into(), session);
 
         // Dispatcher path: lock, remove, drop the lock, then drop the Arc.
         let removed = broker
             .0
             .lock()
-            .unwrap()
             .remove("session-b")
             .expect("session was inserted");
         // At this point the broker no longer holds a reference; dropping the
@@ -8312,7 +8339,7 @@ readline.createInterface({{ input: process.stdin }}).on('line', (line) => {{
         // ( uncontended ) and removes a key that is already absent — a no-op.
         drop(removed);
 
-        assert_eq!(broker.0.lock().unwrap().len(), 0);
+        assert_eq!(broker.0.lock().len(), 0);
     }
 
     #[test]
@@ -8321,7 +8348,7 @@ readline.createInterface({{ input: process.stdin }}).on('line', (line) => {{
         // session key that doesn't exist must produce a descriptive error,
         // not a panic or silent success against a dead stdin.
         let broker = RealtimeBroker::default();
-        let lookup = broker.0.lock().unwrap().get("does-not-exist").cloned();
+        let lookup = broker.0.lock().get("does-not-exist").cloned();
         assert!(lookup.is_none(), "missing session key must resolve to None");
     }
 
@@ -8374,7 +8401,7 @@ readline.createInterface({{ input: process.stdin }}).on('line', (line) => {{
         let (approval_tx, approval_rx) = mpsc::channel();
         let (question_tx, _question_rx) = mpsc::channel();
         {
-            let mut pending = broker.0.lock().unwrap();
+            let mut pending = broker.0.lock();
             pending.insert(
                 "approval".into(),
                 PendingInteraction {
@@ -8398,7 +8425,7 @@ readline.createInterface({{ input: process.stdin }}).on('line', (line) => {{
                 broker: broker.clone(),
             };
         }
-        let pending = broker.0.lock().unwrap();
+        let pending = broker.0.lock();
         assert!(!pending.contains_key("approval"));
         assert_eq!(
             pending.get("question").map(|value| value.kind),

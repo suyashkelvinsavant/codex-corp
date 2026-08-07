@@ -6,6 +6,7 @@
 //! tracked separately from Codex worker processes so stopping a workflow cannot
 //! accidentally kill the app under test.
 
+use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -14,7 +15,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tauri::{Emitter, Runtime};
@@ -86,10 +87,8 @@ pub(crate) struct LocalTestProcessRegistry(
 
 impl LocalTestProcessRegistry {
     fn contains(&self, session_id: &str) -> bool {
-        self.0
-            .lock()
-            .map(|processes| processes.contains_key(session_id))
-            .unwrap_or(false)
+        crate::workflow_runtime::poison_aware_lock(&self.0, "local test process registry", None)
+            .contains_key(session_id)
     }
 
     fn insert(
@@ -97,10 +96,11 @@ impl LocalTestProcessRegistry {
         session_id: String,
         process: Arc<Mutex<LocalTestProcess>>,
     ) -> Result<(), String> {
-        let mut processes = self
-            .0
-            .lock()
-            .map_err(|_| "local test process registry lock poisoned".to_string())?;
+        let mut processes = crate::workflow_runtime::poison_aware_lock(
+            &self.0,
+            "local test process registry",
+            None,
+        );
         if processes.contains_key(&session_id) {
             return Err("a local test process is already running for this session".into());
         }
@@ -109,7 +109,12 @@ impl LocalTestProcessRegistry {
     }
 
     fn remove(&self, session_id: &str) -> Option<Arc<Mutex<LocalTestProcess>>> {
-        self.0.lock().ok()?.remove(session_id)
+        let mut processes = crate::workflow_runtime::poison_aware_lock(
+            &self.0,
+            "local test process registry",
+            None,
+        );
+        processes.remove(session_id)
     }
 }
 
@@ -118,15 +123,18 @@ impl Drop for LocalTestProcessRegistry {
         if Arc::strong_count(&self.0) != 1 {
             return;
         }
-        if let Ok(mut processes) = self.0.lock() {
-            for process in processes.values() {
-                if let Ok(mut process) = process.lock() {
-                    process.terminate();
-                    let _ = process.child.wait();
-                }
-            }
-            processes.clear();
+        let mut processes = crate::workflow_runtime::poison_aware_lock(
+            &self.0,
+            "local test process registry",
+            None,
+        );
+        for process in processes.values() {
+            let mut process =
+                crate::workflow_runtime::poison_aware_lock(process, "local test process", None);
+            process.terminate();
+            let _ = process.child.wait();
         }
+        processes.clear();
     }
 }
 
@@ -161,10 +169,7 @@ pub(crate) fn prepare_local_test(
     run_id: String,
     database: tauri::State<'_, Database>,
 ) -> Result<LocalTestSession, String> {
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = crate::workflow_runtime::database_guard_for(&database);
     if let Some(existing) = load_session_for_run(&connection, &run_id)? {
         if existing.workflow_id != workflow_id {
             return Err("local test run does not belong to this workflow".into());
@@ -232,10 +237,7 @@ pub(crate) fn get_local_test(
     database: tauri::State<'_, Database>,
     processes: tauri::State<'_, LocalTestProcessRegistry>,
 ) -> Result<Option<LocalTestSession>, String> {
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = crate::workflow_runtime::database_guard_for(&database);
     let Some(mut session) = load_latest_session(&connection, &workflow_id)? else {
         return Ok(None);
     };
@@ -275,10 +277,7 @@ fn approve_local_test_launch_with_app<R: Runtime>(
     processes: &LocalTestProcessRegistry,
 ) -> Result<LocalTestSession, String> {
     let mut session = {
-        let connection = database
-            .0
-            .lock()
-            .map_err(|_| "database lock poisoned".to_string())?;
+        let connection = crate::workflow_runtime::database_guard_for(database);
         load_session(&connection, &session_id)?.ok_or("local test session was not found")?
     };
     if session.status != "launch_pending" {
@@ -287,10 +286,7 @@ fn approve_local_test_launch_with_app<R: Runtime>(
     if !approved {
         session.status = "declined".into();
         session.updated_at = now_iso();
-        let connection = database
-            .0
-            .lock()
-            .map_err(|_| "database lock poisoned".to_string())?;
+        let connection = crate::workflow_runtime::database_guard_for(database);
         save_session(&connection, &session)?;
         emit_event(app, &session);
         return Ok(session);
@@ -304,10 +300,7 @@ fn approve_local_test_launch_with_app<R: Runtime>(
             "The project launch metadata changed after approval was requested. Re-run the workflow to review the new launch plan.".into(),
         );
         session.updated_at = now_iso();
-        let connection = database
-            .0
-            .lock()
-            .map_err(|_| "database lock poisoned".to_string())?;
+        let connection = crate::workflow_runtime::database_guard_for(database);
         save_session(&connection, &session)?;
         emit_event(app, &session);
         return Ok(session);
@@ -317,10 +310,7 @@ fn approve_local_test_launch_with_app<R: Runtime>(
     session.last_error = None;
     session.updated_at = now_iso();
     {
-        let connection = database
-            .0
-            .lock()
-            .map_err(|_| "database lock poisoned".to_string())?;
+        let connection = crate::workflow_runtime::database_guard_for(database);
         save_session(&connection, &session)?;
     }
     emit_event(app, &session);
@@ -334,18 +324,13 @@ fn approve_local_test_launch_with_app<R: Runtime>(
             session.status = "launch_failed".into();
             session.last_error = Some(error);
             session.updated_at = now_iso();
-            let connection = database
-                .0
-                .lock()
-                .map_err(|_| "database lock poisoned".to_string())?;
+            let connection = crate::workflow_runtime::database_guard_for(database);
             save_session(&connection, &session)?;
             emit_event(app, &session);
             return Ok(session);
         }
     };
-    let pid = child
-        .lock()
-        .map_err(|_| "local test process lock poisoned".to_string())?
+    let pid = crate::workflow_runtime::poison_aware_lock(&child, "local test process", None)
         .child
         .id();
     processes.insert(session.id.clone(), child.clone())?;
@@ -353,10 +338,7 @@ fn approve_local_test_launch_with_app<R: Runtime>(
     session.pid = Some(pid);
     session.updated_at = now_iso();
     {
-        let connection = database
-            .0
-            .lock()
-            .map_err(|_| "database lock poisoned".to_string())?;
+        let connection = crate::workflow_runtime::database_guard_for(database);
         save_session(&connection, &session)?;
     }
     emit_event(app, &session);
@@ -398,10 +380,7 @@ fn submit_local_test_feedback_with_app<R: Runtime>(
     processes: &LocalTestProcessRegistry,
 ) -> Result<LocalTestSession, String> {
     let mut session = {
-        let connection = database
-            .0
-            .lock()
-            .map_err(|_| "database lock poisoned".to_string())?;
+        let connection = crate::workflow_runtime::database_guard_for(database);
         load_session(&connection, &session_id)?.ok_or("local test session was not found")?
     };
     if session.status != "running" && session.status != "exited" {
@@ -426,10 +405,7 @@ fn submit_local_test_feedback_with_app<R: Runtime>(
     // approval and change-request paths before returning control to the
     // workflow runtime.
     terminate_process(processes, &session.id);
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = crate::workflow_runtime::database_guard_for(database);
     save_session(&connection, &session)?;
     drop(connection);
     emit_event(app, &session);
@@ -444,10 +420,7 @@ pub(crate) fn stop_local_test(
     processes: tauri::State<'_, LocalTestProcessRegistry>,
 ) -> Result<LocalTestSession, String> {
     terminate_process(processes.inner(), &session_id);
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = crate::workflow_runtime::database_guard_for(&database);
     let mut session =
         load_session(&connection, &session_id)?.ok_or("local test session was not found")?;
     if matches!(session.status.as_str(), "running" | "launching") {
@@ -842,13 +815,15 @@ fn monitor_local_process<R: Runtime>(
     app: tauri::AppHandle<R>,
 ) {
     thread::spawn(move || loop {
-        let exit = child
-            .lock()
+        let exit = crate::workflow_runtime::poison_aware_lock(&child, "local test process", None)
+            .child
+            .try_wait()
             .ok()
-            .and_then(|mut process| process.child.try_wait().ok().flatten());
+            .flatten();
         if let Some(exit) = exit {
             processes.remove(&session_id);
-            if let Ok(connection) = database.0.lock() {
+            {
+                let connection = crate::workflow_runtime::database_guard_for(&database);
                 if let Ok(Some(mut session)) = load_session(&connection, &session_id) {
                     if matches!(session.status.as_str(), "running" | "launching") {
                         session.status = "exited".into();
@@ -877,11 +852,10 @@ fn terminate_process(processes: &LocalTestProcessRegistry, session_id: &str) {
     let Some(child) = processes.remove(session_id) else {
         return;
     };
-    let child_result = child.lock();
-    if let Ok(mut process) = child_result {
-        process.terminate();
-        let _ = process.child.wait();
-    }
+    let mut process =
+        crate::workflow_runtime::poison_aware_lock(&child, "local test process", None);
+    process.terminate();
+    let _ = process.child.wait();
 }
 
 fn emit_event<R: Runtime>(app: &tauri::AppHandle<R>, session: &LocalTestSession) {
@@ -1272,7 +1246,7 @@ mod tests {
             .contains(&prepared.id));
 
         let database = app.state::<Database>();
-        let connection = database.0.lock().expect("database lock");
+        let connection = database.0.lock();
         let (status, feedback): (String, String) = connection
             .query_row(
                 "SELECT status,feedback_json FROM local_test_sessions WHERE id=?1",

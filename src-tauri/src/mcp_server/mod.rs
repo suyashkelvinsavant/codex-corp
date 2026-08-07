@@ -26,6 +26,7 @@ pub fn discover_codex_json() -> Result<Value, String> {
 
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use serde_json::Value;
 
 use crate::runtime_ownership::RuntimeOwnershipGuard;
@@ -192,18 +193,12 @@ impl McpRuntime {
     pub(crate) fn headless(database: Database, runtime_owner: Arc<RuntimeOwnershipGuard>) -> Self {
         Self {
             database,
-            process_broker: ProcessBroker(Arc::new(std::sync::Mutex::new(
+            process_broker: ProcessBroker(Arc::new(Mutex::new(std::collections::HashMap::new()))),
+            turn_stdin_broker: TurnStdinBroker(Arc::new(Mutex::new(
                 std::collections::HashMap::new(),
             ))),
-            turn_stdin_broker: TurnStdinBroker(Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            ))),
-            approval_broker: ApprovalBroker(Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            ))),
-            tool_broker: ToolBroker(Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            ))),
+            approval_broker: ApprovalBroker(Arc::new(Mutex::new(std::collections::HashMap::new()))),
+            tool_broker: ToolBroker(Arc::new(Mutex::new(std::collections::HashMap::new()))),
             workflow_runtime: WorkflowRuntime::default(),
             run_approvals: RunApprovalBroker::default(),
             app: None,

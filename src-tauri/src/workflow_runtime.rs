@@ -1,13 +1,14 @@
 use chrono::{Datelike, Timelike, Utc};
 use chrono_tz::Tz;
 use futures_util::stream::{FuturesUnordered, StreamExt};
+use parking_lot::{Condvar, Mutex};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
 
@@ -44,10 +45,7 @@ impl Default for WorkflowRuntime {
 impl WorkflowRuntime {
     /// Active runs for MCP / headless status tools.
     pub(crate) fn list_active(&self, workflow_id: Option<&str>) -> Result<Vec<Value>, String> {
-        let active = self
-            .active
-            .lock()
-            .map_err(|_| "runtime registry lock poisoned".to_string())?;
+        let active = self.active.lock();
         Ok(active
             .iter()
             .filter(|(_, run)| workflow_id.map(|id| run.workflow_id == id).unwrap_or(true))
@@ -63,14 +61,13 @@ impl WorkflowRuntime {
         process_broker: &ProcessBroker,
         turn_stdin_broker: &TurnStdinBroker,
     ) -> Result<(), String> {
-        let active = self
-            .active
-            .lock()
-            .map_err(|_| "runtime registry lock poisoned".to_string())?
+        let active = self.active.lock();
+        let active_run = active
             .get(run_id)
             .cloned()
             .ok_or_else(|| "run is not active".to_string())?;
-        active.stop.store(true, Ordering::SeqCst);
+        active_run.stop.store(true, Ordering::SeqCst);
+        drop(active);
         kill_run_processes(process_broker, turn_stdin_broker, run_id);
         Ok(())
     }
@@ -92,6 +89,7 @@ impl Default for RunApprovalBroker {
     }
 }
 
+#[derive(Debug)]
 struct ProcessLimiter {
     active: Mutex<usize>,
     changed: Condvar,
@@ -118,18 +116,18 @@ impl ProcessLimiter {
 
     fn acquire(self: &Arc<Self>, stop: &AtomicBool) -> Result<ProcessPermit, String> {
         let ticket = self.next_ticket.fetch_add(1, Ordering::SeqCst);
-        let mut active = self
-            .active
-            .lock()
-            .map_err(|_| "process limiter lock poisoned".to_string())?;
+        let mut active = self.active.lock();
         while ticket != self.serving_ticket.load(Ordering::SeqCst)
             || *active >= self.limit.load(Ordering::SeqCst)
         {
-            let waited = self
+            if stop.load(Ordering::SeqCst) {
+                self.serving_ticket.fetch_add(1, Ordering::SeqCst);
+                self.changed.notify_all();
+                return Err("run interrupted while queued for a Codex process".into());
+            }
+            let _ = self
                 .changed
-                .wait_timeout(active, Duration::from_millis(250))
-                .map_err(|_| "process limiter wait poisoned".to_string())?;
-            active = waited.0;
+                .wait_for(&mut active, Duration::from_millis(250));
         }
         self.serving_ticket.fetch_add(1, Ordering::SeqCst);
         self.changed.notify_all();
@@ -141,14 +139,14 @@ impl ProcessLimiter {
     }
 }
 
+#[derive(Debug)]
 struct ProcessPermit(Arc<ProcessLimiter>);
 
 impl Drop for ProcessPermit {
     fn drop(&mut self) {
-        if let Ok(mut active) = self.0.active.lock() {
-            *active = active.saturating_sub(1);
-            self.0.changed.notify_all();
-        }
+        let mut active = self.0.active.lock();
+        *active = active.saturating_sub(1);
+        self.0.changed.notify_all();
     }
 }
 
@@ -454,6 +452,7 @@ impl From<AgentResult> for RuntimeOutput {
 #[derive(Clone)]
 struct RunContext {
     run_id: String,
+    workflow_id: String,
     /// Present for desktop UI event fan-out; `None` in headless / MCP-only runs.
     app: Option<tauri::AppHandle>,
     /// Shared SQLite handle (always available; does not require AppHandle).
@@ -472,16 +471,282 @@ struct RunContext {
     target_workspace: Option<PathBuf>,
 }
 
+pub(crate) use crate::{db_guard_for as database_guard_for, runtime_lock as poison_aware_lock};
+
+fn safe_lock<'a, T: ?Sized>(
+    context: &RunContext,
+    mutex: &'a Mutex<T>,
+    name: &str,
+) -> parking_lot::MutexGuard<'a, T> {
+    crate::runtime_lock(mutex, name, Some(&context.run_id))
+}
+
+fn database_guard<'a>(
+    context: &'a RunContext,
+) -> parking_lot::MutexGuard<'a, rusqlite::Connection> {
+    context.database.0.lock()
+}
+
 fn record_node_tokens(context: &RunContext, node_id: &str, attempt_tokens: u64) -> u64 {
-    context
-        .node_tokens
-        .lock()
-        .map(|mut totals| {
-            let total = totals.entry(node_id.to_string()).or_default();
-            *total = total.saturating_add(attempt_tokens);
-            *total
+    let mut totals = safe_lock(context, &context.node_tokens, "node_tokens");
+    let total = totals.entry(node_id.to_string()).or_default();
+    *total = total.saturating_add(attempt_tokens);
+    *total
+}
+
+/// Cumulative token total for a node in the current run.
+fn node_token_total(context: &RunContext, node_id: &str) -> u64 {
+    let totals = safe_lock(context, &context.node_tokens, "node_tokens");
+    totals.get(node_id).copied().unwrap_or(0)
+}
+
+/// Durable record of how a node pattern (role/model/effort) has behaved in
+/// past runs. Drives inline self-improvement and is exposed to the editor and
+/// workflow chat for longer-loop learning.
+#[derive(Debug, Clone)]
+struct NodeExperience {
+    node_id: String,
+    workflow_id: String,
+    role: String,
+    model: String,
+    effort: String,
+    failure_class: Option<String>,
+    stop_reason: Option<String>,
+    outcome: String,
+    attempt_count: u32,
+    total_tokens: u64,
+    latency_ms: u64,
+}
+
+/// Record a durable experience row for a node. Returns an error so the caller
+/// can decide whether to fail the run or emit a warning and continue.
+fn record_node_experience(context: &RunContext, row: &NodeExperience) -> Result<(), String> {
+    let connection = database_guard(context);
+    connection
+        .execute(
+            "INSERT INTO node_experience(node_id,workflow_id,role,model,effort,failure_class,stop_reason,outcome,attempt_count,total_tokens,latency_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![
+                row.node_id,
+                row.workflow_id,
+                row.role,
+                row.model,
+                row.effort,
+                row.failure_class,
+                row.stop_reason,
+                row.outcome,
+                row.attempt_count as i64,
+                row.total_tokens as i64,
+                row.latency_ms as i64,
+            ],
+        )
+        .map_err(|error| format!("failed to record node experience: {error}"))?;
+    Ok(())
+}
+
+/// Load recent experience rows for a node pattern directly from a connection.
+/// Returns them newest-first, with `id` as a tie-breaker so ordering is stable
+/// even when many rows share a one-second `observed_at` timestamp.
+pub(crate) fn get_node_experience(
+    connection: &rusqlite::Connection,
+    workflow_id: &str,
+    node_id: &str,
+    role: &str,
+    model: &str,
+    effort: &str,
+) -> Result<Vec<Value>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT failure_class,stop_reason,outcome,attempt_count,total_tokens,latency_ms,observed_at
+             FROM node_experience
+             WHERE workflow_id=?1 AND node_id=?2 AND role=?3 AND model=?4 AND effort=?5
+             ORDER BY observed_at DESC, id DESC LIMIT 20",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![workflow_id, node_id, role, model, effort], |row| {
+            Ok(json!({
+                "failureClass": row.get::<_, Option<String>>(0)?,
+                "stopReason": row.get::<_, Option<String>>(1)?,
+                "outcome": row.get::<_, String>(2)?,
+                "attemptCount": row.get::<_, i64>(3)?,
+                "totalTokens": row.get::<_, i64>(4)?,
+                "latencyMs": row.get::<_, i64>(5)?,
+                "observedAt": row.get::<_, String>(6)?,
+            }))
         })
-        .unwrap_or(attempt_tokens)
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+/// Load recent experience rows for the same node pattern within the current run.
+fn load_node_experience(context: &RunContext, node: &RuntimeNode) -> Result<Vec<Value>, String> {
+    let connection = database_guard(context);
+    get_node_experience(
+        &connection,
+        &context.workflow_id,
+        &node.id,
+        &node.data.role,
+        &node.data.model,
+        &node.data.effort,
+    )
+}
+
+/// Derive a guidance note from prior experience for this node pattern.
+/// The note is prepended to the specialist's extra instructions when the most
+/// recent attempts (up to three) share a recurring non-success failure class.
+/// The guidance is grounded in the actual stored records — it names the dominant
+/// failure class and the most common stop reason observed — rather than
+/// emitting a one-size-fits-all string. A recent success suppresses guidance
+/// so the runtime does not pollute a prompt that is already working.
+fn experience_guidance(records: &[Value]) -> Option<String> {
+    if records.len() < 2 {
+        return None;
+    }
+    let recent: Vec<_> = records.iter().take(3).collect();
+    // A recent success suppresses guidance so the runtime does not pollute a
+    // prompt that is already working. Only the newest record counts as "recent".
+    if recent
+        .first()
+        .and_then(|record| record.get("outcome").and_then(Value::as_str))
+        == Some("success")
+    {
+        return None;
+    }
+
+    let mut class_counts: HashMap<String, usize> = HashMap::new();
+    let mut stop_reason_counts: HashMap<String, usize> = HashMap::new();
+    let mut attempt_total: i64 = 0;
+
+    for record in &recent {
+        if let Some(class) = record
+            .get("failureClass")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            *class_counts.entry(class.to_string()).or_default() += 1;
+        }
+        if let Some(reason) = record
+            .get("stopReason")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            *stop_reason_counts.entry(reason.to_string()).or_default() += 1;
+        }
+        attempt_total += record
+            .get("attemptCount")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+    }
+
+    let (dominant_class, class_count) = class_counts.iter().max_by_key(|(_, count)| *count)?;
+    if *class_count < 2 {
+        return None;
+    }
+
+    let avg_attempts = attempt_total / recent.len().max(1) as i64;
+    let stop_reason = stop_reason_counts
+        .iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(reason, _)| reason.as_str())
+        .unwrap_or("the same failure");
+
+    let core = match dominant_class.as_str() {
+        "contract" => format!(
+            "Recent attempts failed with contract/output mismatch ({}). Return strictly valid structured JSON matching the required schema; do not wrap it in markdown fences or omit required fields.",
+            stop_reason
+        ),
+        "transient" => format!(
+            "Recent attempts hit transient errors ({}). If this happens again, wait briefly and retry; do not change the requested output over a temporary failure.",
+            stop_reason
+        ),
+        "capability" => format!(
+            "Recent attempts failed because a required capability was missing ({}). Use only the tools and skills you have; if the task truly needs something unavailable, report the gap clearly instead of attempting it.",
+            stop_reason
+        ),
+        "specification" => format!(
+            "Recent attempts did not follow the instructions ({}). Re-read the prompt, output contract, and constraints before producing output; ask for clarification if criteria are ambiguous.",
+            stop_reason
+        ),
+        "verification" => format!(
+            "Recent attempts failed host verification ({}). Provide explicit, checkable evidence for every claim and do not self-attest.",
+            stop_reason
+        ),
+        "plateau" => format!(
+            "Recent attempts plateaued on the same failure ({}). If your first approach does not succeed, deliberately vary the strategy rather than repeating the same steps.",
+            stop_reason
+        ),
+        other => format!(
+            "Recent attempts failed repeatedly with class '{}' ({}). Review the prompt and output contract, then adjust your approach.",
+            other, stop_reason
+        ),
+    };
+
+    Some(format!(
+        "[Experience note: ~{} attempt(s) per recent run, recurring '{}' failure.] {}",
+        avg_attempts, dominant_class, core
+    ))
+}
+
+pub(crate) fn initialize_database(connection: &rusqlite::Connection) -> Result<(), String> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS node_experience (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT NOT NULL,
+                workflow_id TEXT NOT NULL,
+                role TEXT,
+                model TEXT,
+                effort TEXT,
+                failure_class TEXT,
+                stop_reason TEXT,
+                outcome TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                latency_ms INTEGER,
+                observed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_node_experience_lookup ON node_experience(workflow_id, node_id, role, model, effort);"
+        )
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn delete_node_experience_for_workflow(
+    connection: &rusqlite::Connection,
+    workflow_id: &str,
+) -> Result<usize, String> {
+    connection
+        .execute(
+            "DELETE FROM node_experience WHERE workflow_id=?1",
+            params![workflow_id],
+        )
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn prune_node_experience(
+    connection: &rusqlite::Connection,
+    days: u32,
+) -> Result<usize, String> {
+    if days == 0 {
+        return Ok(0);
+    }
+    let table_exists: bool = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='node_experience'",
+            [],
+            |_| Ok(()),
+        )
+        .is_ok();
+    if !table_exists {
+        return Ok(0);
+    }
+    let age = format!("-{} days", days);
+    connection
+        .execute(
+            "DELETE FROM node_experience WHERE observed_at < datetime('now', ?1)",
+            params![age],
+        )
+        .map_err(|error| error.to_string())
 }
 
 fn load_node_token_totals(
@@ -549,7 +814,8 @@ fn record_verification_revision(
         "revision": revision,
         "summary": feedback,
     });
-    if let Ok(connection) = context.database.0.lock() {
+    {
+        let connection = database_guard(context);
         let _ = connection.execute(
             "INSERT OR REPLACE INTO node_attempts(id,run_id,node_id,attempt,revision,status,diagnostics_json,completed_at) VALUES(?1,?2,?3,?4,?5,'failed',?6,CURRENT_TIMESTAMP)",
             params![id, context.run_id, reviewer_node_id, 0_i64, revision, diagnostics.to_string()],
@@ -678,7 +944,8 @@ fn emit_event(
         message: message.into(),
         diagnostics: safe_diagnostics,
     };
-    if let Ok(connection) = context.database.0.lock() {
+    {
+        let connection = database_guard(context);
         let event_json = serde_json::to_string(&event).unwrap_or_else(|_| "{}".into());
         let _ = connection.execute(
             "INSERT INTO run_events(run_id,node_id,attempt_id,event_type,level,sequence,payload_json) VALUES(?1,?2,?3,?4,?5,?6,?7)",
@@ -1333,7 +1600,17 @@ fn resolve_json_path(root: &Value, path: &str) -> Option<Value> {
     Some(current.clone())
 }
 
-fn mapped_output(output: &RuntimeOutput, mapping: Option<&HashMap<String, String>>) -> Value {
+struct MappedOutput {
+    value: Value,
+    /// (target_field, source_path) pairs that failed to resolve and were
+    /// substituted with `null` in the projected payload.
+    missing: Vec<(String, String)>,
+}
+
+fn mapped_output(
+    output: &RuntimeOutput,
+    mapping: Option<&HashMap<String, String>>,
+) -> MappedOutput {
     let full = json!({
         "status": output.status,
         "summary": output.summary,
@@ -1342,19 +1619,31 @@ fn mapped_output(output: &RuntimeOutput, mapping: Option<&HashMap<String, String
         "threadId": output.thread_id,
     });
     let Some(mapping) = mapping.filter(|mapping| !mapping.is_empty()) else {
-        return full;
+        return MappedOutput {
+            value: full,
+            missing: Vec::new(),
+        };
     };
     let mut projected = serde_json::Map::new();
+    let mut missing = Vec::new();
     for (field, path) in mapping {
         if field.trim().is_empty() {
             continue;
         }
-        projected.insert(
-            field.clone(),
-            resolve_json_path(&full, path).unwrap_or(Value::Null),
-        );
+        match resolve_json_path(&full, path) {
+            Some(value) => {
+                projected.insert(field.clone(), value);
+            }
+            None => {
+                missing.push((field.clone(), path.clone()));
+                projected.insert(field.clone(), Value::Null);
+            }
+        }
     }
-    Value::Object(projected)
+    MappedOutput {
+        value: Value::Object(projected),
+        missing,
+    }
 }
 
 fn compose_specialist_input(
@@ -1382,10 +1671,8 @@ fn compose_specialist_input(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let outputs = context
-        .outputs
-        .lock()
-        .map_err(|_| "outputs lock poisoned".to_string())?;
+    let outputs = safe_lock(context, &context.outputs, "outputs");
+    let mut missing_events: Vec<(String, String, String, String, String, String)> = Vec::new();
     let upstream_outputs = context
         .graph
         .edges
@@ -1401,17 +1688,47 @@ fn compose_specialist_input(
         })
         .filter_map(|edge| {
             outputs.get(&edge.source).map(|output| {
+                let mapped = mapped_output(
+                    output,
+                    edge.data.as_ref().and_then(|data| data.mapping.as_ref()),
+                );
+                for (field, path) in &mapped.missing {
+                    missing_events.push((
+                        node.id.clone(),
+                        edge.id.clone(),
+                        edge.source.clone(),
+                        field.clone(),
+                        path.clone(),
+                        node.data.label.clone(),
+                    ));
+                }
                 json!({
                     "sourceNodeId": edge.source,
                     "edgeId": edge.id,
-                    "payload": mapped_output(
-                        output,
-                        edge.data.as_ref().and_then(|data| data.mapping.as_ref()),
-                    ),
+                    "payload": mapped.value,
                 })
             })
         })
         .collect::<Vec<_>>();
+    drop(outputs);
+    for (node_id, edge_id, source, field, path, label) in missing_events {
+        emit_event(
+            context,
+            "node.input.mapping.missing",
+            "warning",
+            Some(&node_id),
+            None,
+            format!(
+                "{label} mapped field '{field}' (path '{path}') resolved to null from {source}"
+            ),
+            json!({
+                "sourceNodeId": source,
+                "edgeId": edge_id,
+                "field": field,
+                "path": path,
+            }),
+        );
+    }
     let revision_feedback = if revision_feedback.trim().is_empty() {
         Vec::new()
     } else {
@@ -1596,8 +1913,8 @@ async fn specialist_once(
             let previous = context
                 .outputs
                 .lock()
-                .ok()
-                .and_then(|guard| guard.get(&node.id).map(|o| o.artifacts.clone()));
+                .get(&node.id)
+                .map(|o| o.artifacts.clone());
             let (materialized, refs) =
                 materialize_artifacts(&node.id, &output.artifacts, previous.as_deref());
             output.artifacts = materialized;
@@ -1715,7 +2032,8 @@ async fn specialist_once(
                         "artifactMeta": slim_artifact_meta(&output.artifacts),
                     }),
                 );
-                if let Ok(connection) = context.database.0.lock() {
+                {
+                    let connection = database_guard(context);
                     let _ = connection.execute(
                         "INSERT OR REPLACE INTO node_attempts(id,run_id,node_id,attempt,revision,status,thread_id,turn_id,diagnostics_json,completed_at) VALUES(?1,?2,?3,?4,?5,'failed',?6,?7,?8,CURRENT_TIMESTAMP)",
                         params![format!("{}:{}:{}",context.run_id,node.id,attempt_id),context.run_id,node.id,attempt,revision,output.thread_id,output.turn_id,json!({"elapsedMs":elapsed_ms,"reportedFailure":true,"summary":error,"attemptTokens":attempt_tokens,"failureClass":failure_class}).to_string()],
@@ -1736,7 +2054,8 @@ async fn specialist_once(
                 // Full artifact content remains in node_executions via persist, not the event bus.
                 slim_attempt_completed_diagnostics(elapsed_ms, attempt_tokens, &output),
             );
-            if let Ok(connection) = context.database.0.lock() {
+            {
+                let connection = database_guard(context);
                 let _ = connection.execute(
                     "INSERT OR REPLACE INTO node_attempts(id,run_id,node_id,attempt,revision,status,thread_id,turn_id,diagnostics_json,completed_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,CURRENT_TIMESTAMP)",
                     params![format!("{}:{}:{}",context.run_id,node.id,attempt_id),context.run_id,node.id,attempt,revision,output.status,output.thread_id,output.turn_id,json!({"elapsedMs":elapsed_ms,"attemptTokens":attempt_tokens}).to_string()],
@@ -1757,7 +2076,8 @@ async fn specialist_once(
                 format!("{} attempt failed: {error}", node.data.label),
                 json!({"elapsedMs":elapsed_ms,"error":error,"attempt":attempt,"revision":revision,"attemptTokens":attempt_tokens,"tokens":cumulative_tokens,"failureClass":failure_class}),
             );
-            if let Ok(connection) = context.database.0.lock() {
+            {
+                let connection = database_guard(context);
                 let _ = connection.execute(
                     "INSERT OR REPLACE INTO node_attempts(id,run_id,node_id,attempt,revision,status,diagnostics_json,completed_at) VALUES(?1,?2,?3,?4,?5,'failed',?6,CURRENT_TIMESTAMP)",
                     params![format!("{}:{}:{}",context.run_id,node.id,attempt_id),context.run_id,node.id,attempt,revision,json!({"elapsedMs":elapsed_ms,"error":error,"attemptTokens":attempt_tokens,"failureClass":failure_class}).to_string()],
@@ -1798,6 +2118,19 @@ enum RetryStopReason {
     /// Capability/specification recovery armed a needs_human gate that was
     /// declined or timed out (run stops only after the human path failed).
     NeedsHuman,
+}
+
+impl RetryStopReason {
+    fn as_str(&self) -> &'static str {
+        match self {
+            RetryStopReason::Plateau => "plateau",
+            RetryStopReason::Fatal => "fatal",
+            RetryStopReason::ContractExhausted => "contract_exhausted",
+            RetryStopReason::MaxRetries => "max_retries",
+            RetryStopReason::Interrupted => "interrupted",
+            RetryStopReason::NeedsHuman => "needs_human",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1997,7 +2330,7 @@ fn next_retry_action(
     fingerprints: &[String],
     hash_sets: &[String],
     contract_repair_used: bool,
-    original_extra: &str,
+    current_extra: &str,
 ) -> RetryAction {
     // Strategy-aware recovery (P2): capability/specification failures cannot be
     // fixed by re-prompting. Arm a needs_human gate on the FIRST such failure
@@ -2043,7 +2376,7 @@ fn next_retry_action(
         }
         RetryErrorClass::Contract if !contract_repair_used => RetryAction::RetryContractRepair {
             new_extra: format!(
-                "{original_extra}\n\nCONTRACT REPAIR: previous attempt failed schema/parse validation:\n{error}\nReturn valid structured JSON matching the required output schema. Do not omit required fields."
+                "{current_extra}\n\nCONTRACT REPAIR: previous attempt failed schema/parse validation:\n{error}\nReturn valid structured JSON matching the required output schema. Do not omit required fields."
             ),
         },
         RetryErrorClass::Contract => RetryAction::Stop(RetryStopReason::ContractExhausted),
@@ -2095,23 +2428,54 @@ async fn specialist_with_retries(
     revision: u32,
     extra_instruction: &str,
 ) -> Result<RuntimeOutput, String> {
+    let started_at = Instant::now();
     let mut last_error = String::new();
     let mut fingerprints: Vec<String> = Vec::new();
     let mut hash_sets: Vec<String> = Vec::new();
     let mut contract_repair_used = false;
     let mut effective_extra = extra_instruction.to_string();
+    // Inline self-improvement: if this node pattern has recurring failures in
+    // prior runs, prepend a small guidance note to the specialist prompt.
+    let experience_records = match load_node_experience(context, node) {
+        Ok(records) => records,
+        Err(error) => {
+            emit_event(
+                context,
+                "node.experience.load_failed",
+                "warning",
+                Some(&node.id),
+                None,
+                format!("failed to load node experience: {error}"),
+                json!({"error": error}),
+            );
+            Vec::new()
+        }
+    };
+    if let Some(guidance) = experience_guidance(&experience_records) {
+        effective_extra = format!("{guidance}{effective_extra}");
+        emit_event(
+            context,
+            "node.experience.guidance",
+            "info",
+            Some(&node.id),
+            None,
+            "Pre-pending experience guidance to specialist prompt",
+            json!({"guidance": guidance}),
+        );
+    }
     let mut stop_reason: Option<RetryStopReason> = None;
     let mut attempts_used: u32 = 0;
     let mut retry_limit = node.data.max_retries;
     // Seed from any prior node output (e.g. previous revision) so plateau can compare
     // against last known artifact identity when the next attempt fails.
-    let mut last_known_hash_set = context
-        .outputs
-        .lock()
-        .ok()
-        .and_then(|guard| guard.get(&node.id).cloned())
-        .map(|prior| attempt_artifact_hash_set(Some(&prior.artifacts), ""))
-        .unwrap_or_default();
+    let mut last_known_hash_set = {
+        let outputs = safe_lock(context, &context.outputs, "outputs");
+        outputs
+            .get(&node.id)
+            .cloned()
+            .map(|prior| attempt_artifact_hash_set(Some(&prior.artifacts), ""))
+            .unwrap_or_default()
+    };
     let mission = context
         .graph
         .nodes
@@ -2161,7 +2525,7 @@ async fn specialist_with_retries(
                     &fingerprints,
                     &hash_sets,
                     contract_repair_used,
-                    extra_instruction,
+                    &effective_extra,
                 );
                 match apply_retry_action(
                     context,
@@ -2186,7 +2550,34 @@ async fn specialist_with_retries(
             }
             // Ok includes verification-failed success outputs — revision owns that path.
             // Future specialist_with_retries calls seed last_known from context.outputs after persist.
-            Ok(output) => return Ok(output),
+            Ok(output) => {
+                let latency_ms = started_at.elapsed().as_millis() as u64;
+                let experience = NodeExperience {
+                    node_id: node.id.clone(),
+                    workflow_id: context.workflow_id.clone(),
+                    role: node.data.role.clone(),
+                    model: node.data.model.clone(),
+                    effort: node.data.effort.clone(),
+                    failure_class: None,
+                    stop_reason: None,
+                    outcome: "success".into(),
+                    attempt_count: attempts_used,
+                    total_tokens: output.tokens,
+                    latency_ms,
+                };
+                if let Err(error) = record_node_experience(context, &experience) {
+                    emit_event(
+                        context,
+                        "node.experience.record_failed",
+                        "warning",
+                        Some(&node.id),
+                        None,
+                        error,
+                        json!({}),
+                    );
+                }
+                return Ok(output);
+            }
             Err(error) => {
                 last_error = error.clone();
                 // Pre-materialize failures: carry last known artifact set (if any).
@@ -2206,7 +2597,7 @@ async fn specialist_with_retries(
                     &fingerprints,
                     &hash_sets,
                     contract_repair_used,
-                    extra_instruction,
+                    &effective_extra,
                 );
                 match apply_retry_action(
                     context,
@@ -2230,6 +2621,45 @@ async fn specialist_with_retries(
                 }
             }
         }
+    }
+    let latency_ms = started_at.elapsed().as_millis() as u64;
+    let (outcome, failure_class) = match stop_reason {
+        Some(RetryStopReason::Plateau) => ("plateau", "plateau"),
+        Some(RetryStopReason::MaxRetries) => {
+            ("max_retries", classify_failure(&last_error).as_str())
+        }
+        Some(RetryStopReason::ContractExhausted) => ("contract_exhausted", "contract"),
+        Some(RetryStopReason::NeedsHuman) => {
+            ("needs_human", classify_failure(&last_error).as_str())
+        }
+        Some(RetryStopReason::Interrupted) => {
+            ("interrupted", classify_failure(&last_error).as_str())
+        }
+        Some(RetryStopReason::Fatal) | None => ("fatal", classify_failure(&last_error).as_str()),
+    };
+    let experience = NodeExperience {
+        node_id: node.id.clone(),
+        workflow_id: context.workflow_id.clone(),
+        role: node.data.role.clone(),
+        model: node.data.model.clone(),
+        effort: node.data.effort.clone(),
+        failure_class: Some(failure_class.to_string()),
+        stop_reason: stop_reason.map(|r| r.as_str().into()),
+        outcome: outcome.into(),
+        attempt_count: attempts_used,
+        total_tokens: node_token_total(context, &node.id),
+        latency_ms,
+    };
+    if let Err(error) = record_node_experience(context, &experience) {
+        emit_event(
+            context,
+            "node.experience.record_failed",
+            "warning",
+            Some(&node.id),
+            None,
+            error,
+            json!({}),
+        );
     }
     Err(format_retry_stop_error(
         &node.data.label,
@@ -2505,11 +2935,10 @@ async fn execute_specialist_with_revision(
         // transient reviewer context. Persist it before exposing it in memory.
         persist_node_output(context, &target.id, &revised)
             .map_err(|error| NodeExecutionFailure::owned(&target.id, error))?;
-        context
-            .outputs
-            .lock()
-            .map_err(|_| NodeExecutionFailure::owned(&target.id, "outputs lock poisoned"))?
-            .insert(target.id.clone(), revised);
+        {
+            let mut outputs = safe_lock(context, &context.outputs, "outputs");
+            outputs.insert(target.id.clone(), revised);
+        }
         output = specialist_with_retries(
             context,
             node,
@@ -2550,12 +2979,12 @@ async fn await_operator_approval(
 ) -> Result<String, String> {
     let request_id = format!("{}::{}::{gate}", context.run_id, node.id);
     let (sender, receiver) = mpsc::channel();
-    context
-        .run_approvals
-        .0
-        .lock()
-        .map_err(|_| "run approval broker lock poisoned".to_string())?
-        .insert(request_id.clone(), sender);
+    poison_aware_lock(
+        &context.run_approvals.0,
+        "run approval broker",
+        Some(&context.run_id),
+    )
+    .insert(request_id.clone(), sender);
     if let Some(app) = &context.app {
         let _ = app.emit(
             "workflow-run-approval",
@@ -2590,7 +3019,8 @@ async fn await_operator_approval(
         None,
         true,
     );
-    if let Ok(connection) = context.database.0.lock() {
+    {
+        let connection = database_guard(context);
         let _ = connection.execute(
             "INSERT OR REPLACE INTO approvals(id,run_id,node_id,request_json,decision) VALUES(?1,?2,?3,?4,NULL)",
             params![request_id,context.run_id,node.id,json!({"title":node.data.label,"detail":detail,"gate":gate}).to_string()],
@@ -2610,18 +3040,21 @@ async fn await_operator_approval(
     .map_err(|error| error.to_string());
     // Always remove the broker entry, including timeout, cancellation, and
     // sender-disconnect paths. Stale approvals must never be actionable.
-    context
-        .run_approvals
-        .0
-        .lock()
-        .ok()
-        .and_then(|mut pending| pending.remove(&request_id));
+    {
+        let mut pending = poison_aware_lock(
+            &*context.run_approvals.0,
+            "run approval broker",
+            Some(&context.run_id),
+        );
+        pending.remove(&request_id);
+    }
     update_run_status(&context.database, &context.run_id, "running", None, true);
     let decision_result = match wait_result {
         Ok(result) => result,
         Err(error) => {
             let error = error.to_string();
-            if let Ok(connection) = context.database.0.lock() {
+            {
+                let connection = database_guard(context);
                 let _ = connection.execute(
                     "UPDATE approvals SET decision=?2 WHERE id=?1",
                     params![request_id, error],
@@ -2642,7 +3075,8 @@ async fn await_operator_approval(
     let decision = match decision_result {
         Ok(decision) => decision,
         Err(error) => {
-            if let Ok(connection) = context.database.0.lock() {
+            {
+                let connection = database_guard(context);
                 let _ = connection.execute(
                     "UPDATE approvals SET decision=?2 WHERE id=?1",
                     params![request_id, error],
@@ -2661,7 +3095,8 @@ async fn await_operator_approval(
         }
     };
     if !decision {
-        if let Ok(connection) = context.database.0.lock() {
+        {
+            let connection = database_guard(context);
             let _ = connection.execute(
                 "UPDATE approvals SET decision='declined' WHERE id=?1",
                 params![request_id],
@@ -2678,7 +3113,8 @@ async fn await_operator_approval(
         );
         return Err("operator declined the approval gate".into());
     }
-    if let Ok(connection) = context.database.0.lock() {
+    {
+        let connection = database_guard(context);
         let _ = connection.execute(
             "UPDATE approvals SET decision='approved' WHERE id=?1",
             params![request_id],
@@ -2706,10 +3142,7 @@ async fn approval_node(context: &RunContext, node: &RuntimeNode) -> Result<Runti
     .await?;
     // Freeze approved artifact (key,hash) pairs onto approval output only.
     // Cannot re-derive from artifacts table after revision DELETE+reinsert.
-    let outputs_snapshot = context
-        .outputs
-        .lock()
-        .map_err(|_| "outputs lock poisoned".to_string())?;
+    let outputs_snapshot = poison_aware_lock(&context.outputs, "outputs", Some(&context.run_id));
     let mut kind_artifacts: HashMap<String, (String, Vec<Value>)> = HashMap::new();
     for node_ref in &context.graph.nodes {
         if let Some(out) = outputs_snapshot.get(&node_ref.id) {
@@ -2903,10 +3336,7 @@ async fn execute_node(
                     .map(|edge| edge.source.clone())
             });
             let source_id = source_id.ok_or("condition source missing")?;
-            let outputs = context
-                .outputs
-                .lock()
-                .map_err(|_| "outputs lock poisoned".to_string())?;
+            let outputs = safe_lock(context, &context.outputs, "outputs");
             let source = outputs
                 .get(&source_id)
                 .ok_or("condition source has no output")?;
@@ -2923,10 +3353,7 @@ async fn execute_node(
             })
         }
         "output" => {
-            let outputs = context
-                .outputs
-                .lock()
-                .map_err(|_| "outputs lock poisoned".to_string())?;
+            let outputs = safe_lock(context, &context.outputs, "outputs");
             let approval_output = outputs.values().find(|output| {
                 output.data.get("decision").and_then(Value::as_str) == Some("approved")
             });
@@ -3013,11 +3440,7 @@ fn persist_node_output(
     node_id: &str,
     output: &RuntimeOutput,
 ) -> Result<(), String> {
-    let database = &context.database;
-    let mut connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let mut connection = database_guard(context);
     persist_node_output_to_connection(&mut connection, &context.run_id, node_id, output)
 }
 
@@ -3204,7 +3627,6 @@ fn initial_execution_sets(
 
 async fn run_worker(
     context: RunContext,
-    workflow_id: String,
     start_node_id: Option<String>,
     resume_checkpoint: Option<RunCheckpoint>,
     runtime: WorkflowRuntime,
@@ -3224,7 +3646,8 @@ async fn run_worker(
     if let Some(checkpoint) = resume_checkpoint {
         completed.extend(checkpoint.completed);
         skipped.extend(checkpoint.skipped);
-        if let Ok(mut outputs) = context.outputs.lock() {
+        {
+            let mut outputs = safe_lock(&context, &context.outputs, "outputs");
             outputs.extend(checkpoint.outputs);
         }
         emit_event(
@@ -3243,22 +3666,31 @@ async fn run_worker(
         .iter()
         .filter(|node| node.data.kind == "input")
     {
-        context.outputs.lock().ok().map(|mut outputs| {
-            outputs.insert(
-                input.id.clone(),
-                RuntimeOutput {
-                    status: "success".into(),
-                    summary: input.data.output.clone().unwrap_or_default(),
-                    data: json!({"authorizedMission":true}),
-                    artifacts: Vec::new(),
-                    thread_id: None,
-                    turn_id: None,
-                    tokens: 0,
-                },
-            )
-        });
+        let mut outputs = safe_lock(&context, &context.outputs, "outputs");
+        outputs.insert(
+            input.id.clone(),
+            RuntimeOutput {
+                status: "success".into(),
+                summary: input.data.output.clone().unwrap_or_default(),
+                data: json!({"authorizedMission":true}),
+                artifacts: Vec::new(),
+                thread_id: None,
+                turn_id: None,
+                tokens: 0,
+            },
+        );
     }
-    checkpoint(&context, &completed, &skipped);
+    if let Err(error) = checkpoint(&context, &completed, &skipped) {
+        emit_event(
+            &context,
+            "run.checkpoint.failed",
+            "warning",
+            None,
+            None,
+            format!("initial checkpoint failed: {error}; run will not be resumable"),
+            json!({"error": error}),
+        );
+    }
     let mut terminal_error: Option<String> = None;
     loop {
         if context.stop.load(Ordering::SeqCst) {
@@ -3346,10 +3778,22 @@ async fn run_worker(
                         .map(|candidate| candidate.data.kind.as_str());
                     let control_completion = emits_control_completion(node_kind)
                         .then(|| slim_control_completed_diagnostics(&output));
-                    if let Ok(mut outputs) = context.outputs.lock() {
+                    {
+                        let mut outputs = safe_lock(&context, &context.outputs, "outputs");
                         outputs.insert(node_id.clone(), output);
+                        completed.insert(node_id.clone());
+                        if let Some(ref branch) = branch {
+                            for edge in context.graph.edges.iter().filter(|edge| {
+                                edge.source == node_id
+                                    && edge.data.as_ref().is_some_and(|data| {
+                                        data.edge_type == "conditional"
+                                            && data.condition.as_deref() != Some(branch.as_str())
+                                    })
+                            }) {
+                                skipped.insert(edge.target.clone());
+                            }
+                        }
                     }
-                    completed.insert(node_id.clone());
                     if let Some(diagnostics) = control_completion {
                         let label = context
                             .graph
@@ -3368,7 +3812,7 @@ async fn run_worker(
                             diagnostics,
                         );
                     }
-                    if let Some(branch) = branch {
+                    if let Some(ref branch) = branch {
                         for edge in context.graph.edges.iter().filter(|edge| {
                             edge.source == node_id
                                 && edge.data.as_ref().is_some_and(|data| {
@@ -3376,7 +3820,6 @@ async fn run_worker(
                                         && data.condition.as_deref() != Some(branch.as_str())
                                 })
                         }) {
-                            skipped.insert(edge.target.clone());
                             emit_event(
                                 &context,
                                 "node.skipped",
@@ -3423,7 +3866,17 @@ async fn run_worker(
             }
             break;
         }
-        checkpoint(&context, &completed, &skipped);
+        if let Err(error) = checkpoint(&context, &completed, &skipped) {
+            emit_event(
+                &context,
+                "run.checkpoint.failed",
+                "warning",
+                None,
+                None,
+                format!("batch checkpoint failed: {error}; resumability may be stale"),
+                json!({"error": error}),
+            );
+        }
     }
     let (status, reason, resumable) = if let Some(error) = terminal_error {
         ("failed", Some(error), false)
@@ -3444,7 +3897,8 @@ async fn run_worker(
         resumable,
     );
     if status != "completed" {
-        if let Ok(connection) = context.database.0.lock() {
+        {
+            let connection = database_guard(&context);
             let _ = connection.execute(
                 "DELETE FROM artifacts WHERE run_id=?1 AND json_extract(metadata_json,'$.name')='delivery-bundle.json'",
                 params![context.run_id],
@@ -3470,36 +3924,38 @@ async fn run_worker(
         reason.clone().unwrap_or_else(|| format!("Run {status}")),
         json!({"completed":completed,"skipped":skipped,"resumable":resumable}),
     );
-    if let Ok(mut active) = runtime.active.lock() {
-        active.remove(&context.run_id);
+    let mut active = poison_aware_lock(&runtime.active, "runtime active", Some(&context.run_id));
+    active.remove(&context.run_id);
+    let mut connection = database_guard(&context);
+    if let Ok(settings) = app_settings::load(&connection) {
+        let _ = app_settings::cleanup(&mut connection, &settings);
     }
-    if let Ok(mut connection) = context.database.0.lock() {
-        if let Ok(settings) = app_settings::load(&connection) {
-            let _ = app_settings::cleanup(&mut connection, &settings);
-        }
-    }
-    let _ = workflow_id;
 }
 
-fn checkpoint(context: &RunContext, completed: &HashSet<String>, skipped: &HashSet<String>) {
-    let outputs = context
-        .outputs
-        .lock()
-        .map(|outputs| outputs.clone())
-        .unwrap_or_default();
+fn checkpoint(
+    context: &RunContext,
+    completed: &HashSet<String>,
+    skipped: &HashSet<String>,
+) -> Result<(), String> {
+    let outputs = {
+        let guard = safe_lock(context, &context.outputs, "outputs");
+        guard.clone()
+    };
     let value = serde_json::to_string(&RunCheckpoint {
         completed: completed.clone(),
         skipped: skipped.clone(),
         outputs,
     })
-    .unwrap_or_else(|_| "{}".into());
-    if let Ok(connection) = context.database.0.lock() {
-        let _ = connection.execute(
+    .map_err(|error| format!("checkpoint serialization failed: {error}"))?;
+    let connection = database_guard(context);
+    connection
+        .execute(
             "INSERT INTO run_checkpoints(run_id,checkpoint_json,resumable,updated_at) VALUES(?1,?2,1,CURRENT_TIMESTAMP)
              ON CONFLICT(run_id) DO UPDATE SET checkpoint_json=excluded.checkpoint_json,resumable=1,updated_at=CURRENT_TIMESTAMP",
             params![context.run_id,value],
-        );
-    }
+        )
+        .map_err(|error| format!("checkpoint persistence failed: {error}"))?;
+    Ok(())
 }
 
 fn update_run_status(
@@ -3509,12 +3965,11 @@ fn update_run_status(
     reason: Option<&str>,
     resumable: bool,
 ) {
-    if let Ok(connection) = database.0.lock() {
-        let _ = connection.execute(
-            "UPDATE runs SET status=?2,terminal_reason=?3,resumable=?4 WHERE id=?1",
-            params![run_id, status, reason, resumable as i32],
-        );
-    }
+    let connection = database_guard_for(database);
+    let _ = connection.execute(
+        "UPDATE runs SET status=?2,terminal_reason=?3,resumable=?4 WHERE id=?1",
+        params![run_id, status, reason, resumable as i32],
+    );
 }
 
 fn kill_run_processes(
@@ -3524,17 +3979,14 @@ fn kill_run_processes(
 ) {
     let prefix = format!("{run_id}::");
     // Phase 2.6: Send turn/interrupt via stdin for graceful shutdown before kill.
-    let active_turns: Vec<_> = turn_stdin_broker
-        .0
-        .lock()
-        .map(|turns| {
-            turns
-                .iter()
-                .filter(|(key, _)| key.starts_with(&prefix))
-                .map(|(_, handle)| handle.clone())
-                .collect()
-        })
-        .unwrap_or_default();
+    let active_turns: Vec<_> = {
+        let turns = poison_aware_lock(&*turn_stdin_broker.0, "turn stdin broker", None);
+        turns
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .map(|(_, handle)| handle.clone())
+            .collect()
+    };
     for handle in active_turns {
         let request_id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3548,23 +4000,21 @@ fn kill_run_processes(
     }
     // Brief grace period for the app-server to process the interrupt.
     std::thread::sleep(std::time::Duration::from_secs(2));
-    let children: Vec<_> = process_broker
-        .0
-        .lock()
-        .map(|processes| {
-            processes
-                .iter()
-                .filter(|(key, _)| key.starts_with(&prefix))
-                .map(|(_, child)| child.clone())
-                .collect()
-        })
-        .unwrap_or_default();
+    let children: Vec<_> = {
+        let processes = poison_aware_lock(&*process_broker.0, "process broker", None);
+        processes
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .map(|(_, child)| child.clone())
+            .collect()
+    };
     for child in children {
         crate::kill_app_server_child(&child);
     }
     // Clean up stdin handles.
-    if let Ok(mut stdin_map) = turn_stdin_broker.0.lock() {
-        stdin_map.retain(|key, _| !key.starts_with(&prefix));
+    {
+        let mut turns = poison_aware_lock(&*turn_stdin_broker.0, "turn stdin broker", None);
+        turns.retain(|key, _| !key.starts_with(&prefix));
     }
 }
 
@@ -3592,10 +4042,7 @@ async fn start_run_core(
     turn_stdin_broker: TurnStdinBroker,
 ) -> Result<NativeRunRecord, String> {
     let graph_json: String = {
-        let connection = database
-            .0
-            .lock()
-            .map_err(|_| "database lock poisoned".to_string())?;
+        let connection = database_guard_for(&database);
         let settings = app_settings::load(&connection)?;
         runtime
             .limiter
@@ -3638,10 +4085,7 @@ async fn start_run_core(
     let nodes_json = serde_json::to_string(&graph.nodes).map_err(|error| error.to_string())?;
     let edges_json = serde_json::to_string(&graph.edges).map_err(|error| error.to_string())?;
     {
-        let connection = database
-            .0
-            .lock()
-            .map_err(|_| "database lock poisoned".to_string())?;
+        let connection = database_guard_for(&database);
         connection
             .execute(
                 "INSERT INTO runs(id,workflow_id,status,events_json,nodes_json,edges_json,runtime_version,resumable,workspace_path) VALUES(?1,?2,'queued','[]',?3,?4,?5,1,?6)",
@@ -3652,6 +4096,7 @@ async fn start_run_core(
     let stop = Arc::new(AtomicBool::new(false));
     let context = RunContext {
         run_id: run_id.clone(),
+        workflow_id: workflow_id.clone(),
         app,
         database: database.clone(),
         graph,
@@ -3666,11 +4111,9 @@ async fn start_run_core(
         run_approvals,
         target_workspace,
     };
-    runtime
-        .active
-        .lock()
-        .map_err(|_| "runtime registry lock poisoned".to_string())?
-        .insert(
+    {
+        let mut active = poison_aware_lock(&runtime.active, "runtime active", Some(&run_id));
+        active.insert(
             run_id.clone(),
             ActiveRun {
                 workflow_id: workflow_id.clone(),
@@ -3678,10 +4121,10 @@ async fn start_run_core(
                 stop,
             },
         );
+    }
     let runtime_owned = runtime.clone();
-    let workflow_owned = workflow_id.clone();
     tauri::async_runtime::spawn(async move {
-        run_worker(context, workflow_owned, start_node_id, None, runtime_owned).await;
+        run_worker(context, start_node_id, None, runtime_owned).await;
     });
     get_run_record(&database, &run_id)
 }
@@ -3744,10 +4187,7 @@ pub(crate) async fn start_run_headless(
 }
 
 fn get_run_record(database: &Database, run_id: &str) -> Result<NativeRunRecord, String> {
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = database_guard_for(database);
     connection
         .query_row(
             "SELECT id,workflow_id,status,created_at,terminal_reason,resumable,pinned,last_event_seq,nodes_json,edges_json FROM runs WHERE id=?1",
@@ -3777,13 +4217,10 @@ pub(crate) fn stop_run(
     process_broker: tauri::State<'_, ProcessBroker>,
     turn_stdin_broker: tauri::State<'_, TurnStdinBroker>,
 ) -> Result<(), String> {
-    let active = runtime
-        .active
-        .lock()
-        .map_err(|_| "runtime registry lock poisoned".to_string())?
-        .get(&run_id)
-        .cloned()
-        .ok_or("run is not active")?;
+    let active = {
+        let active = poison_aware_lock(&runtime.active, "runtime active", None);
+        active.get(&run_id).cloned().ok_or("run is not active")?
+    };
     active.stop.store(true, Ordering::SeqCst);
     kill_run_processes(process_broker.inner(), turn_stdin_broker.inner(), &run_id);
     Ok(())
@@ -3799,12 +4236,12 @@ pub(crate) fn respond_run_approval(
     if !request_id.starts_with(&format!("{run_id}::")) {
         return Err("approval does not belong to this run".into());
     }
-    let sender = broker
-        .0
-        .lock()
-        .map_err(|_| "run approval broker lock poisoned".to_string())?
-        .remove(&request_id)
-        .ok_or("approval is no longer pending")?;
+    let sender = {
+        let mut pending = poison_aware_lock(&*broker.0, "run approval broker", None);
+        pending
+            .remove(&request_id)
+            .ok_or("approval is no longer pending")?
+    };
     sender.send(decision).map_err(|error| error.to_string())
 }
 
@@ -3813,10 +4250,7 @@ pub(crate) fn get_run(
     run_id: String,
     database: tauri::State<'_, Database>,
 ) -> Result<NativeRunRecord, String> {
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = database_guard_for(&database);
     connection
         .query_row(
             "SELECT id,workflow_id,status,created_at,terminal_reason,resumable,pinned,last_event_seq,nodes_json,edges_json FROM runs WHERE id=?1",
@@ -3846,10 +4280,7 @@ pub(crate) fn analytics_verification_loops(
     run_id: String,
     database: tauri::State<'_, Database>,
 ) -> Result<Value, String> {
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = database_guard_for(&database);
     verification_loops_for_run(&connection, &run_id)
 }
 
@@ -3858,15 +4289,27 @@ pub(crate) fn list_active_runs(
     workflow_id: Option<String>,
     runtime: tauri::State<'_, WorkflowRuntime>,
 ) -> Result<Vec<Value>, String> {
-    let active = runtime
-        .active
-        .lock()
-        .map_err(|_| "runtime registry lock poisoned".to_string())?;
+    let active = poison_aware_lock(&runtime.active, "runtime active", None);
     Ok(active
         .iter()
         .filter(|(_, run)| workflow_id.as_ref().is_none_or(|id| &run.workflow_id == id))
         .map(|(run_id, run)| json!({"runId":run_id,"workflowId":run.workflow_id,"status":run.status}))
         .collect())
+}
+
+/// Expose durable node experience to workflow chat and the workflow
+/// creator/editor so they can learn from past runs.
+#[tauri::command]
+pub(crate) fn list_node_experience(
+    workflow_id: String,
+    node_id: String,
+    role: String,
+    model: String,
+    effort: String,
+    database: tauri::State<'_, Database>,
+) -> Result<Vec<Value>, String> {
+    let connection = database_guard_for(&database);
+    get_node_experience(&connection, &workflow_id, &node_id, &role, &model, &effort)
 }
 
 #[tauri::command]
@@ -3887,10 +4330,7 @@ pub(crate) async fn resume_run(
         return Err("only interrupted resumable runs can be resumed".into());
     }
     let (graph, checkpoint, target_workspace, node_tokens) = {
-        let connection = database
-            .0
-            .lock()
-            .map_err(|_| "database lock poisoned".to_string())?;
+        let connection = database_guard_for(&database);
         let checkpoint_json: String = connection
             .query_row(
                 "SELECT checkpoint_json FROM run_checkpoints WHERE run_id=?1 AND resumable=1",
@@ -3919,6 +4359,7 @@ pub(crate) async fn resume_run(
     let stop = Arc::new(AtomicBool::new(false));
     let context = RunContext {
         run_id: run_id.clone(),
+        workflow_id: record.workflow_id.clone(),
         app: Some(app.clone()),
         database: database.inner().clone(),
         graph,
@@ -3933,11 +4374,9 @@ pub(crate) async fn resume_run(
         run_approvals: run_approvals.inner().clone(),
         target_workspace,
     };
-    runtime
-        .active
-        .lock()
-        .map_err(|_| "runtime registry lock poisoned".to_string())?
-        .insert(
+    {
+        let mut active = poison_aware_lock(&runtime.active, "runtime active", Some(&run_id));
+        active.insert(
             run_id.clone(),
             ActiveRun {
                 workflow_id: record.workflow_id.clone(),
@@ -3945,10 +4384,10 @@ pub(crate) async fn resume_run(
                 stop,
             },
         );
+    }
     let runtime_owned = runtime.inner().clone();
-    let workflow_id = record.workflow_id.clone();
     tauri::async_runtime::spawn(async move {
-        run_worker(context, workflow_id, None, Some(checkpoint), runtime_owned).await;
+        run_worker(context, None, Some(checkpoint), runtime_owned).await;
     });
     Ok(record)
 }
@@ -4028,10 +4467,7 @@ fn cron_matches_at(expression: &str, timezone: &str, now: chrono::DateTime<Utc>)
 fn due_schedules(app: &tauri::AppHandle) -> Result<Vec<DueSchedule>, String> {
     let workflows = {
         let database = app.state::<Database>();
-        let connection = database
-            .0
-            .lock()
-            .map_err(|_| "database lock poisoned".to_string())?;
+        let connection = database_guard_for(&database);
         let mut statement = connection
             .prepare("SELECT id,graph_json,workspace_path FROM workflows ORDER BY id")
             .map_err(|error| error.to_string())?;
@@ -4075,10 +4511,7 @@ fn due_schedules(app: &tauri::AppHandle) -> Result<Vec<DueSchedule>, String> {
 
 fn reserve_schedule_firing(app: &tauri::AppHandle, schedule: &DueSchedule) -> Result<bool, String> {
     let database = app.state::<Database>();
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = database_guard_for(&database);
     connection
         .execute(
             "INSERT OR IGNORE INTO schedule_firings(workflow_id,node_id,minute_key) VALUES(?1,?2,?3)",
@@ -4089,20 +4522,18 @@ fn reserve_schedule_firing(app: &tauri::AppHandle, schedule: &DueSchedule) -> Re
 }
 
 fn release_schedule_firing(app: &tauri::AppHandle, schedule: &DueSchedule) {
-    if let Ok(connection) = app.state::<Database>().0.lock() {
-        let _ = connection.execute(
-            "DELETE FROM schedule_firings WHERE workflow_id=?1 AND node_id=?2 AND minute_key=?3",
-            params![schedule.workflow_id, schedule.node_id, schedule.minute_key],
-        );
-    }
+    let database = app.state::<Database>();
+    let connection = database_guard_for(&database);
+    let _ = connection.execute(
+        "DELETE FROM schedule_firings WHERE workflow_id=?1 AND node_id=?2 AND minute_key=?3",
+        params![schedule.workflow_id, schedule.node_id, schedule.minute_key],
+    );
 }
 
 fn workflow_is_active(app: &tauri::AppHandle, workflow_id: &str) -> bool {
-    app.state::<WorkflowRuntime>()
-        .active
-        .lock()
-        .map(|active| active.values().any(|run| run.workflow_id == workflow_id))
-        .unwrap_or(true)
+    let runtime = app.state::<WorkflowRuntime>();
+    let active = poison_aware_lock(&runtime.active, "runtime active", None);
+    active.values().any(|run| run.workflow_id == workflow_id)
 }
 
 fn scheduler_tick(app: &tauri::AppHandle) {
@@ -4154,10 +4585,7 @@ fn start_scheduler(app: tauri::AppHandle) {
 /// Mark in-flight runs as interrupted and apply retention cleanup.
 /// Shared by desktop `initialize` and headless `McpHost::headless` (no cron).
 pub(crate) fn recover_interrupted_runs(database: &Database) -> Result<(), String> {
-    let mut connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let mut connection = database_guard_for(database);
     let _ = connection.execute(
         "UPDATE runs SET status='interrupted',resumable=1,terminal_reason='application restarted during run' WHERE status IN ('queued','running','waiting_approval')",
         [],
@@ -4203,6 +4631,24 @@ mod tests {
         assert!(cron_matches_at("*/15 9-17 * * 1-5", "UTC", now).is_some());
         assert!(cron_matches_at("0,30 9-17 * * 1-5", "UTC", now).is_some());
         assert!(cron_matches_at("*/20 9-17 * * 1-5", "UTC", now).is_none());
+    }
+
+    #[test]
+    fn process_limiter_returns_interrupted_when_stopped_while_queued() {
+        let limiter = Arc::new(ProcessLimiter::new(1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let _first = limiter.acquire(&stop).unwrap();
+
+        let limiter2 = limiter.clone();
+        let stop2 = stop.clone();
+        let handle = std::thread::spawn(move || limiter2.acquire(&stop2));
+
+        std::thread::sleep(Duration::from_millis(50));
+        stop.store(true, Ordering::SeqCst);
+
+        let result = handle.join().unwrap();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("interrupted"));
     }
 
     #[test]
@@ -4342,6 +4788,57 @@ mod tests {
         let prompt = connector_capability_instructions(&node);
         assert!(prompt.contains("imagegen"));
         assert!(prompt.contains("figma.generate_asset"));
+    }
+
+    #[test]
+    fn builder_gets_danger_full_access_and_never_approval() {
+        let node = RuntimeNode {
+            id: "builder".into(),
+            data: RuntimeNodeData {
+                label: "Builder".into(),
+                role: "Builder".into(),
+                kind: "agent".into(),
+                model: "gpt".into(),
+                effort: default_effort(),
+                tools: vec![
+                    "Workspace read".into(),
+                    "Workspace write".into(),
+                    "Shell".into(),
+                    "Build".into(),
+                    "Test".into(),
+                    "Package install".into(),
+                ],
+                connector_tools: vec![],
+                skills: vec![],
+                active_skill: None,
+                permission_profile: None,
+                collaboration_mode: None,
+                personality: None,
+                prompt: String::new(),
+                base_instructions: String::new(),
+                developer_instructions: String::new(),
+                output: None,
+                user_test_feedback: Vec::new(),
+                completion_criteria: Vec::new(),
+                max_retries: 0,
+                approval_policy: "never".into(),
+                sandbox_profile: "danger-full-access".into(),
+                workspace_policy: default_workspace(),
+                input_schema: None,
+                timeout_seconds: default_timeout_seconds(),
+                requires_approval: false,
+                hard_criteria_gate: false,
+                output_schema: None,
+                condition_rule: None,
+                cron_expression: None,
+                cron_timezone: None,
+                cron_enabled: true,
+            },
+        };
+        assert_eq!(
+            tool_policy(&node).unwrap(),
+            ("danger-full-access".into(), "never".into())
+        );
     }
 
     #[test]
@@ -5042,6 +5539,7 @@ mod tests {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         RunContext {
             run_id: "run-test".into(),
+            workflow_id: "wf-test".into(),
             app: None,
             database: Database(Arc::new(Mutex::new(connection))),
             graph: RuntimeGraph {
@@ -5086,7 +5584,7 @@ mod tests {
                 {"id":"revision","source":"review","target":"target","data":{"edgeType":"revision"}}
             ]
         })).unwrap();
-        context.outputs.lock().unwrap().extend([
+        context.outputs.lock().extend([
             (
                 "a".into(),
                 sample_output("success", "done", json!({"score":7})),
@@ -5118,6 +5616,67 @@ mod tests {
             json!(["save button is inert"])
         );
         assert!(!composed.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn mapped_output_collects_missing_paths() {
+        let output = sample_output("success", "ok", json!({"score": 7}));
+        let mut mapping = HashMap::new();
+        mapping.insert("score".into(), "$.data.score".into());
+        mapping.insert("missing".into(), "$.data.not_present".into());
+        mapping.insert("bad_path".into(), "data.score".into()); // no $. prefix
+        let mapped = mapped_output(&output, Some(&mapping));
+        assert_eq!(
+            mapped.value,
+            json!({"score": 7, "missing": null, "bad_path": null})
+        );
+        let missing: HashSet<_> = mapped.missing.iter().cloned().collect();
+        assert_eq!(missing.len(), 2, "expected two missing mapped paths");
+        assert!(missing.contains(&("missing".into(), "$.data.not_present".into())));
+        assert!(missing.contains(&("bad_path".into(), "data.score".into())));
+    }
+
+    #[test]
+    fn compose_specialist_input_emits_mapping_missing_event() {
+        let mut context = sample_run_context(None);
+        {
+            let connection = context.database.0.lock();
+            crate::initialize_database(&connection).unwrap();
+        }
+        context.graph = serde_json::from_value(json!({
+            "nodes": [
+                {"id":"input","data":{"label":"Input","role":"Input","kind":"input","output":"mission"}},
+                {"id":"a","data":{"label":"A","role":"A","kind":"agent"}},
+                {"id":"target","data":{"label":"Target","role":"Target","kind":"agent"}}
+            ],
+            "edges": [
+                {"id":"mapped","source":"a","target":"target","data":{"edgeType":"standard","mapping":{"missing":"$.data.not_present"}}}
+            ]
+        })).unwrap();
+        context.outputs.lock().extend([(
+            "a".into(),
+            sample_output("success", "done", json!({"score":7})),
+        )]);
+        let target = context
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.id == "target")
+            .unwrap();
+        let composed = compose_specialist_input(&context, target, "").unwrap();
+        assert_eq!(
+            composed["upstreamOutputs"][0]["payload"],
+            json!({"missing": null})
+        );
+        let connection = context.database.0.lock();
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM run_events WHERE event_type='node.input.mapping.missing'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "missing mapping should emit a warning event");
     }
 
     #[test]
@@ -5454,7 +6013,7 @@ mod tests {
         // queryable via count_verification_revisions without re-parsing delivery.
         let context = sample_run_context(None);
         {
-            let connection = context.database.0.lock().unwrap();
+            let connection = context.database.0.lock();
             connection
                 .execute_batch(
                     "CREATE TABLE node_attempts (
@@ -5491,7 +6050,7 @@ mod tests {
         );
         record_verification_revision(&context, "other-reviewer", "builder", 1, &["x".into()], "x");
         {
-            let connection = context.database.0.lock().unwrap();
+            let connection = context.database.0.lock();
             assert_eq!(
                 count_verification_revisions(&connection, "run-test", "reviewer").unwrap(),
                 2
@@ -5546,7 +6105,7 @@ mod tests {
         // failing criterion ids (deduped) exactly like the inspector chip uses.
         let context = sample_run_context(None);
         {
-            let connection = context.database.0.lock().unwrap();
+            let connection = context.database.0.lock();
             connection
                 .execute_batch(
                     "CREATE TABLE node_attempts (
@@ -5584,7 +6143,7 @@ mod tests {
         record_verification_revision(&context, "qa", "producer", 1, &["hidden-1".into()], "nope");
         // A non-verification attempt must not count toward loop analytics.
         {
-            let connection = context.database.0.lock().unwrap();
+            let connection = context.database.0.lock();
             connection
                 .execute(
                     "INSERT INTO node_attempts(id,run_id,node_id,attempt,revision,status,diagnostics_json)
@@ -5604,7 +6163,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let connection = context.database.0.lock().unwrap();
+        let connection = context.database.0.lock();
         let value = verification_loops_for_run(&connection, "run-test").unwrap();
         assert_eq!(value["runId"], "run-test");
         let nodes = value["nodes"].as_array().unwrap();
@@ -5925,7 +6484,7 @@ mod tests {
         let mut sender = None;
         let request_id = "run-test::builder::needs_human";
         for _ in 0..100 {
-            sender = context.run_approvals.0.lock().unwrap().remove(request_id);
+            sender = context.run_approvals.0.lock().remove(request_id);
             if sender.is_some() {
                 break;
             }
@@ -5965,7 +6524,7 @@ mod tests {
         );
         let database = Database(Arc::new(Mutex::new(connection)));
         recover_interrupted_runs(&database).unwrap();
-        let connection = database.0.lock().unwrap();
+        let connection = database.0.lock();
         let (status, resumable, reason): (String, i64, Option<String>) = connection
             .query_row(
                 "SELECT status,resumable,terminal_reason FROM runs WHERE id='run-recovery'",
@@ -6074,5 +6633,262 @@ mod tests {
             .unwrap();
         assert!(metadata.contains("new"));
         assert!(!metadata.contains("old-a"));
+    }
+
+    #[test]
+    fn node_experience_records_and_recalls_for_self_improvement() {
+        let mut context = sample_run_context(None);
+        {
+            let connection = context.database.0.lock();
+            crate::initialize_database(&connection).unwrap();
+        }
+        context.graph = serde_json::from_value(json!({
+            "nodes": [{
+                "id": "greeter",
+                "data": {
+                    "label": "Greeter",
+                    "role": "greeting-specialist",
+                    "kind": "agent",
+                    "model": "gpt-5.6-luna",
+                    "effort": "low"
+                }
+            }],
+            "edges": []
+        }))
+        .unwrap();
+        let node = context
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.id == "greeter")
+            .unwrap();
+
+        let base = || NodeExperience {
+            node_id: node.id.clone(),
+            workflow_id: context.workflow_id.clone(),
+            role: node.data.role.clone(),
+            model: node.data.model.clone(),
+            effort: node.data.effort.clone(),
+            failure_class: Some("contract".into()),
+            stop_reason: Some("max_retries".into()),
+            outcome: "max_retries".into(),
+            attempt_count: 0,
+            total_tokens: 0,
+            latency_ms: 0,
+        };
+
+        let mut first = base();
+        first.attempt_count = 3;
+        first.total_tokens = 120;
+        first.latency_ms = 4500;
+        record_node_experience(&context, &first).unwrap();
+
+        let mut second = base();
+        second.attempt_count = 2;
+        second.total_tokens = 90;
+        second.latency_ms = 3200;
+        record_node_experience(&context, &second).unwrap();
+
+        let records = load_node_experience(&context, node).unwrap();
+        assert_eq!(records.len(), 2, "both experience rows should be loaded");
+        let guidance = experience_guidance(&records)
+            .expect("recurring contract failures should produce guidance");
+        assert!(
+            guidance.to_ascii_lowercase().contains("schema")
+                || guidance.to_ascii_lowercase().contains("structured json"),
+            "guidance should nudge the specialist toward valid structured JSON: {guidance}"
+        );
+
+        // A recent success should suppress failure-derived guidance.
+        record_node_experience(
+            &context,
+            &NodeExperience {
+                failure_class: None,
+                stop_reason: None,
+                outcome: "success".into(),
+                attempt_count: 1,
+                total_tokens: 12,
+                latency_ms: 800,
+                ..base()
+            },
+        )
+        .unwrap();
+        let records_after_success = load_node_experience(&context, node).unwrap();
+        assert!(
+            experience_guidance(&records_after_success).is_none(),
+            "a recent success should suppress pre-emptive failure guidance"
+        );
+    }
+
+    #[test]
+    fn node_experience_ignores_stale_success_when_recent_fails() {
+        let mut context = sample_run_context(None);
+        {
+            let connection = context.database.0.lock();
+            crate::initialize_database(&connection).unwrap();
+        }
+        context.graph = serde_json::from_value(json!({
+            "nodes": [{
+                "id": "greeter",
+                "data": {
+                    "label": "Greeter",
+                    "role": "greeting-specialist",
+                    "kind": "agent",
+                    "model": "gpt-5.6-luna",
+                    "effort": "low"
+                }
+            }],
+            "edges": []
+        }))
+        .unwrap();
+        let node = context
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.id == "greeter")
+            .unwrap();
+
+        let base = || NodeExperience {
+            node_id: node.id.clone(),
+            workflow_id: context.workflow_id.clone(),
+            role: node.data.role.clone(),
+            model: node.data.model.clone(),
+            effort: node.data.effort.clone(),
+            failure_class: Some("contract".into()),
+            stop_reason: Some("max_retries".into()),
+            outcome: "max_retries".into(),
+            attempt_count: 0,
+            total_tokens: 0,
+            latency_ms: 0,
+        };
+
+        // An older success should not suppress guidance when the most recent
+        // attempts are failing again.
+        record_node_experience(
+            &context,
+            &NodeExperience {
+                failure_class: None,
+                stop_reason: None,
+                outcome: "success".into(),
+                attempt_count: 1,
+                total_tokens: 12,
+                latency_ms: 800,
+                ..base()
+            },
+        )
+        .unwrap();
+        for _ in 0..2 {
+            record_node_experience(&context, &base()).unwrap();
+        }
+
+        let records = load_node_experience(&context, node).unwrap();
+        assert!(
+            experience_guidance(&records).is_some(),
+            "recurring recent failures should produce guidance despite an older success"
+        );
+    }
+
+    #[test]
+    fn database_guard_returns_usable_connection() {
+        let context = sample_run_context(None);
+        {
+            let connection = context.database.0.lock();
+            crate::initialize_database(&connection).unwrap();
+        }
+        let guard = database_guard(&context);
+        let count: i64 = guard
+            .query_row("SELECT COUNT(*) FROM node_experience", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "database_guard should return a usable connection");
+    }
+
+    #[test]
+    #[ignore = "set CODEX_CORP_LIVE_LUNA_TEST=1 to run a real Luna low call (costs tokens)"]
+    fn live_luna_low_agent_roundtrip() {
+        if std::env::var("CODEX_CORP_LIVE_LUNA_TEST").is_err() {
+            return;
+        }
+        let temp_dir =
+            std::env::temp_dir().join(format!("codex-corp-live-luna-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let output_schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["status", "summary", "data", "artifacts"],
+            "properties": {
+                "status": { "type": "string", "enum": ["success", "failure"] },
+                "summary": { "type": "string" },
+                "data": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["greeting"],
+                    "properties": {
+                        "greeting": { "type": "string" }
+                    }
+                },
+                "artifacts": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["name", "kind", "content"],
+                        "properties": {
+                            "name": { "type": "string" },
+                            "kind": { "type": "string", "enum": ["code", "document", "json", "image", "link"] },
+                            "content": { "type": "string" }
+                        }
+                    }
+                }
+            }
+        });
+        let request = AgentRequest {
+            node_id: "live-luna".into(),
+            run_id: Some("live-run".into()),
+            attempt_id: Some("a0".into()),
+            thread_id: None,
+            role: "greeting-specialist".into(),
+            model: "gpt-5.6-luna".into(),
+            effort: "low".into(),
+            base_instructions: "".into(),
+            developer_instructions: "Return only a raw JSON object. Do not use markdown code fences or explanation. The data object should contain a single key 'greeting' with a friendly one-sentence greeting string. artifacts must be an empty array.".into(),
+            user_input: "Produce a friendly one-sentence greeting and return it as JSON.".into(),
+            upstream_outputs: Vec::new(),
+            approval_policy: "never".into(),
+            sandbox_profile: "workspace-write".into(),
+            permission_profile: None,
+            collaboration_mode: None,
+            personality: None,
+            workspace_policy: "workflow".into(),
+            target_workspace: Some(temp_dir.to_string_lossy().into_owned()),
+            timeout_seconds: 60,
+            output_schema: Some(output_schema),
+            tools: Vec::new(),
+            skills: Vec::new(),
+            tool_boundary: "".into(),
+            app_server_path: None,
+        };
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        crate::initialize_database(&connection).unwrap();
+        let result = tauri::async_runtime::block_on(execute_agent_internal(
+            request,
+            None,
+            ApprovalBroker(Arc::new(Mutex::new(HashMap::new()))),
+            ProcessBroker(Arc::new(Mutex::new(HashMap::new()))),
+            TurnStdinBroker(Arc::new(Mutex::new(HashMap::new()))),
+            Database(Arc::new(Mutex::new(connection))),
+            Arc::new(AtomicU64::new(0)),
+        ))
+        .expect("luna low call should succeed");
+        assert_eq!(
+            result.status, "success",
+            "agent should report success: {}",
+            result.summary
+        );
+        let greeting = result
+            .data
+            .get("greeting")
+            .and_then(Value::as_str)
+            .expect("data.greeting should be present");
+        assert!(!greeting.is_empty(), "greeting should not be empty");
     }
 }

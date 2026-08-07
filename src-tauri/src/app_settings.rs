@@ -251,6 +251,8 @@ pub(crate) fn cleanup(
                 params![cutoff],
             )
             .map_err(|error| error.to_string())?;
+        crate::workflow_runtime::prune_node_experience(&transaction, settings.retention_days)
+            .map_err(|error| format!("experience retention cleanup failed: {error}"))?;
     }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(ids.len())
@@ -260,10 +262,7 @@ pub(crate) fn cleanup(
 pub(crate) fn get_app_settings(
     database: tauri::State<'_, Database>,
 ) -> Result<AppSettings, String> {
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = crate::workflow_runtime::database_guard_for(&database);
     load(&connection)
 }
 
@@ -272,10 +271,7 @@ pub(crate) fn preview_retention(
     settings: AppSettings,
     database: tauri::State<'_, Database>,
 ) -> Result<RetentionPreview, String> {
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = crate::workflow_runtime::database_guard_for(&database);
     preview(&connection, settings)
 }
 
@@ -286,10 +282,7 @@ pub(crate) fn save_app_settings(
     database: tauri::State<'_, Database>,
 ) -> Result<RetentionPreview, String> {
     settings.validate()?;
-    let mut connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let mut connection = crate::workflow_runtime::database_guard_for(&database);
     let result = preview(&connection, settings.clone())?;
     if result.affected_runs > 0 && !confirm_cleanup {
         return Err(format!(
@@ -313,10 +306,7 @@ pub(crate) fn save_app_settings(
 
 #[tauri::command]
 pub(crate) fn cleanup_detailed_logs(database: tauri::State<'_, Database>) -> Result<usize, String> {
-    let mut connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let mut connection = crate::workflow_runtime::database_guard_for(&database);
     let settings = load(&connection)?;
     cleanup(&mut connection, &settings)
 }
@@ -326,10 +316,7 @@ pub(crate) fn get_storage_info(
     app: tauri::AppHandle,
     database: tauri::State<'_, Database>,
 ) -> Result<StorageInfo, String> {
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = crate::workflow_runtime::database_guard_for(&database);
     let data = app_data_dir();
     let database_path = data.join("codex-corp.sqlite");
     let database_bytes = std::fs::metadata(&database_path)
@@ -350,10 +337,7 @@ pub(crate) fn pin_run(
     pinned: bool,
     database: tauri::State<'_, Database>,
 ) -> Result<(), String> {
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = crate::workflow_runtime::database_guard_for(&database);
     let changed = connection
         .execute(
             "UPDATE runs SET pinned=?2 WHERE id=?1",
@@ -368,10 +352,7 @@ pub(crate) fn pin_run(
 
 #[tauri::command]
 pub(crate) fn export_detailed_logs(database: tauri::State<'_, Database>) -> Result<String, String> {
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = crate::workflow_runtime::database_guard_for(&database);
     let mut runs_statement = connection
         .prepare("SELECT id,workflow_id,status,created_at,pinned,terminal_reason FROM runs ORDER BY datetime(created_at) DESC")
         .map_err(|error| error.to_string())?;
@@ -437,10 +418,7 @@ pub(crate) fn export_detailed_logs(database: tauri::State<'_, Database>) -> Resu
 
 #[tauri::command]
 pub(crate) fn clear_all_company_data(database: tauri::State<'_, Database>) -> Result<(), String> {
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = crate::workflow_runtime::database_guard_for(&database);
     connection
         .execute_batch(
             "DELETE FROM artifacts;
@@ -493,10 +471,7 @@ pub(crate) fn persist_hook_run(
     record: HookRunRecord,
     database: tauri::State<'_, Database>,
 ) -> Result<(), String> {
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = crate::workflow_runtime::database_guard_for(&database);
     persist_hook_run_with_connection(&connection, &record)
 }
 
@@ -541,10 +516,7 @@ pub(crate) fn list_hook_runs(
     limit: Option<u32>,
     database: tauri::State<'_, Database>,
 ) -> Result<Vec<HookRunRecord>, String> {
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = crate::workflow_runtime::database_guard_for(&database);
     let limit = limit.unwrap_or(50).min(500);
     let mut params: Vec<Box<dyn ToSql>> = Vec::new();
     let sql = if let Some(ref nid) = node_id {
@@ -581,10 +553,7 @@ pub(crate) fn list_hook_runs(
 
 #[tauri::command]
 pub(crate) fn clear_hook_runs(database: tauri::State<'_, Database>) -> Result<usize, String> {
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = crate::workflow_runtime::database_guard_for(&database);
     let count = connection
         .execute("DELETE FROM hook_runs", [])
         .map_err(|error| error.to_string())?;

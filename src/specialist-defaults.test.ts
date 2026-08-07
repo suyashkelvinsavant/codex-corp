@@ -10,12 +10,15 @@ import { WORKFLOW_ARCHITECT_SYSTEM_PROMPT } from "./workflow-architect-tools";
 
 describe("specialist defaults", () => {
   it("provides role-specific detailed prompts, tools, and skills", () => {
-    const builder = defaultSpecialistForRole("Frontend Engineer", "agent");
+    const builder = defaultSpecialistForRole("Builder", "agent");
     expect(builder.prompt.length).toBeGreaterThan(MIN_SPECIALIST_PROMPT_CHARS);
     expect(builder.tools.length).toBeGreaterThan(0);
     expect(builder.skills).toEqual([]);
     expect(builder.skillHints.length).toBeGreaterThan(0);
     expect(builder.prompt.toLowerCase()).toMatch(/frontend|implementer|ui/);
+    expect(builder.sandboxProfile).toBe("danger-full-access");
+    expect(builder.approvalPolicy).toBe("never");
+    expect(builder.workspacePolicy).toBe("workflow");
 
     const creative = defaultSpecialistForRole("Creative", "creative");
     expect(creative.prompt.length).toBeGreaterThan(MIN_SPECIALIST_PROMPT_CHARS);

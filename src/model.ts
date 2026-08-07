@@ -111,7 +111,7 @@ export type AgentData = {
   timeoutSeconds?: number;
   workspacePolicy?: "isolated" | "workflow";
   approvalPolicy?: "on-request" | "untrusted" | "never";
-  sandboxProfile?: "read-only" | "workspace-write";
+  sandboxProfile?: "read-only" | "workspace-write" | "danger-full-access";
   condition?: string;
   conditionRule?: ConditionRule;
   /** Skills selected from the live Codex connector inventory. */

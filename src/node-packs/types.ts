@@ -19,8 +19,9 @@ export type NodePack = {
   skillHints: string[];
   nonGoals?: string[];
   completionCriteria?: CompletionCriterion[];
-  sandboxProfile?: "read-only" | "workspace-write";
+  sandboxProfile?: "read-only" | "workspace-write" | "danger-full-access";
   approvalPolicy?: "on-request" | "untrusted" | "never";
+  workspacePolicy?: "isolated" | "workflow";
 };
 
 export type PackKind = NodePack["kind"];
@@ -43,8 +44,9 @@ export type PackInstantiation = {
   /** Non-binding role guidance retained for catalog/prompt UX. */
   skillHints: string[];
   completionCriteria?: CompletionCriterion[];
-  sandboxProfile?: "read-only" | "workspace-write";
+  sandboxProfile?: "read-only" | "workspace-write" | "danger-full-access";
   approvalPolicy?: "on-request" | "untrusted" | "never";
+  workspacePolicy?: "isolated" | "workflow";
 };
 
 export type MigratableInstructionData = {

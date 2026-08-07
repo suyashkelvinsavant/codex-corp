@@ -8,11 +8,12 @@
 //! requestApproval. Migrate those only when call sites map cleanly (see
 //! HEADLESS.md Architecture debt).
 
+use parking_lot::Mutex;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, ChildStdin};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -57,9 +58,9 @@ struct ChatProcessGuard {
 impl Drop for ChatProcessGuard {
     fn drop(&mut self) {
         kill_app_server_child(&self.child);
-        if let Ok(mut processes) = self.broker.0.lock() {
-            processes.remove(&self.key);
-        }
+        let mut processes =
+            crate::workflow_runtime::poison_aware_lock(&self.broker.0, "process broker", None);
+        processes.remove(&self.key);
     }
 }
 
@@ -174,10 +175,7 @@ where
         broker: process_broker.clone(),
         child: child.clone(),
     };
-    process_broker
-        .0
-        .lock()
-        .map_err(|_| "process broker lock poisoned".to_string())?
+    crate::workflow_runtime::poison_aware_lock(&process_broker.0, "process broker", None)
         .insert(process_key, child.clone());
 
     let read_response = |expected_id: i64| -> Result<Value, String> {

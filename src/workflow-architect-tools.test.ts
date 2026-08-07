@@ -42,8 +42,37 @@ describe("workflow architect tools", () => {
         "workflow_validate",
         "workflow_repair",
         "workflow_open_editor",
+        "workflow_node_experience",
       ]),
     );
+  });
+
+  it("exposes sandbox, approval, and workspace policy in architect tool schemas", () => {
+    const tools = workflowArchitectDynamicTools();
+    const create = tools.find((tool) => tool.name === "workflow_create")!;
+    const add = tools.find((tool) => tool.name === "workflow_add_node")!;
+    const patch = tools.find((tool) => tool.name === "workflow_patch_node")!;
+    const createNodeProps = (create.inputSchema as any).properties.nodes.items
+      .properties;
+    const addNodeProps = (add.inputSchema as any).properties.node.properties;
+    const patchProps = (patch.inputSchema as any).properties.patch.properties;
+
+    for (const props of [createNodeProps, addNodeProps, patchProps]) {
+      expect(props).toHaveProperty("sandboxProfile");
+      expect(props).toHaveProperty("approvalPolicy");
+      expect(props).toHaveProperty("workspacePolicy");
+      expect(props.sandboxProfile.enum).toEqual([
+        "read-only",
+        "workspace-write",
+        "danger-full-access",
+      ]);
+      expect(props.approvalPolicy.enum).toEqual([
+        "on-request",
+        "untrusted",
+        "never",
+      ]);
+      expect(props.workspacePolicy.enum).toEqual(["isolated", "workflow"]);
+    }
   });
 
   it("preserves the untouched graph when updating workflow metadata", async () => {
@@ -172,6 +201,154 @@ Output contract
     const node = saved?.nodes.find((item) => item.id === "researcher-2");
     expect(node?.data.model).toBe("gpt-5.6-luna");
     expect(node?.data.effort).toBe("medium");
+  });
+
+  it("propagates pack policy fields when adding a Builder specialist", async () => {
+    let saved: WorkflowTemplate | undefined;
+    const result = await executeWorkflowArchitectTool(
+      "workflow_add_node",
+      {
+        id: "software-company",
+        node: {
+          id: "builder-2",
+          label: "Builder 2",
+          role: "Builder",
+          kind: "agent",
+          prompt:
+            "Implement the approved frontend, run the build, and verify with tests.",
+        },
+      },
+      {
+        save: (workflow) => {
+          saved = workflow;
+        },
+        remove: vi.fn(),
+        open: vi.fn(),
+      },
+    );
+
+    expect(result.success).toBe(true);
+    const node = saved?.nodes.find((item) => item.id === "builder-2");
+    expect(node?.data.sandboxProfile).toBe("danger-full-access");
+    expect(node?.data.approvalPolicy).toBe("never");
+    expect(node?.data.workspacePolicy).toBe("workflow");
+  });
+
+  it("preserves explicit sandbox, approval, and workspace policy when adding a node", async () => {
+    let saved: WorkflowTemplate | undefined;
+    const result = await executeWorkflowArchitectTool(
+      "workflow_add_node",
+      {
+        id: "software-company",
+        node: {
+          id: "builder-2",
+          label: "Builder 2",
+          role: "Builder",
+          kind: "agent",
+          model: "gpt-5",
+          prompt: "Implement and verify.",
+          sandboxProfile: "workspace-write",
+          approvalPolicy: "on-request",
+          workspacePolicy: "isolated",
+        },
+      },
+      {
+        save: (workflow) => {
+          saved = workflow;
+        },
+        remove: vi.fn(),
+        open: vi.fn(),
+      },
+    );
+
+    expect(result.success).toBe(true);
+    const node = saved?.nodes.find((item) => item.id === "builder-2");
+    expect(node?.data.sandboxProfile).toBe("workspace-write");
+    expect(node?.data.approvalPolicy).toBe("on-request");
+    expect(node?.data.workspacePolicy).toBe("isolated");
+  });
+
+  it("preserves explicit sandbox, approval, and workspace policy when creating a workflow", async () => {
+    let saved: WorkflowTemplate | undefined;
+    const result = await executeWorkflowArchitectTool(
+      "workflow_create",
+      {
+        id: "policy-graph",
+        name: "Policy graph",
+        description: "Tests policy preservation",
+        nodes: [
+          {
+            id: "in",
+            label: "Mission brief",
+            role: "Control",
+            kind: "input",
+          },
+          {
+            id: "b",
+            label: "Builder",
+            role: "Builder",
+            kind: "agent",
+            model: "gpt-5",
+            prompt: "Implement the approved design, run tests, and build.",
+            sandboxProfile: "workspace-write",
+            approvalPolicy: "on-request",
+            workspacePolicy: "isolated",
+          },
+          {
+            id: "out",
+            label: "Release",
+            role: "Control",
+            kind: "output",
+          },
+        ],
+        edges: [
+          { source: "in", target: "b" },
+          { source: "b", target: "out" },
+        ],
+      },
+      {
+        save: (workflow) => {
+          saved = workflow;
+        },
+        remove: vi.fn(),
+        open: vi.fn(),
+      },
+    );
+
+    expect(result.success).toBe(true);
+    const builder = saved?.nodes.find((item) => item.id === "b");
+    expect(builder?.data.sandboxProfile).toBe("workspace-write");
+    expect(builder?.data.approvalPolicy).toBe("on-request");
+    expect(builder?.data.workspacePolicy).toBe("isolated");
+  });
+
+  it("allows the architect to patch sandbox, approval, and workspace policy", async () => {
+    let saved: WorkflowTemplate | undefined;
+    const result = await executeWorkflowArchitectTool(
+      "workflow_patch_node",
+      {
+        id: "software-company",
+        nodeId: "builder",
+        patch: {
+          sandboxProfile: "danger-full-access",
+          approvalPolicy: "never",
+          workspacePolicy: "workflow",
+        },
+      },
+      {
+        save: (workflow) => {
+          saved = workflow;
+        },
+        remove: vi.fn(),
+        open: vi.fn(),
+      },
+    );
+
+    expect(result.success).toBe(true);
+    const builder = saved?.nodes.find((node) => node.id === "builder");
+    expect(builder?.data.sandboxProfile).toBe("danger-full-access");
+    expect(builder?.data.approvalPolicy).toBe("never");
+    expect(builder?.data.workspacePolicy).toBe("workflow");
   });
 
   it("requires confirmation before deleting a workflow or node", async () => {

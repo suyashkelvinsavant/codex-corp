@@ -1,9 +1,10 @@
 //! MCP server process lifecycle: start / stop / status (embedded + external PID file).
 
+use parking_lot::Mutex;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -92,9 +93,8 @@ pub fn start_embedded_with_config(
         }
     }
 
-    let mut guard = embedded_slot()
-        .lock()
-        .map_err(|_| "mcp lifecycle lock poisoned".to_string())?;
+    let mut guard =
+        crate::workflow_runtime::poison_aware_lock(embedded_slot(), "mcp lifecycle", None);
     if let Some(existing) = guard.as_ref() {
         if !existing.stop.load(Ordering::SeqCst) {
             if existing.config.same_bind(&config) {
@@ -198,10 +198,7 @@ fn spawn_http_with_retry(
 /// place so a peer headless server can observe it; the server poller removes the
 /// file after tripping.
 pub fn stop_embedded() {
-    let maybe_state = embedded_slot()
-        .lock()
-        .ok()
-        .and_then(|mut guard| guard.take());
+    let maybe_state = embedded_slot().lock().take();
     let stopped_local = if let Some(state) = maybe_state {
         state.stop.store(true, Ordering::SeqCst);
         if let Some(handle) = state.listener {
@@ -222,11 +219,10 @@ pub fn stop_embedded() {
 }
 
 pub fn status_embedded() -> ServerStatus {
-    if let Ok(guard) = embedded_slot().lock() {
-        if let Some(state) = guard.as_ref() {
-            if !state.stop.load(Ordering::SeqCst) {
-                return status_from_config(&state.config, &state.mode, &state.owner_id, true);
-            }
+    let guard = embedded_slot().lock();
+    if let Some(state) = guard.as_ref() {
+        if !state.stop.load(Ordering::SeqCst) {
+            return status_from_config(&state.config, &state.mode, &state.owner_id, true);
         }
     }
     // Fall back to on-disk status (another process may own the server).

@@ -31,7 +31,7 @@ const ADDITIONAL_BUILTIN_CONTRACTS = [
       "product-manager",
       "researcher",
       "designer",
-      "frontend-engineer",
+      "builder",
       "qa-engineer",
     ],
     minimumNodeCount: 8,
@@ -280,20 +280,27 @@ describe("workflow catalog", () => {
         );
       }
     });
-    it("runs Software company specialists in the selected workspace with escalation available", () => {
-      const agents = getTemplate("software-company-v1").nodes.filter(
-        (node) => node.data.kind === "agent",
+    it("runs Software company specialists in the selected workspace with builder autonomy", () => {
+      const software = getTemplate("software-company-v1");
+      const builder = software.nodes.find((node) => node.id === "builder");
+      expect(builder?.data.approvalPolicy).toBe("never");
+      expect(builder?.data.sandboxProfile).toBe("danger-full-access");
+      expect(builder?.data.workspacePolicy).toBe("workflow");
+
+      const agents = software.nodes.filter((node) => node.data.kind === "agent");
+      expect(agents.length).toBe(4);
+      for (const node of agents) {
+        if (node.id === "builder") continue;
+        const approval = node.data.approvalPolicy ?? "on-request";
+        const sandbox = node.data.sandboxProfile ?? "workspace-write";
+        expect(["on-request", "untrusted", "never"]).toContain(approval);
+        expect(["read-only", "workspace-write", "danger-full-access"]).toContain(
+          sandbox,
+        );
+      }
+      expect(agents.every((node) => node.data.workspacePolicy === "workflow")).toBe(
+        true,
       );
-      expect(agents).toHaveLength(4);
-      expect(
-        agents.every((node) => node.data.approvalPolicy === "on-request"),
-      ).toBe(true);
-      expect(
-        agents.every((node) => node.data.sandboxProfile === "workspace-write"),
-      ).toBe(true);
-      expect(
-        agents.every((node) => node.data.workspacePolicy === "workflow"),
-      ).toBe(true);
     });
 
     it("gives QA deterministic required test and build gates", () => {
@@ -317,6 +324,9 @@ describe("workflow catalog", () => {
       const builder = getTemplate("software-company-v1").nodes.find(
         (node) => node.id === "builder",
       );
+      expect(builder?.data.packId).toBe("builder");
+      expect(builder?.data.approvalPolicy).toBe("never");
+      expect(builder?.data.sandboxProfile).toBe("danger-full-access");
       expect(builder?.data.tools).toEqual(
         expect.arrayContaining([
           "Workspace read",
@@ -324,6 +334,9 @@ describe("workflow catalog", () => {
           "Shell",
           "Apply patch",
           "Network",
+          "Build",
+          "Test",
+          "Package install",
         ]),
       );
       expect(builder?.data.developerInstructions).toMatch(
@@ -334,6 +347,9 @@ describe("workflow catalog", () => {
       );
       expect(builder?.data.developerInstructions).toMatch(
         /do not report success/i,
+      );
+      expect(builder?.data.developerInstructions).toMatch(
+        /do not ask for human approval|do not request human permission/i,
       );
     });
 

@@ -13,6 +13,7 @@ function pack(
 ): NodePack {
   const { baseInstructions, ...rest } = partial;
   return {
+    workspacePolicy: "workflow" as const,
     ...rest,
     version: V,
     harnessCoreVersion: HARNESS_CORE_VERSION,
@@ -145,9 +146,15 @@ Output contract
       "Shell",
       "Apply patch",
       "Network",
+      "Build",
+      "Test",
+      "Package install",
     ],
     skillHints: ["frontend-design", "react"],
     nonGoals: ["Invent unapproved backend contracts"],
+    sandboxProfile: "danger-full-access",
+    approvalPolicy: "never",
+    workspacePolicy: "workflow",
     developerInstructions: `You are the Frontend Engineer specialist — a SOLE IMPLEMENTER for UI work in this company.
 
 Mission
@@ -157,13 +164,54 @@ Mission
 Process
 1. Inspect the existing workspace, package manifest, lockfile, and relevant source before editing. Reuse the existing stack and avoid rereading unrelated files.
 2. Implement the smallest vertical slice that satisfies acceptance criteria using focused patches.
-3. Reconcile the declared dependency environment. When dependencies are missing or incomplete, run the repository's deterministic package-manager install and request permission if the sandbox requires it.
+3. Reconcile the declared dependency environment. When dependencies are missing or incomplete, run the repository's deterministic package-manager install. Do not ask for human approval; the execution boundary is configured to allow the package install, build, and test tools you need.
 4. Run targeted tests first, then the repository test and production build commands. Fix failures you own before handing work to QA.
 
 Output contract
 - status success|failure|needs_revision, summary, data, code artifacts.
 - Do not report success while dependency installation, tests, or the production build are incomplete or failing. Include exact commands and results without dumping full logs.
+- If dependency installation, the test suite, or the production build fails due to an environment/network issue outside the mission scope, report failure with the exact diagnostic; do not return needs_revision for infrastructure blockers. QA or the operator will decide the next step.
 - Never invent backend contracts that Architect did not approve.`,
+  }),
+  pack({
+    id: "builder",
+    label: "Builder",
+    role: "Builder",
+    kind: "agent",
+    menuOrder: 55,
+    description:
+      "Full-stack builder with read, write, build, test, and package-install tooling.",
+    tools: [
+      "Workspace read",
+      "Workspace write",
+      "Shell",
+      "Apply patch",
+      "Network",
+      "Build",
+      "Test",
+      "Package install",
+    ],
+    skillHints: ["frontend-design", "react", "api-design"],
+    nonGoals: ["Bypass approval gates", "Scope creep beyond mission"],
+    sandboxProfile: "danger-full-access",
+    approvalPolicy: "never",
+    workspacePolicy: "workflow",
+    developerInstructions: `You are the Builder specialist — a SOLE IMPLEMENTER for this track.
+
+Mission
+- Turn the approved mission, architecture, and design into a working, tested, buildable deliverable.
+- Keep changes small, typed, and testable. Match existing project patterns.
+
+Process
+1. Inspect the existing workspace, package manifest, lockfile, and relevant source before editing. Reuse the existing stack and avoid rereading unrelated files.
+2. Implement the smallest vertical slice that satisfies acceptance criteria using focused patches.
+3. Reconcile the declared dependency environment. When dependencies are missing or incomplete, run the repository's deterministic package-manager install. Do not ask for human approval; the execution boundary is configured to allow the package install, build, and test tools you need.
+4. Run targeted tests first, then the repository test and production build commands. Fix failures you own before handing work to QA.
+
+Output contract
+- status success|failure|needs_revision, summary, data, code artifacts.
+- Do not report success while dependency installation, tests, or the production build are incomplete or failing. Include exact commands and results without dumping full logs.
+- If dependency installation, the test suite, or the production build fails due to an environment/network issue outside the mission scope, report failure with the exact diagnostic; do not return needs_revision for infrastructure blockers. QA or the operator will decide the next step.`,
   }),
   pack({
     id: "backend-engineer",
@@ -172,10 +220,21 @@ Output contract
     kind: "agent",
     menuOrder: 60,
     description:
-      "Implements server/API/data paths with least-privilege tooling.",
-    tools: ["Shell", "Workspace write", "Apply patch"],
+      "Implements server/API/data paths with build and test tooling.",
+    tools: [
+      "Shell",
+      "Workspace write",
+      "Apply patch",
+      "Network",
+      "Build",
+      "Test",
+      "Package install",
+    ],
     skillHints: ["api-design"],
     nonGoals: ["Secret storage in source"],
+    sandboxProfile: "danger-full-access",
+    approvalPolicy: "never",
+    workspacePolicy: "workflow",
     developerInstructions: `You are the Backend Engineer specialist — a SOLE IMPLEMENTER for server-side work.
 
 Mission
@@ -184,11 +243,16 @@ Mission
 
 Process
 1. Consume architecture + acceptance criteria.
-2. Implement minimal endpoints/modules; add focused tests when the repo has a harness.
-3. Document run/config steps for the operator.
+2. Inspect the workspace, package manifest, and lockfile before editing; reuse the existing stack.
+3. Reconcile the declared dependency environment. When dependencies are missing or incomplete, run the repository's deterministic package-manager install. Do not ask for human approval; the execution boundary is configured to allow the package install, build, and test tools you need.
+4. Implement minimal endpoints/modules; add focused tests when the repo has a harness.
+5. Run the repository test and production build commands and fix failures you own before handing work to QA.
+6. Document run/config steps for the operator.
 
 Output contract
-- Structured summary + code/document artifacts. Call needs_revision if blockers remain.`,
+- Structured summary + code/document artifacts.
+- Do not report success while dependency installation, tests, or the production build are incomplete or failing. Include exact commands and results.
+- If dependency installation, the test suite, or the production build fails due to an environment/network issue outside the mission scope, report failure with the exact diagnostic; do not return needs_revision for infrastructure blockers.`,
   }),
   pack({
     id: "senior-software-engineer",
@@ -198,9 +262,20 @@ Output contract
     menuOrder: 65,
     description:
       "Full-stack implementer for focused code-change delivery tracks.",
-    tools: ["Shell", "Workspace write", "Apply patch"],
+    tools: [
+      "Shell",
+      "Workspace write",
+      "Apply patch",
+      "Network",
+      "Build",
+      "Test",
+      "Package install",
+    ],
     skillHints: ["react", "api-design"],
     nonGoals: ["Bypass approval gates", "Scope creep beyond mission"],
+    sandboxProfile: "danger-full-access",
+    approvalPolicy: "never",
+    workspacePolicy: "workflow",
     developerInstructions: `You are the Senior Software Engineer specialist — sole implementer for this change track.
 
 Mission
@@ -209,11 +284,16 @@ Mission
 
 Process
 1. Read mission, architecture, and QA expectations.
-2. Implement, verify with available checks, and document residual risks.
-3. Package clear handoff notes for QA and human approval.
+2. Inspect the workspace, package manifest, and lockfile before editing; reuse the existing stack.
+3. Reconcile the declared dependency environment. When dependencies are missing or incomplete, run the repository's deterministic package-manager install. Do not ask for human approval; the execution boundary is configured to allow the package install, build, and test tools you need.
+4. Implement, verify with available checks, and document residual risks.
+5. Run the repository test and production build commands and fix failures you own before handing work to QA.
+6. Package clear handoff notes for QA and human approval.
 
 Output contract
-- status success|failure|needs_revision; code/document artifacts; residual risks explicit.`,
+- status success|failure|needs_revision; code/document artifacts; residual risks explicit.
+- Do not report success while dependency installation, tests, or the production build are incomplete or failing. Include exact commands and results.
+- If dependency installation, the test suite, or the production build fails due to an environment/network issue outside the mission scope, report failure with the exact diagnostic; do not return needs_revision for infrastructure blockers.`,
   }),
   pack({
     id: "qa-engineer",
@@ -348,6 +428,7 @@ Output contract
       "Blank specialist with neutral harness-core — configure role and contract.",
     tools: ["Shell", "Workspace write"],
     skillHints: [],
+    workspacePolicy: "isolated",
     nonGoals: ["Operate without an operator-authored role contract"],
     developerInstructions: `You are a focused specialist agent in a multi-agent company graph.
 

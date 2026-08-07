@@ -70,10 +70,7 @@ fn validate_finance_entry(entry: &FinanceEntry) -> Result<(), String> {
 #[tauri::command]
 pub(crate) fn list_finance_entries(app: tauri::AppHandle) -> Result<Vec<FinanceEntry>, String> {
     let database = app.state::<Database>();
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = crate::workflow_runtime::database_guard_for(&database);
     let mut statement = connection
         .prepare(
             "SELECT id,workflow_id,kind,source,amount,currency,occurred_at,note
@@ -102,10 +99,7 @@ pub(crate) fn list_finance_entries(app: tauri::AppHandle) -> Result<Vec<FinanceE
 pub(crate) fn save_finance_entry(entry: FinanceEntry, app: tauri::AppHandle) -> Result<(), String> {
     validate_finance_entry(&entry)?;
     let database = app.state::<Database>();
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = crate::workflow_runtime::database_guard_for(&database);
     connection
         .execute(
             "INSERT INTO finance_entries(id,workflow_id,kind,source,amount,currency,occurred_at,note)
@@ -131,10 +125,7 @@ pub(crate) fn save_finance_entry(entry: FinanceEntry, app: tauri::AppHandle) -> 
 #[tauri::command]
 pub(crate) fn delete_finance_entry(id: String, app: tauri::AppHandle) -> Result<(), String> {
     let database = app.state::<Database>();
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = crate::workflow_runtime::database_guard_for(&database);
     connection
         .execute("DELETE FROM finance_entries WHERE id=?1", params![id])
         .map(|_| ())
@@ -146,10 +137,7 @@ pub(crate) fn list_dashboard_feedback(
     app: tauri::AppHandle,
 ) -> Result<Vec<DashboardFeedback>, String> {
     let database = app.state::<Database>();
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = crate::workflow_runtime::database_guard_for(&database);
     let mut statement = connection
         .prepare(
             "SELECT id,created_at,operator_message,architect_digest,workflow_id
@@ -184,10 +172,7 @@ pub(crate) fn save_dashboard_feedback(
         return Err("dashboard feedback is incomplete".into());
     }
     let database = app.state::<Database>();
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "database lock poisoned".to_string())?;
+    let connection = crate::workflow_runtime::database_guard_for(&database);
     connection
         .execute(
             "INSERT INTO dashboard_feedback(id,created_at,operator_message,architect_digest,workflow_id)

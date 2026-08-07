@@ -75,6 +75,7 @@ function ctx(over: Partial<MediatorHostContext> = {}): MediatorHostContext {
     ],
     running: false,
     runId: null,
+    workflowId: "wf-test",
     approvals: [],
     runHistory: [],
     ...over,

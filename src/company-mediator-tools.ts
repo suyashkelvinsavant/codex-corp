@@ -15,6 +15,7 @@ import { composeAuthorizedMission } from "./mission-context";
 import type { MediatorQuestion, MediatorQuestionAnswer } from "./mediator-ui";
 import type { LocalTestSession } from "./local-test";
 import type { AppProjectMode, AppWorkspaceSelection } from "./workflow-chat";
+import { listNodeExperience, formatExperienceDigest } from "./node-experience";
 
 export const COMPANY_MEDIATOR_SYSTEM_PROMPT = `You are Byte for Codex Corp — the human-facing companion for a multi-specialist company graph (not a graph node yourself).
 
@@ -40,7 +41,7 @@ Steer the company with **tools** and talk to the operator. You do **not** implem
 - company_run / company_run_from / company_stop / company_set_mission / approval tools for control.
 - After a completed Release Bundle, report the local-test status from company_status. The operator must launch, test, and approve or give concrete feedback; never claim the app was tested without that evidence.
 - company_ask_operator for blocking structured questions when a decision is missing.
-- company_list_nodes + node_get / node_get_trace / node_get_events / node_task_progress for inspection.
+- company_list_nodes + node_get / node_get_trace / node_get_events / node_get_experience / node_task_progress for inspection. Call node_get_experience when a node has repeated failures to see its historical outcomes and recurring failure classes.
 
 ## Style
 Brief, accurate markdown. No marketing fluff. No assumed product (landing page, app type, stack) unless the operator stated it.`;
@@ -51,6 +52,7 @@ export type MediatorHostContext = {
   events: RunEvent[];
   running: boolean;
   runId: string | null;
+  workflowId: string;
   approvals: ApprovalRequest[];
   localTest?: LocalTestSession | null;
   runHistory: RunRecord[];
@@ -286,6 +288,13 @@ export function companyMediatorDynamicTools(): DynamicToolSpecJson[] {
       type: "function",
       name: "node_focus",
       description: "Focus/select a node in the graph editor UI.",
+      inputSchema: nodeRef,
+    },
+    {
+      type: "function",
+      name: "node_get_experience",
+      description:
+        "Durable run experience for a node pattern (success/failure outcomes, failure classes, tokens, latency). Call this before giving advice about a repeated failure or before suggesting prompt/tool changes.",
       inputSchema: nodeRef,
     },
   ];
@@ -548,6 +557,7 @@ export async function executeCompanyMediatorTool(
       case "node_get_criteria":
       case "node_get_events":
       case "node_task_progress":
+      case "node_get_experience":
       case "node_focus": {
         const resolved = resolveNode(ctx, {
           nodeId: str("nodeId"),
@@ -627,6 +637,23 @@ export async function executeCompanyMediatorTool(
               at: e.at,
             }));
           return ok({ id: node.id, events: ev });
+        }
+        if (name === "node_get_experience") {
+          const records = await listNodeExperience({
+            workflowId: ctx.workflowId,
+            nodeId: node.id,
+            role: node.data.role,
+            model: node.data.model,
+            effort: node.data.effort,
+          });
+          return ok({
+            id: node.id,
+            role: node.data.role,
+            model: node.data.model,
+            effort: node.data.effort,
+            digest: formatExperienceDigest(records),
+            records: records.slice(0, 20),
+          });
         }
         // node_task_progress
         {

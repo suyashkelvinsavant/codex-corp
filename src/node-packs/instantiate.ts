@@ -24,6 +24,7 @@ export function instantiatePack(pack: NodePack): PackInstantiation {
       : defaultPlatformCriteria(),
     sandboxProfile: pack.sandboxProfile,
     approvalPolicy: pack.approvalPolicy,
+    workspacePolicy: pack.workspacePolicy,
   };
 }
 

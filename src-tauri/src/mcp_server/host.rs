@@ -29,10 +29,7 @@ impl McpHost {
         let database = open_shared_database()?;
         // Apply the same app_settings / chat / business schema helpers used by desktop.
         {
-            let connection = database
-                .0
-                .lock()
-                .map_err(|_| "database lock poisoned".to_string())?;
+            let connection = crate::workflow_runtime::database_guard_for(&database);
             crate::app_settings::initialize(&connection)?;
             crate::chat_data::initialize(&connection)?;
             crate::business_data::initialize(&connection)?;
@@ -73,12 +70,7 @@ impl McpHost {
     }
 
     pub fn list_workflows(&self) -> Result<Value, String> {
-        let connection = self
-            .runtime
-            .database
-            .0
-            .lock()
-            .map_err(|_| "database lock poisoned".to_string())?;
+        let connection = crate::workflow_runtime::database_guard_for(&self.runtime.database);
         let mut statement = connection
             .prepare(
                 "SELECT id,name,graph_json,template_json,workspace_path,updated_at FROM workflows ORDER BY updated_at DESC,id",
@@ -115,12 +107,7 @@ impl McpHost {
     }
 
     pub fn get_workflow(&self, id: &str) -> Result<Value, String> {
-        let connection = self
-            .runtime
-            .database
-            .0
-            .lock()
-            .map_err(|_| "database lock poisoned".to_string())?;
+        let connection = crate::workflow_runtime::database_guard_for(&self.runtime.database);
         connection
             .query_row(
                 "SELECT id,name,graph_json,template_json,workspace_path,updated_at FROM workflows WHERE id=?1",
@@ -140,12 +127,7 @@ impl McpHost {
     }
 
     pub fn list_runs(&self, workflow_id: Option<&str>) -> Result<Value, String> {
-        let connection = self
-            .runtime
-            .database
-            .0
-            .lock()
-            .map_err(|_| "database lock poisoned".to_string())?;
+        let connection = crate::workflow_runtime::database_guard_for(&self.runtime.database);
         let mut items = Vec::new();
         if let Some(workflow_id) = workflow_id {
             let mut statement = connection
@@ -177,12 +159,7 @@ impl McpHost {
 
     pub fn get_run(&self, run_id: &str) -> Result<Value, String> {
         let mut record = {
-            let connection = self
-                .runtime
-                .database
-                .0
-                .lock()
-                .map_err(|_| "database lock poisoned".to_string())?;
+            let connection = crate::workflow_runtime::database_guard_for(&self.runtime.database);
             connection
                 .query_row(
                     "SELECT id,workflow_id,status,created_at,terminal_reason,resumable,pinned,last_event_seq,nodes_json,edges_json FROM runs WHERE id=?1",
@@ -213,12 +190,11 @@ impl McpHost {
     }
 
     fn pending_run_approval_ids_for_run(&self, run_id: &str) -> Result<Vec<String>, String> {
-        let pending = self
-            .runtime
-            .run_approvals
-            .0
-            .lock()
-            .map_err(|_| "run approval broker lock poisoned".to_string())?;
+        let pending = crate::workflow_runtime::poison_aware_lock(
+            &self.runtime.run_approvals.0,
+            "run approval broker",
+            None,
+        );
         let prefix = format!("{run_id}::");
         let mut ids: Vec<String> = pending
             .keys()
@@ -232,12 +208,7 @@ impl McpHost {
     /// Per-node verification→revision loop analytics (P4) — same SQL surface as
     /// the `analytics_verification_loops` Tauri command.
     pub fn analytics_verification_loops(&self, run_id: &str) -> Result<Value, String> {
-        let connection = self
-            .runtime
-            .database
-            .0
-            .lock()
-            .map_err(|_| "database lock poisoned".to_string())?;
+        let connection = crate::workflow_runtime::database_guard_for(&self.runtime.database);
         crate::workflow_runtime::verification_loops_for_run(&connection, run_id)
     }
 
@@ -281,14 +252,13 @@ impl McpHost {
         if !request_id.starts_with(&format!("{run_id}::")) {
             return Err("approval does not belong to this run".into());
         }
-        let sender = self
-            .runtime
-            .run_approvals
-            .0
-            .lock()
-            .map_err(|_| "run approval broker lock poisoned".to_string())?
-            .remove(request_id)
-            .ok_or_else(|| "approval is no longer pending".to_string())?;
+        let sender = crate::workflow_runtime::poison_aware_lock(
+            &self.runtime.run_approvals.0,
+            "run approval broker",
+            None,
+        )
+        .remove(request_id)
+        .ok_or_else(|| "approval is no longer pending".to_string())?;
         sender.send(decision).map_err(|error| error.to_string())?;
         Ok(json!({
             "ok": true,
@@ -313,14 +283,13 @@ impl McpHost {
             return Err("requestId is required".into());
         }
         let normalized = normalize_codex_approval_decision(decision)?;
-        let pending = self
-            .runtime
-            .approval_broker
-            .0
-            .lock()
-            .map_err(|_| "approval broker lock poisoned".to_string())?
-            .remove(request_id)
-            .ok_or_else(|| "approval request is no longer pending".to_string())?;
+        let pending = crate::workflow_runtime::poison_aware_lock(
+            &self.runtime.approval_broker.0,
+            "approval broker",
+            None,
+        )
+        .remove(request_id)
+        .ok_or_else(|| "approval request is no longer pending".to_string())?;
         if pending.kind != PendingInteractionKind::Approval {
             return Err("pending request is not an approval".into());
         }
@@ -338,12 +307,11 @@ impl McpHost {
     /// List broker keys currently waiting on Live Codex `requestApproval`.
     /// Used with `CODEX_CORP_HEADLESS_APPROVAL=wait` when stderr is unavailable.
     pub fn list_pending_codex_approvals(&self) -> Result<Value, String> {
-        let pending = self
-            .runtime
-            .approval_broker
-            .0
-            .lock()
-            .map_err(|_| "approval broker lock poisoned".to_string())?;
+        let pending = crate::workflow_runtime::poison_aware_lock(
+            &self.runtime.approval_broker.0,
+            "approval broker",
+            None,
+        );
         let mut request_ids: Vec<String> = pending
             .iter()
             .filter(|(_, interaction)| interaction.kind == PendingInteractionKind::Approval)
@@ -359,12 +327,11 @@ impl McpHost {
 
     /// List pending human approval-gate request ids (runId::nodeId::approval…).
     pub fn list_pending_run_approvals(&self) -> Result<Value, String> {
-        let pending = self
-            .runtime
-            .run_approvals
-            .0
-            .lock()
-            .map_err(|_| "run approval broker lock poisoned".to_string())?;
+        let pending = crate::workflow_runtime::poison_aware_lock(
+            &self.runtime.run_approvals.0,
+            "run approval broker",
+            None,
+        );
         let mut request_ids: Vec<String> = pending.keys().cloned().collect();
         request_ids.sort();
         Ok(json!({

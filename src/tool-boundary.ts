@@ -12,6 +12,9 @@ export const STANDARD_TOOL_LABELS = [
   "Shell",
   "Network",
   "Web search",
+  "Build",
+  "Test",
+  "Package install",
 ] as const;
 
 function isLegacyMcpToolLabel(label: string): boolean {

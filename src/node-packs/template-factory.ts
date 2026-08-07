@@ -151,6 +151,9 @@ function packNode(
       trace: ["Template seed"],
       maxRetries: 2,
       timeoutSeconds,
+      sandboxProfile: inst.sandboxProfile,
+      approvalPolicy: inst.approvalPolicy,
+      workspacePolicy: inst.workspacePolicy ?? "isolated",
       ...executionPolicy,
       completionCriteria: inst.completionCriteria ?? defaultPlatformCriteria(),
       color: kindPopColor(inst.kind),
@@ -160,42 +163,12 @@ function packNode(
 
 /** software-company-v1: input → pm → architect → builder → qa → approval → output (+ revision) */
 export function buildSoftwareCompanyTemplate(): BuiltinTemplate {
-  // Specialists operate autonomously inside the user-selected workflow
-  // workspace. The explicit Approval control node remains the human gate.
-  const autonomousWorkflowPolicy = {
-    // Normal workspace work stays sandboxed. Required dependency/network
-    // escalation remains possible through the native approval broker.
-    approvalPolicy: "on-request" as const,
-    sandboxProfile: "workspace-write" as const,
-    workspacePolicy: "workflow" as const,
-  };
   const nodes: FlowNode[] = [
     controlNode("input", "input", "Mission brief", 0),
-    packNode(
-      "pm",
-      "product-manager",
-      1,
-      undefined,
-      300,
-      autonomousWorkflowPolicy,
-    ),
-    packNode(
-      "architect",
-      "architect",
-      2,
-      undefined,
-      300,
-      autonomousWorkflowPolicy,
-    ),
-    packNode(
-      "builder",
-      "frontend-engineer",
-      3,
-      "Builder",
-      600,
-      autonomousWorkflowPolicy,
-    ),
-    packNode("qa", "qa-engineer", 4, undefined, 600, autonomousWorkflowPolicy),
+    packNode("pm", "product-manager", 1, undefined, 300),
+    packNode("architect", "architect", 2, undefined, 300),
+    packNode("builder", "builder", 3, "Builder", 600),
+    packNode("qa", "qa-engineer", 4, undefined, 600),
     controlNode("approval", "approval", "Approval", 5),
     controlNode("output", "output", "Release Bundle", 6),
   ];
@@ -286,7 +259,7 @@ export function buildLaunchReviewTemplate(): BuiltinTemplate {
     packNode("researcher", "researcher", 2),
     packNode("architect", "architect", 3),
     controlNode("gate", "condition", "Ready to build?", 4),
-    packNode("builder", "senior-software-engineer", 5, "Builder"),
+    packNode("builder", "builder", 5, "Builder"),
     packNode("reviewer", "code-reviewer", 6),
     controlNode("approval", "approval", "Approval", 7),
     controlNode("output", "output", "Release Bundle", 8),
@@ -317,46 +290,13 @@ export function buildLaunchReviewTemplate(): BuiltinTemplate {
 
 /** product-launch-v1: pm → research → design → build → qa → approval → output */
 export function buildProductLaunchTemplate(): BuiltinTemplate {
-  const workspaceExecutionPolicy = {
-    approvalPolicy: "on-request" as const,
-    sandboxProfile: "workspace-write" as const,
-    workspacePolicy: "workflow" as const,
-  };
   const nodes: FlowNode[] = [
     controlNode("input", "input", "Mission brief", 0),
-    packNode(
-      "pm",
-      "product-manager",
-      1,
-      undefined,
-      300,
-      workspaceExecutionPolicy,
-    ),
-    packNode(
-      "researcher",
-      "researcher",
-      2,
-      undefined,
-      300,
-      workspaceExecutionPolicy,
-    ),
-    packNode(
-      "designer",
-      "designer",
-      3,
-      undefined,
-      300,
-      workspaceExecutionPolicy,
-    ),
-    packNode(
-      "builder",
-      "frontend-engineer",
-      4,
-      "Builder",
-      600,
-      workspaceExecutionPolicy,
-    ),
-    packNode("qa", "qa-engineer", 5, undefined, 600, workspaceExecutionPolicy),
+    packNode("pm", "product-manager", 1, undefined, 300),
+    packNode("researcher", "researcher", 2, undefined, 300),
+    packNode("designer", "designer", 3, undefined, 300),
+    packNode("builder", "builder", 4, "Builder", 600),
+    packNode("qa", "qa-engineer", 5, undefined, 600),
     controlNode("approval", "approval", "Approval", 6),
     controlNode("output", "output", "Release Bundle", 7),
   ];
@@ -416,46 +356,13 @@ export function buildSecurityReviewTemplate(): BuiltinTemplate {
 
 /** incident-response-v1: security triage → architecture → remediation → qa → handoff → approval */
 export function buildIncidentResponseTemplate(): BuiltinTemplate {
-  const workspaceExecutionPolicy = {
-    approvalPolicy: "on-request" as const,
-    sandboxProfile: "workspace-write" as const,
-    workspacePolicy: "workflow" as const,
-  };
   const nodes: FlowNode[] = [
     controlNode("input", "input", "Incident brief", 0),
-    packNode(
-      "security",
-      "security-reviewer",
-      1,
-      "Triage",
-      300,
-      workspaceExecutionPolicy,
-    ),
-    packNode(
-      "architect",
-      "architect",
-      2,
-      undefined,
-      300,
-      workspaceExecutionPolicy,
-    ),
-    packNode(
-      "remediator",
-      "backend-engineer",
-      3,
-      "Remediator",
-      600,
-      workspaceExecutionPolicy,
-    ),
-    packNode("qa", "qa-engineer", 4, undefined, 600, workspaceExecutionPolicy),
-    packNode(
-      "delivery",
-      "delivery-agent",
-      5,
-      "Incident handoff",
-      300,
-      workspaceExecutionPolicy,
-    ),
+    packNode("security", "security-reviewer", 1, "Triage", 300),
+    packNode("architect", "architect", 2, undefined, 300),
+    packNode("remediator", "backend-engineer", 3, "Remediator", 600),
+    packNode("qa", "qa-engineer", 4, undefined, 600),
+    packNode("delivery", "delivery-agent", 5, "Incident handoff", 300),
     controlNode("approval", "approval", "Approval", 6),
     controlNode("output", "output", "Release Bundle", 7),
   ];

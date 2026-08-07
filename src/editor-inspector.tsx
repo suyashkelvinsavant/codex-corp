@@ -81,6 +81,7 @@ import type {
   Kind,
   RunEvent,
 } from "./model";
+import { findPackForRole, getPack } from "./node-packs/packs";
 import { Metric } from "./metric";
 import { CONTROL_KINDS, controlKindLabel, statusText } from "./node-display";
 import { composeSpecialistInputPreview } from "./specialist-input";
@@ -102,6 +103,31 @@ function isTauri(): boolean {
     __TAURI__?: unknown;
   };
   return !!(global.isTauri || global.__TAURI_INTERNALS__ || global.__TAURI__);
+}
+
+type PolicyFields = Pick<AgentData, "sandboxProfile" | "approvalPolicy" | "workspacePolicy">;
+
+/** Reset to pack-defined policy when a pack is known, otherwise to safe defaults. */
+function packPolicyDefaults(data: AgentData): PolicyFields {
+  const specialistKind =
+    data.kind === "agent" || data.kind === "creative"
+      ? data.kind
+      : undefined;
+  const pack =
+    (data.packId ? getPack(data.packId) : undefined) ??
+    (specialistKind ? findPackForRole(data.role, specialistKind) : undefined);
+  if (!pack) {
+    return {
+      workspacePolicy: "isolated",
+      sandboxProfile: "workspace-write",
+      approvalPolicy: "on-request",
+    };
+  }
+  return {
+    workspacePolicy: pack.workspacePolicy ?? "isolated",
+    sandboxProfile: pack.sandboxProfile ?? "workspace-write",
+    approvalPolicy: pack.approvalPolicy ?? "on-request",
+  };
 }
 
 export function NodeInspector({
@@ -371,9 +397,7 @@ export function NodeInspector({
       ),
       timeoutSeconds: 120,
       maxRetries: 2,
-      workspacePolicy: "isolated",
-      sandboxProfile: "workspace-write",
-      approvalPolicy: "on-request",
+      ...packPolicyDefaults(d),
       requiresApproval: false,
       inputSchema: defaultInputSchema,
       outputSchema: defaultOutputSchema,
@@ -902,6 +926,9 @@ export function NodeInspector({
                 >
                   <option value="workspace-write">Workspace write</option>
                   <option value="read-only">Read only</option>
+                  <option value="danger-full-access">
+                    Danger full access (build + package install)
+                  </option>
                 </select>
               </label>
               <label>
@@ -1157,9 +1184,7 @@ function CreativeNodeInspector({
       ),
       timeoutSeconds: 120,
       maxRetries: 2,
-      workspacePolicy: "isolated",
-      sandboxProfile: "workspace-write",
-      approvalPolicy: "on-request",
+      ...packPolicyDefaults(d),
       requiresApproval: false,
       inputSchema: defaultInputSchema,
       outputSchema: defaultOutputSchema,
@@ -1613,6 +1638,9 @@ function CreativeNodeInspector({
                 >
                   <option value="workspace-write">Workspace write</option>
                   <option value="read-only">Read only</option>
+                  <option value="danger-full-access">
+                    Danger full access (build + package install)
+                  </option>
                 </select>
               </label>
               <label>

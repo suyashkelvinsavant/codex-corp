@@ -54,6 +54,7 @@ sha2 = "0.10"
 ctrlc = "3"
 fs2 = "0.4"
 base64 = "0.22"
+parking_lot = "0.12"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }
