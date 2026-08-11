@@ -259,7 +259,10 @@ describe("persistence helpers", () => {
         (item) => item.id === "builder",
       );
       const migratedOthers = migrated?.nodes.filter(
-        (item) => item.data.kind === "agent" && item.id !== "builder",
+        (item) =>
+          item.data.kind === "agent" &&
+          item.id !== "builder" &&
+          item.id !== "release-coordinator",
       );
       expect(migratedBuilder?.data.packId).toBe("builder");
       expect(migratedBuilder?.data.approvalPolicy).toBe("never");
@@ -320,6 +323,184 @@ describe("persistence helpers", () => {
     expect(currentBuilder?.data.sandboxProfile).toBe("danger-full-access");
     expect(current?.migrationNotices ?? []).not.toContain(
       "Upgraded the Software Company builder to autonomous build/test/package-install permissions and kept other specialists on-request.",
+    );
+  });
+
+  it("migrates the old qa→approval→output shape to staged release nodes", () => {
+    const legacyNodes = [
+      node("input", "input"),
+      node("pm"),
+      node("architect"),
+      node("builder"),
+      node("qa"),
+      node("approval", "approval"),
+      node("output", "output"),
+    ];
+    for (const specialist of legacyNodes.filter(
+      (item) => item.data.kind === "agent",
+    )) {
+      specialist.data.approvalPolicy = "on-request";
+      specialist.data.sandboxProfile = "workspace-write";
+      specialist.data.workspacePolicy = "workflow";
+    }
+    legacyNodes.find((item) => item.id === "builder")!.data.packId = "builder";
+    legacyNodes.find((item) => item.id === "builder")!.data.approvalPolicy =
+      "never";
+    legacyNodes.find((item) => item.id === "builder")!.data.sandboxProfile =
+      "danger-full-access";
+    const legacyEdges = [
+      {
+        id: "e-in-pm",
+        source: "input",
+        target: "pm",
+        data: { edgeType: "standard" as const },
+      },
+      {
+        id: "e-pm-arch",
+        source: "pm",
+        target: "architect",
+        data: { edgeType: "standard" as const },
+      },
+      {
+        id: "e-arch-builder",
+        source: "architect",
+        target: "builder",
+        data: { edgeType: "standard" as const },
+      },
+      {
+        id: "e-builder-qa",
+        source: "builder",
+        target: "qa",
+        data: { edgeType: "standard" as const },
+      },
+      {
+        id: "e-qa-approval",
+        source: "qa",
+        target: "approval",
+        data: { edgeType: "approval" as const },
+      },
+      {
+        id: "e-approval-out",
+        source: "approval",
+        target: "output",
+        data: { edgeType: "standard" as const },
+      },
+      {
+        id: "e-qa-builder-rev",
+        source: "qa",
+        target: "builder",
+        data: { edgeType: "revision" as const, maxRevisions: 2 },
+      },
+    ];
+    const migrated = parseWorkflowSnapshot(
+      JSON.stringify({
+        schemaVersion: WORKFLOW_SCHEMA_VERSION,
+        nodes: legacyNodes,
+        edges: legacyEdges,
+      }),
+    );
+    expect(migrated?.nodes.map((n) => n.id)).toContain("release-coordinator");
+    expect(migrated?.nodes.map((n) => n.id)).toContain("demo");
+    expect(migrated?.nodes.map((n) => n.id)).toContain("release-commit");
+    expect(migrated?.nodes.map((n) => n.id)).toContain("publish-approval");
+    expect(migrated?.nodes.map((n) => n.id)).not.toContain("approval");
+    const edgeIds = migrated?.edges.map((e) => e.id) ?? [];
+    expect(edgeIds).toContain("e-qa-release-coordinator");
+    expect(edgeIds).toContain("e-release-coordinator-demo");
+    expect(edgeIds).toContain("e-demo-release-commit");
+    expect(edgeIds).toContain("e-release-commit-publish");
+    expect(edgeIds).toContain("e-publish-output");
+    expect(edgeIds).not.toContain("e-qa-approval");
+    expect(edgeIds).not.toContain("e-approval-out");
+    expect(migrated?.migrationNotices).toContain(
+      "Upgraded the Software Company release flow to staged AI-mediated release: Release Coordinator → Demo → Release commit → Publish approval.",
+    );
+  });
+
+  it("does not migrate a snapshot that already has release-coordinator", () => {
+    const nodesWithCoordinator = [
+      node("input", "input"),
+      node("pm"),
+      node("architect"),
+      node("builder"),
+      node("qa"),
+      node("output", "output"),
+      {
+        id: "release-coordinator",
+        type: "default" as const,
+        position: { x: 0, y: 600 },
+        data: {
+          kind: "agent" as const,
+          label: "Release Coordinator",
+          packId: "release-coordinator",
+          role: "Release Coordinator",
+          status: "idle" as const,
+          sandboxProfile: "read-only" as const,
+          approvalPolicy: "never" as const,
+          workspacePolicy: "workflow" as const,
+        },
+      },
+    ];
+    for (const specialist of nodesWithCoordinator.filter(
+      (item) => item.data.kind === "agent" && item.id !== "release-coordinator",
+    )) {
+      specialist.data.approvalPolicy = "on-request";
+      specialist.data.sandboxProfile = "workspace-write";
+      specialist.data.workspacePolicy = "workflow";
+    }
+    nodesWithCoordinator.find((item) => item.id === "builder")!.data.packId =
+      "builder";
+    nodesWithCoordinator.find((item) => item.id === "builder")!.data.approvalPolicy =
+      "never";
+    nodesWithCoordinator.find((item) => item.id === "builder")!.data.sandboxProfile =
+      "danger-full-access";
+    const edgesWithCoordinator = [
+      {
+        id: "e-in-pm",
+        source: "input",
+        target: "pm",
+        data: { edgeType: "standard" as const },
+      },
+      {
+        id: "e-pm-arch",
+        source: "pm",
+        target: "architect",
+        data: { edgeType: "standard" as const },
+      },
+      {
+        id: "e-arch-builder",
+        source: "architect",
+        target: "builder",
+        data: { edgeType: "standard" as const },
+      },
+      {
+        id: "e-builder-qa",
+        source: "builder",
+        target: "qa",
+        data: { edgeType: "standard" as const },
+      },
+      {
+        id: "e-qa-release-coordinator",
+        source: "qa",
+        target: "release-coordinator",
+        data: { edgeType: "standard" as const },
+      },
+      {
+        id: "e-release-coordinator-output",
+        source: "release-coordinator",
+        target: "output",
+        data: { edgeType: "standard" as const },
+      },
+    ];
+    const migrated = parseWorkflowSnapshot(
+      JSON.stringify({
+        schemaVersion: WORKFLOW_SCHEMA_VERSION,
+        nodes: nodesWithCoordinator,
+        edges: edgesWithCoordinator,
+      }),
+    );
+    expect(migrated?.migrationNotices ?? []).not.toContain(
+      "Upgraded the Software Company release flow to staged AI-mediated release: Release Coordinator → Demo → Release commit → Publish approval.",
     );
   });
 

@@ -96,6 +96,13 @@ export function normalizeWorkflowSnapshot(
   );
   const hasLegacyDeliveryControl =
     sourceVersion < 4 && snapshot.nodes.some(isLegacyDeliveryControl);
+  // Detect the old Software Company shape (qa → approval → output) that needs
+  // to be upgraded to the staged release flow (qa → release-coordinator → demo →
+  // release-commit → publish-approval → output).
+  const needsStagedReleaseMigration = hasLegacyStagedReleaseShape(
+    snapshot.nodes,
+    snapshot.edges,
+  );
   if (resetLegacyApproval) {
     migrationNotices.push(
       "Legacy specialist approval flags were reset because they were not runtime gates before workflow schema v2.",
@@ -114,6 +121,11 @@ export function normalizeWorkflowSnapshot(
   if (hasLegacyDeliveryControl) {
     migrationNotices.push(
       "Renamed the default Delivery control to Release Bundle and clarified its verified handoff purpose.",
+    );
+  }
+  if (needsStagedReleaseMigration) {
+    migrationNotices.push(
+      "Upgraded the Software Company release flow to staged AI-mediated release: Release Coordinator → Demo → Release commit → Publish approval.",
     );
   }
   const nodes = snapshot.nodes.map((node) => {
@@ -212,14 +224,20 @@ export function normalizeWorkflowSnapshot(
   }
   return {
     schemaVersion: WORKFLOW_SCHEMA_VERSION,
-    nodes,
-    edges: snapshot.edges.map((edge) =>
-      edge.data?.edgeType === "revision" && edge.data.maxRevisions === undefined
-        ? {
-            ...edge,
-            data: { ...edge.data, maxRevisions: DEFAULT_MAX_REVISIONS },
-          }
-        : edge,
+    nodes: needsStagedReleaseMigration
+      ? migrateToStagedReleaseNodes(nodes)
+      : nodes,
+    edges: (needsStagedReleaseMigration
+      ? migrateToStagedReleaseEdges(snapshot.edges)
+      : snapshot.edges.map((edge) =>
+          edge.data?.edgeType === "revision" &&
+          edge.data.maxRevisions === undefined
+            ? {
+                ...edge,
+                data: { ...edge.data, maxRevisions: DEFAULT_MAX_REVISIONS },
+              }
+            : edge,
+        )
     ),
     ...(migrationNotices.length ? { migrationNotices } : {}),
   };
@@ -263,6 +281,143 @@ function isAffectedSoftwareCompanyPolicy(
       edge.target === "builder" &&
       edge.data?.edgeType === "revision",
   );
+}
+
+/**
+ * Detect the old Software Company release shape: a single `approval` node
+ * between `qa` and `output` (qa → approval → output), without the staged
+ * release coordinator/demo/release-commit/publish-approval nodes.
+ */
+function hasLegacyStagedReleaseShape(
+  nodes: FlowNode[],
+  edges: FlowEdge[],
+): boolean {
+  const hasApproval = nodes.some(
+    (n) => n.id === "approval" && n.data.kind === "approval",
+  );
+  const hasReleaseCoordinator = nodes.some(
+    (n) => n.id === "release-coordinator",
+  );
+  if (!hasApproval || hasReleaseCoordinator) return false;
+  const hasQaToApproval = edges.some(
+    (e) => e.source === "qa" && e.target === "approval",
+  );
+  const hasApprovalToOutput = edges.some(
+    (e) => e.source === "approval" && e.target === "output",
+  );
+  return hasQaToApproval && hasApprovalToOutput;
+}
+
+/**
+ * Migrate nodes from the old shape (qa → approval → output) to the new staged
+ * release flow. Replaces the single `approval` node with:
+ * release-coordinator → demo → release-commit → publish-approval
+ */
+function migrateToStagedReleaseNodes(nodes: FlowNode[]): FlowNode[] {
+  const coordinatorPack = getPack("release-coordinator");
+  const filtered = nodes.filter((n) => n.id !== "approval");
+  const approvalNode = nodes.find((n) => n.id === "approval");
+  const position = approvalNode?.position ?? { x: 0, y: 600 };
+  const releaseCoordinatorNode: FlowNode = {
+    id: "release-coordinator",
+    type: "default",
+    position: { x: position.x, y: position.y },
+    data: {
+      kind: "agent",
+      label: "Release Coordinator",
+      packId: "release-coordinator",
+      packVersion: coordinatorPack?.version,
+      role: "Release Coordinator",
+      status: "idle",
+      model: "",
+      effort: "low",
+      tools: ["Workspace read"],
+      sandboxProfile: "read-only",
+      approvalPolicy: "never",
+      workspacePolicy: "workflow",
+      description: coordinatorPack?.description ?? "",
+      prompt: coordinatorPack?.developerInstructions ?? "",
+      baseInstructions: coordinatorPack?.baseInstructions ?? "",
+      developerInstructions: coordinatorPack?.developerInstructions ?? "",
+      duration: "",
+      tokens: 0,
+      trace: [],
+      color: "",
+    },
+  };
+  const makeApprovalNode = (
+    id: string,
+    label: string,
+    xOffset: number,
+  ): FlowNode => ({
+    id,
+    type: "default",
+    position: { x: position.x + xOffset, y: position.y },
+    data: {
+      kind: "approval",
+      label,
+      role: "Control",
+      status: "idle",
+      model: "",
+      effort: "low",
+      tools: [],
+      prompt: "",
+      description: "",
+      duration: "",
+      tokens: 0,
+      trace: [],
+      color: "",
+    },
+  });
+  return [
+    ...filtered,
+    releaseCoordinatorNode,
+    makeApprovalNode("demo", "Demo launch", 200),
+    makeApprovalNode("release-commit", "Release commit", 400),
+    makeApprovalNode("publish-approval", "Publish approval", 600),
+  ];
+}
+
+/**
+ * Migrate edges from the old shape (qa → approval → output) to the new staged
+ * release flow: qa → release-coordinator → demo → release-commit →
+ * publish-approval → output. Preserves the revision edge.
+ */
+function migrateToStagedReleaseEdges(edges: FlowEdge[]): FlowEdge[] {
+  const filtered = edges.filter(
+    (e) => !(e.source === "qa" && e.target === "approval") &&
+      !(e.source === "approval" && e.target === "output"),
+  );
+  const makeEdge = (
+    id: string,
+    source: string,
+    target: string,
+    edgeType?: "standard" | "revision" | "approval" | "conditional" | "merge",
+  ): FlowEdge => ({
+    id,
+    source,
+    target,
+    type: "default",
+    data: edgeType ? { edgeType } : { edgeType: "standard" },
+  });
+  return [
+    ...filtered,
+    makeEdge("e-qa-release-coordinator", "qa", "release-coordinator"),
+    makeEdge(
+      "e-release-coordinator-demo",
+      "release-coordinator",
+      "demo",
+      "approval",
+    ),
+    makeEdge("e-demo-release-commit", "demo", "release-commit", "approval"),
+    makeEdge(
+      "e-release-commit-publish",
+      "release-commit",
+      "publish-approval",
+      "approval",
+    ),
+    makeEdge("e-publish-output", "publish-approval", "output"),
+  ];
 }
 
 /** Per-template browser storage key; software-company keeps the legacy key. */
