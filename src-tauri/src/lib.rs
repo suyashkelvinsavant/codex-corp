@@ -3002,6 +3002,17 @@ struct MediatorChatDeltaEvent {
     turn_id: String,
 }
 
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct MediatorStreamEvent {
+    session_id: Option<String>,
+    message_id: Option<String>,
+    event_type: String,
+    text: String,
+    thread_id: String,
+    turn_id: String,
+}
+
 /// Company chat mediator: Live Codex turn with dynamicTools + streaming deltas.
 #[tauri::command]
 async fn execute_mediator_turn(
@@ -3392,6 +3403,46 @@ async fn execute_mediator_turn(
                         message = text.to_string();
                     }
                 }
+            } else if method == "item/reasoning/textDelta"
+                || method == "item/reasoning/summaryTextDelta"
+                || method == "item/plan/delta"
+                || method == "turn/plan/updated"
+                || method == "item/commandExecution/outputDelta"
+                || method == "process/outputDelta"
+                || method == "turn/diff/updated"
+                || method == "item/fileChange/patchUpdated"
+            {
+                let delta = value
+                    .pointer("/params/delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let stream_text = if method == "turn/diff/updated" {
+                    value
+                        .pointer("/params/diff")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&delta)
+                        .to_string()
+                } else if method == "item/fileChange/patchUpdated" {
+                    value
+                        .get("params")
+                        .map(|p| p.to_string())
+                        .unwrap_or_default()
+                } else {
+                    delta
+                };
+                emit_optional(
+                    &app,
+                    "mediator-stream-event",
+                    MediatorStreamEvent {
+                        session_id: session_id.clone(),
+                        message_id: message_id.clone(),
+                        event_type: method.into(),
+                        text: stream_text,
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                    },
+                );
             } else if method == "turn/completed" || method == "error" {
                 if method == "error" && message.is_empty() {
                     message = value

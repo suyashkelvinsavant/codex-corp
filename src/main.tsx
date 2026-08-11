@@ -1197,6 +1197,12 @@ function App() {
     projectMode?: AppProjectMode;
     workspacePath?: string;
     onDelta?: (delta: string) => void;
+    onStreamEvent?: (event: {
+      eventType: string;
+      text: string;
+      threadId?: string;
+      turnId?: string;
+    }) => void;
   }) => {
     if (!isTauri()) {
       throw new Error(
@@ -1280,6 +1286,23 @@ function App() {
       if (event.payload.messageId !== req.messageId) return;
       if (event.payload.delta) req.onDelta?.(event.payload.delta);
     });
+    const unlistenStream = await listen<{
+      messageId?: string;
+      eventType: string;
+      text: string;
+      threadId?: string;
+      turnId?: string;
+    }>("mediator-stream-event", (event) => {
+      if (event.payload.messageId !== req.messageId) return;
+      if (event.payload.text) {
+        req.onStreamEvent?.({
+          eventType: event.payload.eventType,
+          text: event.payload.text,
+          threadId: event.payload.threadId,
+          turnId: event.payload.turnId,
+        });
+      }
+    });
     try {
       const recentConversation = req.history
         .map(
@@ -1311,6 +1334,7 @@ function App() {
     } finally {
       unlistenTool();
       unlistenDelta();
+      unlistenStream();
     }
   };
 

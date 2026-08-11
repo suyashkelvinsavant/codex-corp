@@ -84,6 +84,15 @@ import {
   type ChatSession,
   type WorkflowChatStore,
 } from "./workflow-chat";
+import { ExecutionStreamDisclosure } from "./execution-stream-disclosure";
+import {
+  appendStreamEvent,
+  createStreamBuffer,
+} from "./execution-stream";
+import {
+  classifyStreamKind,
+  normalizeStreamEventType,
+} from "./stream-display";
 import {
   chatMessagesFingerprint,
   isPinnedToBottom,
@@ -167,6 +176,13 @@ export type MediatorTurnRequest = {
   workspacePath?: string;
   /** Live token stream from Codex (desktop). */
   onDelta?: (delta: string) => void;
+  /** Live reasoning/plan/console stream events from Codex (desktop). */
+  onStreamEvent?: (event: {
+    eventType: string;
+    text: string;
+    threadId?: string;
+    turnId?: string;
+  }) => void;
 };
 
 export type MediatorTurnResult = {
@@ -253,6 +269,9 @@ export function AgentChatPage({
     loadChatStore(workflowId),
   );
   const [draft, setDraft] = useState("");
+  const [expandedStreamMessageId, setExpandedStreamMessageId] = useState<
+    string | null
+  >(null);
   const [localTestFeedback, setLocalTestFeedback] = useState("");
   const [pendingFiles, setPendingFiles] = useState<ChatAttachment[]>([]);
   const [attachError, setAttachError] = useState<string | null>(null);
@@ -911,6 +930,43 @@ export function AgentChatPage({
             return { ...prev, sessions };
           });
         },
+        onStreamEvent: (event) => {
+          const canonical = normalizeStreamEventType(event.eventType);
+          const kind = classifyStreamKind(canonical);
+          if (!kind) return;
+          setStore((prev) => {
+            const sessions = prev.sessions.map((s) => {
+              if (s.id !== session.id) return s;
+              const msg = s.messages.find((m) => m.id === pendingId);
+              if (!msg) return s;
+              const streamKey = `chat/${session.id}/${event.turnId ?? "current"}`;
+              const existing = msg.streamBuffer;
+              const buffer =
+                existing && existing.streamKey === streamKey
+                  ? existing
+                  : createStreamBuffer(streamKey, "byte", "workflow-chat");
+              const updated = appendStreamEvent(buffer, {
+                streamKey,
+                nodeId: "byte",
+                surface: "workflow-chat",
+                kind,
+                text: event.text,
+                at: Date.now(),
+                threadId: event.threadId,
+                turnId: event.turnId,
+              });
+              return {
+                ...s,
+                messages: s.messages.map((m) =>
+                  m.id === pendingId
+                    ? { ...m, streamBuffer: updated }
+                    : m,
+                ),
+              };
+            });
+            return { ...prev, sessions };
+          });
+        },
       });
       const finalMsg = makeMessage(
         "mediator",
@@ -1252,6 +1308,18 @@ export function AgentChatPage({
                       <p key={i}>{formatChatLine(line)}</p>
                     ))}
                   </div>
+                  {msg.streamBuffer && (
+                    <ExecutionStreamDisclosure
+                      buffer={msg.streamBuffer}
+                      expanded={expandedStreamMessageId === msg.id}
+                      onToggle={() =>
+                        setExpandedStreamMessageId((current) =>
+                          current === msg.id ? null : msg.id,
+                        )
+                      }
+                      label="Byte reasoning stream"
+                    />
+                  )}
                 </div>
               ))}
               {localTest ? (

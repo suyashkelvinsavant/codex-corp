@@ -7,6 +7,7 @@
  */
 
 import type { RunEvent } from "./model";
+import type { ExecutionStreamBuffer } from "./execution-stream";
 import { invoke } from "@tauri-apps/api/core";
 import { native as nativeAdapter } from "./native-adapter";
 import { isLifecycleRunEvent, progressLineFromRunEvent } from "./mediator-ui";
@@ -68,6 +69,8 @@ export type ChatMessage = {
   at: string;
   kind?: "status" | "approval" | "progress" | "help" | "error" | "test";
   attachments?: ChatAttachment[];
+  /** Bounded live reasoning/plan/console stream for this chat turn. */
+  streamBuffer?: ExecutionStreamBuffer;
 };
 
 /** Soft cap so chat payloads and rendering remain bounded. */
