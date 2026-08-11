@@ -35,3 +35,17 @@ export function resolveNativeApproval(
     resumeNodeId: stillPendingForNode ? null : match.nodeId,
   };
 }
+
+/**
+ * Remove pending run-scoped approvals when a run completes or terminates.
+ * Already-resolved approvals are preserved for audit. Non-run-scoped approvals
+ * (native Codex tool approvals without a runId) are left untouched.
+ */
+export function clearRunApprovals(
+  approvals: ApprovalRequest[],
+  runId: string,
+): ApprovalRequest[] {
+  return approvals.filter(
+    (item) => !(item.runId === runId && item.status === "pending"),
+  );
+}

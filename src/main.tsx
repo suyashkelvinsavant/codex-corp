@@ -246,6 +246,7 @@ import {
 import { CONTROL_KINDS, controlKindLabel, statusText } from "./node-display";
 import { isConcreteMission, missionBriefStatus } from "./mission-context";
 import {
+  clearRunApprovals,
   resolveNativeApproval,
   type NativeApprovalResolution,
 } from "./approval-lifecycle";
@@ -3877,6 +3878,12 @@ function App() {
           setRunning(false);
           void loadRunHistoryFor(workflowId);
           void loadPortfolioRunSummaries();
+          // Clean up pending run-scoped approvals for the completed/terminated run.
+          approvalsRef.current = clearRunApprovals(
+            approvalsRef.current,
+            payload.runId,
+          );
+          setApprovals(approvalsRef.current);
           if (payload.eventType === "run.completed") {
             void prepareLocalTestForRun(payload.runId);
           }

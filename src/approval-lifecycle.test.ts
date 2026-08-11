@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { ApprovalRequest } from "./model";
-import { resolveNativeApproval } from "./approval-lifecycle";
+import { clearRunApprovals, resolveNativeApproval } from "./approval-lifecycle";
 
 function request(
   id: string,
   nodeId: string,
   status: ApprovalRequest["status"] = "pending",
+  runId?: string,
 ): ApprovalRequest {
   return {
     id,
@@ -15,6 +16,7 @@ function request(
     detail: "{}",
     risk: "test",
     status,
+    runId,
   };
 }
 
@@ -67,5 +69,32 @@ describe("native approval lifecycle", () => {
     );
     expect(result.resumeNodeId).toBe("builder");
     expect(result.requests[1].status).toBe("pending");
+  });
+});
+
+describe("clearRunApprovals", () => {
+  it("removes pending run-scoped approvals for the completed run", () => {
+    const approvals = [
+      request("a1", "n1", "pending", "run1"),
+      request("a2", "n2", "pending", "run2"),
+      request("a3", "n3", "approved", "run1"),
+    ];
+    const result = clearRunApprovals(approvals, "run1");
+    expect(result.map((a) => a.id)).toEqual(["a2", "a3"]);
+  });
+
+  it("leaves non-run-scoped approvals untouched", () => {
+    const approvals = [request("a1", "n1", "pending")];
+    const result = clearRunApprovals(approvals, "run1");
+    expect(result.map((a) => a.id)).toEqual(["a1"]);
+  });
+
+  it("leaves already-resolved run-scoped approvals untouched", () => {
+    const approvals = [
+      request("a1", "n1", "approved", "run1"),
+      request("a2", "n2", "declined", "run1"),
+    ];
+    const result = clearRunApprovals(approvals, "run1");
+    expect(result.map((a) => a.id)).toEqual(["a1", "a2"]);
   });
 });
