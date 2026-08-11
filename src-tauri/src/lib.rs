@@ -3013,6 +3013,39 @@ struct MediatorStreamEvent {
     turn_id: String,
 }
 
+/// Build the thread/start or thread/resume params for the mediator turn.
+/// Byte uses `workspace-write` sandbox and `on-request` approval so it can
+/// execute shell commands in the selected workspace, subject to the native
+/// approval broker and the publish-operation guard.
+fn mediator_turn_params(
+    workspace: &Path,
+    model: &str,
+    tools: &Value,
+    base: &str,
+    developer: &str,
+) -> Value {
+    let mut params = json!({
+        "model": model,
+        "cwd": workspace,
+        "approvalPolicy": "on-request",
+        "sandbox": "workspace-write",
+        "ephemeral": true,
+        "dynamicTools": tools
+    });
+    apply_instruction_params(&mut params, base, developer);
+    params
+}
+
+/// Detect Git publish operations that must be routed through the dedicated
+/// publish-approval node, not ordinary Byte shell access.
+fn is_publish_operation(command: &str) -> bool {
+    let lower = command.trim().to_lowercase();
+    if !lower.starts_with("git ") {
+        return false;
+    }
+    lower.contains("push") || lower.contains("commit") || lower.contains("reset --hard")
+}
+
 /// Company chat mediator: Live Codex turn with dynamicTools + streaming deltas.
 #[tauri::command]
 async fn execute_mediator_turn(
@@ -3020,9 +3053,11 @@ async fn execute_mediator_turn(
     app: tauri::AppHandle,
     tool_broker: tauri::State<'_, ToolBroker>,
     process_broker: tauri::State<'_, ProcessBroker>,
+    broker: tauri::State<'_, ApprovalBroker>,
 ) -> Result<MediatorTurnResult, String> {
     let tool_broker = tool_broker.inner().clone();
     let process_broker = process_broker.inner().clone();
+    let broker = broker.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let app = Some(app);
         let workspace = request
@@ -3166,15 +3201,14 @@ async fn execute_mediator_turn(
         let mut resumed = false;
         let mut next_request_id = 2;
         let thread_result = if let Some(thread_id) = requested_thread {
-            let mut resume_params = json!({
-                "threadId": thread_id,
-                "model": model,
-                "cwd": workspace,
-                "approvalPolicy": "never",
-                "sandbox": "read-only",
-                "excludeTurns": true
-            });
-            apply_instruction_params(&mut resume_params, mediator_base, mediator_developer);
+            let mut resume_params = mediator_turn_params(&workspace, &model, &tools, mediator_base, mediator_developer);
+            resume_params["threadId"] = json!(thread_id);
+            resume_params["excludeTurns"] = json!(true);
+            // Resume does not use dynamicTools; remove it for protocol compatibility.
+            if let Some(obj) = resume_params.as_object_mut() {
+                obj.remove("dynamicTools");
+                obj.remove("ephemeral");
+            }
             send_json_timed(
                 &stdin,
                 json!({
@@ -3194,15 +3228,7 @@ async fn execute_mediator_turn(
                         json!({"oldThreadId":thread_id,"reason":error}),
                     );
                     next_request_id += 1;
-                    let mut start_params = json!({
-                        "model": model,
-                        "cwd": workspace,
-                        "approvalPolicy": "never",
-                        "sandbox": "read-only",
-                        "ephemeral": true,
-                        "dynamicTools": tools
-                    });
-                    apply_instruction_params(&mut start_params, mediator_base, mediator_developer);
+                    let start_params = mediator_turn_params(&workspace, &model, &tools, mediator_base, mediator_developer);
                     send_json_timed(
                         &stdin,
                         json!({
@@ -3215,15 +3241,7 @@ async fn execute_mediator_turn(
                 }
             }
         } else {
-            let mut start_params = json!({
-                "model": model,
-                "cwd": workspace,
-                "approvalPolicy": "never",
-                "sandbox": "read-only",
-                "ephemeral": true,
-                "dynamicTools": tools
-            });
-            apply_instruction_params(&mut start_params, mediator_base, mediator_developer);
+            let start_params = mediator_turn_params(&workspace, &model, &tools, mediator_base, mediator_developer);
             send_json_timed(
                 &stdin,
                 json!({
@@ -3308,6 +3326,113 @@ async fn execute_mediator_turn(
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
             let value = parse_app_server_line(&line)?;
+            // Handle requestApproval from the mediator (Byte) turn.
+            // Byte uses workspace-write + on-request, so the app-server will ask
+            // for approval before executing shell commands. We route these through
+            // the same approval broker as specialist nodes, with a publish-operation
+            // guard that blocks git commit/push/reset --hard.
+            if value.get("id").is_some()
+                && value
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .map(|m| m.ends_with("requestApproval"))
+                    .unwrap_or(false)
+            {
+                let id = value.get("id").cloned().unwrap_or(Value::Null);
+                let raw_request_id = id
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| id.to_string());
+                let broker_request_id = format!("company-mediator::{raw_request_id}");
+                let params = value.get("params").cloned().unwrap_or(Value::Null);
+                // Publish-operation guard: block git commit/push/reset --hard.
+                let command = params
+                    .pointer("/command")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let _cwd = params
+                    .pointer("/cwd")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if is_publish_operation(command) {
+                    let _ = send_json_timed(
+                        &stdin,
+                        json!({
+                            "jsonrpc":"2.0",
+                            "id": id,
+                            "result": {
+                                "decision": "decline",
+                                "reason": "Publish operations require the dedicated publish-approval node."
+                            }
+                        }),
+                        Duration::from_secs(10),
+                    );
+                    emit_optional(
+                        &app,
+                        "codex-agent-event",
+                        NormalizedAgentEvent {
+                            node_id: "company-mediator".into(),
+                            event_type: "approval.publish_blocked".into(),
+                            message: format!(
+                                "Blocked publish operation from Byte shell: {command}"
+                            ),
+                            thread_id: Some(thread_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            tokens: None,
+                        },
+                    );
+                    continue;
+                }
+                let (sender, receiver) = mpsc::channel();
+                crate::workflow_runtime::poison_aware_lock(
+                    &broker.0,
+                    "approval broker",
+                    None,
+                )
+                .insert(
+                    broker_request_id.clone(),
+                    PendingInteraction {
+                        kind: PendingInteractionKind::Approval,
+                        process_key: "company-mediator".into(),
+                        sender,
+                    },
+                );
+                emit_optional(
+                    &app,
+                    "codex-approval-requested",
+                    NativeApprovalEvent {
+                        request_id: broker_request_id.clone(),
+                        node_id: "company-mediator".into(),
+                        method: "requestApproval".into(),
+                        params: redact_sensitive(params),
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                    },
+                );
+                let decision = receiver
+                    .recv_timeout(Duration::from_secs(120))
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_else(|| "decline".into());
+                broker.0.lock().remove(&broker_request_id);
+                emit_optional(
+                    &app,
+                    "codex-approval-resolved",
+                    NativeApprovalResolvedEvent {
+                        request_id: broker_request_id.clone(),
+                        node_id: "company-mediator".into(),
+                        decision: decision.clone(),
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                    },
+                );
+                let _ = send_json_timed(
+                    &stdin,
+                    json!({"jsonrpc":"2.0","id":id,"result":{"decision":decision}}),
+                    Duration::from_secs(5),
+                );
+                continue;
+            }
             if value.get("id").is_some()
                 && value.get("method").and_then(Value::as_str) == Some("item/tool/call")
             {
@@ -7168,6 +7293,32 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn mediator_turn_params_use_workspace_write_and_on_request() {
+        let params = mediator_turn_params(
+            &PathBuf::from("/tmp/ws"),
+            "gpt-5",
+            &json!([]),
+            "",
+            "",
+        );
+        assert_eq!(params["approvalPolicy"], "on-request");
+        assert_eq!(params["sandbox"], "workspace-write");
+        assert_eq!(params["cwd"], "/tmp/ws");
+    }
+
+    #[test]
+    fn is_publish_operation_detects_git_publish_commands() {
+        assert!(is_publish_operation("git push origin main"));
+        assert!(is_publish_operation("git commit -m \"release\""));
+        assert!(is_publish_operation("git push --force origin main"));
+        assert!(is_publish_operation("git reset --hard origin/main"));
+        assert!(!is_publish_operation("git status"));
+        assert!(!is_publish_operation("git diff"));
+        assert!(!is_publish_operation("git log"));
+        assert!(!is_publish_operation("npm run build"));
+    }
 
     #[test]
     fn mcp_auto_start_parse_defaults_and_opt_out() {
