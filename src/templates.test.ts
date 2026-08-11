@@ -288,7 +288,7 @@ describe("workflow catalog", () => {
       expect(builder?.data.workspacePolicy).toBe("workflow");
 
       const agents = software.nodes.filter((node) => node.data.kind === "agent");
-      expect(agents.length).toBe(4);
+      expect(agents.length).toBe(5);
       for (const node of agents) {
         if (node.id === "builder") continue;
         const approval = node.data.approvalPolicy ?? "on-request";
@@ -301,6 +301,30 @@ describe("workflow catalog", () => {
       expect(agents.every((node) => node.data.workspacePolicy === "workflow")).toBe(
         true,
       );
+    });
+
+    it("uses staged release coordinator → demo → release-commit → publish-approval → output", () => {
+      const software = getTemplate("software-company-v1");
+      const nodeIds = software.nodes.map((n) => n.id);
+      expect(nodeIds).toContain("release-coordinator");
+      expect(nodeIds).toContain("demo");
+      expect(nodeIds).toContain("release-commit");
+      expect(nodeIds).toContain("publish-approval");
+      const edgeIds = software.edges.map((e) => e.id);
+      expect(edgeIds).toContain("e-qa-release-coordinator");
+      expect(edgeIds).toContain("e-release-coordinator-demo");
+      expect(edgeIds).toContain("e-demo-release-commit");
+      expect(edgeIds).toContain("e-release-commit-publish");
+      expect(edgeIds).toContain("e-publish-output");
+      // The old direct qa→approval→output path should be gone.
+      expect(edgeIds).not.toContain("e-qa-approval");
+      expect(edgeIds).not.toContain("e-approval-out");
+      const coordinator = software.nodes.find(
+        (n) => n.id === "release-coordinator",
+      );
+      expect(coordinator?.data.kind).toBe("agent");
+      expect(coordinator?.data.sandboxProfile).toBe("read-only");
+      expect(coordinator?.data.approvalPolicy).toBe("never");
     });
 
     it("gives QA deterministic required test and build gates", () => {

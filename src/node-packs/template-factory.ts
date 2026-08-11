@@ -161,7 +161,7 @@ function packNode(
   };
 }
 
-/** software-company-v1: input → pm → architect → builder → qa → approval → output (+ revision) */
+/** software-company-v1: input → pm → architect → builder → qa → release-coordinator → demo → release-commit → publish-approval → output (+ revision) */
 export function buildSoftwareCompanyTemplate(): BuiltinTemplate {
   const nodes: FlowNode[] = [
     controlNode("input", "input", "Mission brief", 0),
@@ -169,8 +169,11 @@ export function buildSoftwareCompanyTemplate(): BuiltinTemplate {
     packNode("architect", "architect", 2, undefined, 300),
     packNode("builder", "builder", 3, "Builder", 600),
     packNode("qa", "qa-engineer", 4, undefined, 600),
-    controlNode("approval", "approval", "Approval", 5),
-    controlNode("output", "output", "Release Bundle", 6),
+    packNode("release-coordinator", "release-coordinator", 5, "Release Coordinator", 600),
+    controlNode("demo", "approval", "Demo launch", 6),
+    controlNode("release-commit", "approval", "Release commit", 7),
+    controlNode("publish-approval", "approval", "Publish approval", 8),
+    controlNode("output", "output", "Release Bundle", 9),
   ];
   const qa = nodes.find((node) => node.id === "qa");
   if (!qa) throw new Error("Software Company template is missing QA");
@@ -203,15 +206,18 @@ export function buildSoftwareCompanyTemplate(): BuiltinTemplate {
     edge("e-pm-arch", "pm", "architect"),
     edge("e-arch-builder", "architect", "builder"),
     edge("e-builder-qa", "builder", "qa"),
-    edge("e-qa-approval", "qa", "approval", "approval"),
-    edge("e-approval-out", "approval", "output"),
+    edge("e-qa-release-coordinator", "qa", "release-coordinator"),
+    edge("e-release-coordinator-demo", "release-coordinator", "demo", "approval"),
+    edge("e-demo-release-commit", "demo", "release-commit", "approval"),
+    edge("e-release-commit-publish", "release-commit", "publish-approval", "approval"),
+    edge("e-publish-output", "publish-approval", "output"),
     edge("e-qa-builder-rev", "qa", "builder", "revision"),
   ];
   return {
     id: "software-company-v1",
     name: "Software company",
     description:
-      "PM → Architect → Builder → QA → Approval → verified Release Bundle with revision loop.",
+      "PM → Architect → Builder → QA → Release Coordinator → Demo → Release commit → Publish approval → verified Release Bundle with revision loop.",
     version: "v1.0",
     nodes,
     edges,
