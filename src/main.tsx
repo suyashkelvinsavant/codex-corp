@@ -216,9 +216,16 @@ import {
 import {
   appendStreamPreview,
   appendTypedTrace,
+  classifyStreamKind,
   isAgentMessageDelta,
   isStreamingTraceEvent,
+  normalizeStreamEventType,
 } from "./stream-display";
+import {
+  appendStreamEvent,
+  createStreamBuffer,
+  type ExecutionStreamBuffer,
+} from "./execution-stream";
 import {
   buildUserInputResponse,
   parseElicitationForm,
@@ -803,6 +810,10 @@ function App() {
   );
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
   const approvalsRef = useRef<ApprovalRequest[]>([]);
+  const streamBuffersRef = useRef<Record<string, ExecutionStreamBuffer>>({});
+  const [activeStreamNodeId, setActiveStreamNodeId] = useState<string | null>(
+    null,
+  );
   const [localTest, setLocalTest] = useState<LocalTestSession | null>(null);
   const [activeApproval, setActiveApproval] = useState<ApprovalRequest | null>(
     null,
@@ -3376,8 +3387,10 @@ function App() {
         if (disposed) return;
         const payload = event.payload;
         const lifecycle = isCodexAgentLifecycleEvent(payload.eventType);
-        const streaming = isAgentMessageDelta(payload.eventType);
+        const canonicalType = normalizeStreamEventType(payload.eventType);
+        const streaming = isAgentMessageDelta(canonicalType);
         const streamingTrace = isStreamingTraceEvent(payload.eventType);
+        const streamKind = classifyStreamKind(canonicalType);
         const tokenEvent =
           isTokenUsageEventType(payload.eventType) ||
           typeof payload.tokens === "number";
@@ -3390,10 +3403,46 @@ function App() {
           !lifecycle &&
           !streaming &&
           !streamingTrace &&
+          !streamKind &&
           !tokenEvent &&
           tokens <= 0
         )
           return;
+        let streamBufferForNode: ExecutionStreamBuffer | undefined;
+        if (streamKind) {
+          const streamKey = `${runId ?? "draft"}/${payload.nodeId}/${payload.turnId ?? "current"}`;
+          const existing = streamBuffersRef.current[payload.nodeId];
+          const buffer =
+            existing && existing.streamKey === streamKey
+              ? existing
+              : createStreamBuffer(streamKey, payload.nodeId, "workflow-node");
+          streamBufferForNode = appendStreamEvent(buffer, {
+            streamKey,
+            nodeId: payload.nodeId,
+            surface: "workflow-node",
+            kind: streamKind,
+            text: payload.message,
+            at: Date.now(),
+            threadId: payload.threadId,
+            turnId: payload.turnId,
+          });
+          streamBuffersRef.current = {
+            ...streamBuffersRef.current,
+            [payload.nodeId]: streamBufferForNode,
+          };
+          setActiveStreamNodeId(payload.nodeId);
+        }
+        if (lifecycle) {
+          const existing = streamBuffersRef.current[payload.nodeId];
+          if (existing && !existing.complete) {
+            const completed = { ...existing, complete: true };
+            streamBuffersRef.current = {
+              ...streamBuffersRef.current,
+              [payload.nodeId]: completed,
+            };
+            streamBufferForNode = completed;
+          }
+        }
         setNodes((ns) =>
           ns.map((n) => {
             if (n.id !== payload.nodeId) return n;
@@ -3421,6 +3470,7 @@ function App() {
                   : lifecycle
                     ? undefined
                     : next.data.streamingPreview,
+                streamBuffer: streamBufferForNode ?? next.data.streamBuffer,
                 trace: lifecycle
                   ? [...next.data.trace, payload.message].slice(-80)
                   : traceEntry

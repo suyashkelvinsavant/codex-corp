@@ -4,6 +4,7 @@ import type {
   CompletionCriterion,
   CriterionEvaluation,
 } from "./completion-criteria";
+import type { ExecutionStreamBuffer } from "./execution-stream";
 
 export const AgentOutputSchema = z.object({
   status: z.enum(["success", "failure", "needs_revision"]),
@@ -99,6 +100,8 @@ export type AgentData = {
   trace: Array<string | TraceRecord>;
   /** Ephemeral, bounded assistant text assembled from app-server deltas. */
   streamingPreview?: string;
+  /** Bounded live reasoning/plan/console stream for this node. */
+  streamBuffer?: ExecutionStreamBuffer;
   output?: string;
   structuredOutput?: Record<string, unknown>;
   inputSchema?: string;
