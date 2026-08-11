@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeTestWorkflow } from "./test-workflow-fixture";
-import { validateWorkflow } from "./graph";
+import { validateWorkflow } from "./graph-validation";
 import { getPack } from "./node-packs/packs";
 import {
   cloneTemplateGraph,

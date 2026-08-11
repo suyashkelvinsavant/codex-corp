@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { invoke, isTauri } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
+import { native } from "./native-adapter";
 import {
   BarChart3,
   DollarSign,
@@ -46,7 +47,7 @@ export function DashboardsPage({
     void Promise.all([
       listFinanceEntriesPersisted(),
       listDashboardFeedbackPersisted(),
-      isTauri() ? invoke<any>("get_app_settings").catch(() => null) : Promise.resolve(null),
+      native.isNative ? invoke<any>("get_app_settings").catch(() => null) : Promise.resolve(null),
     ]).then(([nextFinance, nextFeedback, settings]) => {
       if (!cancelled) {
         setFinance(nextFinance);

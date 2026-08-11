@@ -72,7 +72,8 @@ import {
   Unlock,
   X,
 } from "lucide-react";
-import { invoke, isTauri as tauriIsTauri } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
+import { isTauri } from "./native-adapter";
 import { listen } from "@tauri-apps/api/event";
 import {
   QueryClient,
@@ -104,7 +105,8 @@ import {
   type CodexModelOption,
 } from "./codex-models";
 import { kindPopColor } from "./kind-colors";
-import { autoLayout, upstreamLineage, validateWorkflow } from "./graph";
+import { autoLayout } from "./graph-layout";
+import { upstreamLineage, validateWorkflow } from "./graph-validation";
 import {
   nodeOutputPatchForRunEvent,
   nodeStatusForRunEvent,
@@ -306,17 +308,6 @@ const EdgeInspector = lazy(() =>
     default: module.EdgeInspector,
   })),
 );
-
-/** True inside the native desktop shell (not a plain browser tab on Vite). */
-function isTauri(): boolean {
-  if (tauriIsTauri()) return true;
-  const g = globalThis as typeof globalThis & {
-    isTauri?: boolean;
-    __TAURI_INTERNALS__?: unknown;
-    __TAURI__?: unknown;
-  };
-  return !!(g.isTauri || g.__TAURI_INTERNALS__ || g.__TAURI__);
-}
 
 function codexHealthLabel(info: CodexInfo): string {
   if (info.compatible && info.found) {

@@ -1,13 +1,11 @@
-use chrono::{Datelike, Timelike, Utc};
-use chrono_tz::Tz;
 use futures_util::stream::{FuturesUnordered, StreamExt};
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
@@ -16,7 +14,7 @@ use crate::app_settings;
 use crate::verifier::{
     architecture_policy_failed, artifact_exists_failed, artifact_hash_set_key, attempt_fingerprint,
     classify_failure, collect_upstream_artifacts, command_failed, delivery_pair_compare,
-    freeze_approval_snapshot, is_plateau, materialize_artifacts, ApprovedArtifact,
+    is_plateau, materialize_artifacts, ApprovedArtifact,
     DeliveryCompareResult, FailureClass, ProcessCommandRunner,
 };
 use crate::{
@@ -89,145 +87,112 @@ impl Default for RunApprovalBroker {
     }
 }
 
-#[derive(Debug)]
-struct ProcessLimiter {
-    active: Mutex<usize>,
-    changed: Condvar,
-    limit: AtomicUsize,
-    next_ticket: AtomicU64,
-    serving_ticket: AtomicU64,
-}
+mod process_limiter;
+use process_limiter::ProcessLimiter;
+mod graph_validation;
+use graph_validation::{evaluate_condition, parse_graph};
+#[cfg(test)]
+use graph_validation::validate_condition_rule;
+mod scheduler;
+use scheduler::start_scheduler;
+#[cfg(test)]
+use scheduler::cron_matches_at;
+mod approval_gates;
+use approval_gates::{approval_node, await_operator_approval};
+#[cfg(test)]
+use approval_gates::{operator_approval_timeout, parse_needs_human_timeout, wait_for_approval};
+mod node_experience;
+// These three are called from outside the `workflow_runtime` module
+// (`lib.rs::initialize_database`, `lib.rs::delete_workflow`, and
+// `app_settings::run_retention_cleanup`), so they stay crate-visible.
+pub(crate) use node_experience::{
+    delete_node_experience_for_workflow,
+    initialize_database as initialize_node_experience_database, prune_node_experience,
+};
+// The rest of the node_experience surface is only used inside this module.
+use node_experience::{
+    experience_guidance, get_node_experience, load_node_experience, record_node_experience,
+    NodeExperience,
+};
 
-impl ProcessLimiter {
-    fn new(limit: usize) -> Self {
-        Self {
-            active: Mutex::new(0),
-            changed: Condvar::new(),
-            limit: AtomicUsize::new(limit),
-            next_ticket: AtomicU64::new(0),
-            serving_ticket: AtomicU64::new(0),
-        }
-    }
-
-    fn set_limit(&self, limit: usize) {
-        self.limit.store(limit.clamp(1, 16), Ordering::SeqCst);
-        self.changed.notify_all();
-    }
-
-    fn acquire(self: &Arc<Self>, stop: &AtomicBool) -> Result<ProcessPermit, String> {
-        let ticket = self.next_ticket.fetch_add(1, Ordering::SeqCst);
-        let mut active = self.active.lock();
-        while ticket != self.serving_ticket.load(Ordering::SeqCst)
-            || *active >= self.limit.load(Ordering::SeqCst)
-        {
-            if stop.load(Ordering::SeqCst) {
-                self.serving_ticket.fetch_add(1, Ordering::SeqCst);
-                self.changed.notify_all();
-                return Err("run interrupted while queued for a Codex process".into());
-            }
-            let _ = self
-                .changed
-                .wait_for(&mut active, Duration::from_millis(250));
-        }
-        self.serving_ticket.fetch_add(1, Ordering::SeqCst);
-        self.changed.notify_all();
-        if stop.load(Ordering::SeqCst) {
-            return Err("run interrupted while queued for a Codex process".into());
-        }
-        *active += 1;
-        Ok(ProcessPermit(self.clone()))
-    }
-}
-
-#[derive(Debug)]
-struct ProcessPermit(Arc<ProcessLimiter>);
-
-impl Drop for ProcessPermit {
-    fn drop(&mut self) {
-        let mut active = self.0.active.lock();
-        *active = active.saturating_sub(1);
-        self.0.changed.notify_all();
-    }
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(super) struct RuntimeGraph {
+    pub(super) nodes: Vec<RuntimeNode>,
+    pub(super) edges: Vec<RuntimeEdge>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-struct RuntimeGraph {
-    nodes: Vec<RuntimeNode>,
-    edges: Vec<RuntimeEdge>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct RuntimeNode {
-    id: String,
-    data: RuntimeNodeData,
+pub(super) struct RuntimeNode {
+    pub(super) id: String,
+    pub(super) data: RuntimeNodeData,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct RuntimeNodeData {
-    label: String,
-    role: String,
-    kind: String,
+pub(super) struct RuntimeNodeData {
+    pub(super) label: String,
+    pub(super) role: String,
+    pub(super) kind: String,
     #[serde(default)]
-    model: String,
+    pub(super) model: String,
     #[serde(default = "default_effort")]
-    effort: String,
+    pub(super) effort: String,
     #[serde(default)]
-    tools: Vec<String>,
+    pub(super) tools: Vec<String>,
     #[serde(default)]
-    connector_tools: Vec<String>,
+    pub(super) connector_tools: Vec<String>,
     #[serde(default)]
-    skills: Vec<String>,
+    pub(super) skills: Vec<String>,
     #[serde(default)]
-    active_skill: Option<String>,
+    pub(super) active_skill: Option<String>,
     #[serde(default)]
-    permission_profile: Option<String>,
+    pub(super) permission_profile: Option<String>,
     #[serde(default)]
-    collaboration_mode: Option<String>,
+    pub(super) collaboration_mode: Option<String>,
     #[serde(default)]
-    personality: Option<String>,
+    pub(super) personality: Option<String>,
     #[serde(default)]
-    prompt: String,
+    pub(super) prompt: String,
     /// Authored harness-like base; empty = omit baseInstructions (native opt-in).
     #[serde(default)]
-    base_instructions: String,
+    pub(super) base_instructions: String,
     /// Role/developer contract. Falls back to legacy `prompt` when empty.
     #[serde(default)]
-    developer_instructions: String,
+    pub(super) developer_instructions: String,
     #[serde(default)]
-    output: Option<String>,
+    pub(super) output: Option<String>,
     /// Operator observations from a completed local test, routed explicitly to
     /// the next producer invocation.
     #[serde(default)]
-    user_test_feedback: Vec<String>,
+    pub(super) user_test_feedback: Vec<String>,
     #[serde(default)]
-    completion_criteria: Vec<RuntimeCriterion>,
+    pub(super) completion_criteria: Vec<RuntimeCriterion>,
     #[serde(default = "default_retries")]
-    max_retries: u32,
+    pub(super) max_retries: u32,
     #[serde(default = "default_approval")]
-    approval_policy: String,
+    pub(super) approval_policy: String,
     #[serde(default = "default_sandbox")]
-    sandbox_profile: String,
+    pub(super) sandbox_profile: String,
     #[serde(default = "default_workspace")]
-    workspace_policy: String,
+    pub(super) workspace_policy: String,
     #[serde(default)]
-    input_schema: Option<String>,
+    pub(super) input_schema: Option<String>,
     #[serde(default)]
-    output_schema: Option<String>,
+    pub(super) output_schema: Option<String>,
     #[serde(default = "default_timeout_seconds")]
-    timeout_seconds: u64,
+    pub(super) timeout_seconds: u64,
     #[serde(default)]
-    requires_approval: bool,
+    pub(super) requires_approval: bool,
     #[serde(default)]
-    hard_criteria_gate: bool,
+    pub(super) hard_criteria_gate: bool,
     #[serde(default)]
-    condition_rule: Option<ConditionRule>,
+    pub(super) condition_rule: Option<ConditionRule>,
     #[serde(default)]
-    cron_expression: Option<String>,
+    pub(super) cron_expression: Option<String>,
     #[serde(default)]
-    cron_timezone: Option<String>,
+    pub(super) cron_timezone: Option<String>,
     #[serde(default = "default_true")]
-    cron_enabled: bool,
+    pub(super) cron_enabled: bool,
 }
 
 fn default_effort() -> String {
@@ -251,8 +216,8 @@ fn default_timeout_seconds() -> u64 {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct RuntimeCriterion {
-    id: String,
+pub(super) struct RuntimeCriterion {
+    pub(super) id: String,
     label: String,
     #[serde(deserialize_with = "deserialize_criterion_kind")]
     kind: String,
@@ -295,25 +260,25 @@ fn default_required() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-struct RuntimeEdge {
-    id: String,
-    source: String,
-    target: String,
+pub(super) struct RuntimeEdge {
+    pub(super) id: String,
+    pub(super) source: String,
+    pub(super) target: String,
     #[serde(default)]
-    data: Option<RuntimeEdgeData>,
+    pub(super) data: Option<RuntimeEdgeData>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct RuntimeEdgeData {
+pub(super) struct RuntimeEdgeData {
     #[serde(default = "default_edge")]
-    edge_type: String,
+    pub(super) edge_type: String,
     #[serde(default)]
-    condition: Option<String>,
+    pub(super) condition: Option<String>,
     #[serde(default)]
-    max_revisions: Option<u32>,
+    pub(super) max_revisions: Option<u32>,
     #[serde(default)]
-    mapping: Option<HashMap<String, String>>,
+    pub(super) mapping: Option<HashMap<String, String>>,
 }
 
 fn default_edge() -> String {
@@ -322,15 +287,15 @@ fn default_edge() -> String {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ConditionRule {
+pub(super) struct ConditionRule {
     #[serde(default)]
-    source_node_id: Option<String>,
-    path: String,
-    operator: String,
+    pub(super) source_node_id: Option<String>,
+    pub(super) path: String,
+    pub(super) operator: String,
     #[serde(default)]
-    value: Option<Value>,
-    true_branch: String,
-    false_branch: String,
+    pub(super) value: Option<Value>,
+    pub(super) true_branch: String,
+    pub(super) false_branch: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -366,28 +331,28 @@ pub(crate) struct NativeRunRecord {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct RunApprovalEvent {
-    run_id: String,
-    request_id: String,
-    node_id: String,
-    title: String,
-    detail: String,
+pub(super) struct RunApprovalEvent {
+    pub(super) run_id: String,
+    pub(super) request_id: String,
+    pub(super) node_id: String,
+    pub(super) title: String,
+    pub(super) detail: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RuntimeOutput {
-    status: String,
-    summary: String,
-    data: Value,
-    artifacts: Vec<Value>,
+pub(super) struct RuntimeOutput {
+    pub(super) status: String,
+    pub(super) summary: String,
+    pub(super) data: Value,
+    pub(super) artifacts: Vec<Value>,
     #[serde(default)]
-    thread_id: Option<String>,
+    pub(super) thread_id: Option<String>,
     #[serde(default)]
-    turn_id: Option<String>,
+    pub(super) turn_id: Option<String>,
     /// Live Codex total tokens for this node attempt (0 when unknown / non-LLM nodes).
     #[serde(default)]
-    tokens: u64,
+    pub(super) tokens: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -450,25 +415,25 @@ impl From<AgentResult> for RuntimeOutput {
 }
 
 #[derive(Clone)]
-struct RunContext {
-    run_id: String,
-    workflow_id: String,
+pub(super) struct RunContext {
+    pub(super) run_id: String,
+    pub(super) workflow_id: String,
     /// Present for desktop UI event fan-out; `None` in headless / MCP-only runs.
-    app: Option<tauri::AppHandle>,
+    pub(super) app: Option<tauri::AppHandle>,
     /// Shared SQLite handle (always available; does not require AppHandle).
-    database: Database,
-    graph: RuntimeGraph,
-    outputs: Arc<Mutex<HashMap<String, RuntimeOutput>>>,
+    pub(super) database: Database,
+    pub(super) graph: RuntimeGraph,
+    pub(super) outputs: Arc<Mutex<HashMap<String, RuntimeOutput>>>,
     /// Cumulative per-node usage for this run, including failed retries and revisions.
-    node_tokens: Arc<Mutex<HashMap<String, u64>>>,
-    stop: Arc<AtomicBool>,
-    sequence: Arc<AtomicU64>,
-    limiter: Arc<ProcessLimiter>,
-    approval_broker: ApprovalBroker,
-    process_broker: ProcessBroker,
-    turn_stdin_broker: TurnStdinBroker,
-    run_approvals: RunApprovalBroker,
-    target_workspace: Option<PathBuf>,
+    pub(super) node_tokens: Arc<Mutex<HashMap<String, u64>>>,
+    pub(super) stop: Arc<AtomicBool>,
+    pub(super) sequence: Arc<AtomicU64>,
+    pub(super) limiter: Arc<ProcessLimiter>,
+    pub(super) approval_broker: ApprovalBroker,
+    pub(super) process_broker: ProcessBroker,
+    pub(super) turn_stdin_broker: TurnStdinBroker,
+    pub(super) run_approvals: RunApprovalBroker,
+    pub(super) target_workspace: Option<PathBuf>,
 }
 
 pub(crate) use crate::{db_guard_for as database_guard_for, runtime_lock as poison_aware_lock};
@@ -498,255 +463,6 @@ fn record_node_tokens(context: &RunContext, node_id: &str, attempt_tokens: u64) 
 fn node_token_total(context: &RunContext, node_id: &str) -> u64 {
     let totals = safe_lock(context, &context.node_tokens, "node_tokens");
     totals.get(node_id).copied().unwrap_or(0)
-}
-
-/// Durable record of how a node pattern (role/model/effort) has behaved in
-/// past runs. Drives inline self-improvement and is exposed to the editor and
-/// workflow chat for longer-loop learning.
-#[derive(Debug, Clone)]
-struct NodeExperience {
-    node_id: String,
-    workflow_id: String,
-    role: String,
-    model: String,
-    effort: String,
-    failure_class: Option<String>,
-    stop_reason: Option<String>,
-    outcome: String,
-    attempt_count: u32,
-    total_tokens: u64,
-    latency_ms: u64,
-}
-
-/// Record a durable experience row for a node. Returns an error so the caller
-/// can decide whether to fail the run or emit a warning and continue.
-fn record_node_experience(context: &RunContext, row: &NodeExperience) -> Result<(), String> {
-    let connection = database_guard(context);
-    connection
-        .execute(
-            "INSERT INTO node_experience(node_id,workflow_id,role,model,effort,failure_class,stop_reason,outcome,attempt_count,total_tokens,latency_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-            params![
-                row.node_id,
-                row.workflow_id,
-                row.role,
-                row.model,
-                row.effort,
-                row.failure_class,
-                row.stop_reason,
-                row.outcome,
-                row.attempt_count as i64,
-                row.total_tokens as i64,
-                row.latency_ms as i64,
-            ],
-        )
-        .map_err(|error| format!("failed to record node experience: {error}"))?;
-    Ok(())
-}
-
-/// Load recent experience rows for a node pattern directly from a connection.
-/// Returns them newest-first, with `id` as a tie-breaker so ordering is stable
-/// even when many rows share a one-second `observed_at` timestamp.
-pub(crate) fn get_node_experience(
-    connection: &rusqlite::Connection,
-    workflow_id: &str,
-    node_id: &str,
-    role: &str,
-    model: &str,
-    effort: &str,
-) -> Result<Vec<Value>, String> {
-    let mut statement = connection
-        .prepare(
-            "SELECT failure_class,stop_reason,outcome,attempt_count,total_tokens,latency_ms,observed_at
-             FROM node_experience
-             WHERE workflow_id=?1 AND node_id=?2 AND role=?3 AND model=?4 AND effort=?5
-             ORDER BY observed_at DESC, id DESC LIMIT 20",
-        )
-        .map_err(|error| error.to_string())?;
-    let rows = statement
-        .query_map(params![workflow_id, node_id, role, model, effort], |row| {
-            Ok(json!({
-                "failureClass": row.get::<_, Option<String>>(0)?,
-                "stopReason": row.get::<_, Option<String>>(1)?,
-                "outcome": row.get::<_, String>(2)?,
-                "attemptCount": row.get::<_, i64>(3)?,
-                "totalTokens": row.get::<_, i64>(4)?,
-                "latencyMs": row.get::<_, i64>(5)?,
-                "observedAt": row.get::<_, String>(6)?,
-            }))
-        })
-        .map_err(|error| error.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())
-}
-
-/// Load recent experience rows for the same node pattern within the current run.
-fn load_node_experience(context: &RunContext, node: &RuntimeNode) -> Result<Vec<Value>, String> {
-    let connection = database_guard(context);
-    get_node_experience(
-        &connection,
-        &context.workflow_id,
-        &node.id,
-        &node.data.role,
-        &node.data.model,
-        &node.data.effort,
-    )
-}
-
-/// Derive a guidance note from prior experience for this node pattern.
-/// The note is prepended to the specialist's extra instructions when the most
-/// recent attempts (up to three) share a recurring non-success failure class.
-/// The guidance is grounded in the actual stored records — it names the dominant
-/// failure class and the most common stop reason observed — rather than
-/// emitting a one-size-fits-all string. A recent success suppresses guidance
-/// so the runtime does not pollute a prompt that is already working.
-fn experience_guidance(records: &[Value]) -> Option<String> {
-    if records.len() < 2 {
-        return None;
-    }
-    let recent: Vec<_> = records.iter().take(3).collect();
-    // A recent success suppresses guidance so the runtime does not pollute a
-    // prompt that is already working. Only the newest record counts as "recent".
-    if recent
-        .first()
-        .and_then(|record| record.get("outcome").and_then(Value::as_str))
-        == Some("success")
-    {
-        return None;
-    }
-
-    let mut class_counts: HashMap<String, usize> = HashMap::new();
-    let mut stop_reason_counts: HashMap<String, usize> = HashMap::new();
-    let mut attempt_total: i64 = 0;
-
-    for record in &recent {
-        if let Some(class) = record
-            .get("failureClass")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-        {
-            *class_counts.entry(class.to_string()).or_default() += 1;
-        }
-        if let Some(reason) = record
-            .get("stopReason")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-        {
-            *stop_reason_counts.entry(reason.to_string()).or_default() += 1;
-        }
-        attempt_total += record
-            .get("attemptCount")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-    }
-
-    let (dominant_class, class_count) = class_counts.iter().max_by_key(|(_, count)| *count)?;
-    if *class_count < 2 {
-        return None;
-    }
-
-    let avg_attempts = attempt_total / recent.len().max(1) as i64;
-    let stop_reason = stop_reason_counts
-        .iter()
-        .max_by_key(|(_, count)| *count)
-        .map(|(reason, _)| reason.as_str())
-        .unwrap_or("the same failure");
-
-    let core = match dominant_class.as_str() {
-        "contract" => format!(
-            "Recent attempts failed with contract/output mismatch ({}). Return strictly valid structured JSON matching the required schema; do not wrap it in markdown fences or omit required fields.",
-            stop_reason
-        ),
-        "transient" => format!(
-            "Recent attempts hit transient errors ({}). If this happens again, wait briefly and retry; do not change the requested output over a temporary failure.",
-            stop_reason
-        ),
-        "capability" => format!(
-            "Recent attempts failed because a required capability was missing ({}). Use only the tools and skills you have; if the task truly needs something unavailable, report the gap clearly instead of attempting it.",
-            stop_reason
-        ),
-        "specification" => format!(
-            "Recent attempts did not follow the instructions ({}). Re-read the prompt, output contract, and constraints before producing output; ask for clarification if criteria are ambiguous.",
-            stop_reason
-        ),
-        "verification" => format!(
-            "Recent attempts failed host verification ({}). Provide explicit, checkable evidence for every claim and do not self-attest.",
-            stop_reason
-        ),
-        "plateau" => format!(
-            "Recent attempts plateaued on the same failure ({}). If your first approach does not succeed, deliberately vary the strategy rather than repeating the same steps.",
-            stop_reason
-        ),
-        other => format!(
-            "Recent attempts failed repeatedly with class '{}' ({}). Review the prompt and output contract, then adjust your approach.",
-            other, stop_reason
-        ),
-    };
-
-    Some(format!(
-        "[Experience note: ~{} attempt(s) per recent run, recurring '{}' failure.] {}",
-        avg_attempts, dominant_class, core
-    ))
-}
-
-pub(crate) fn initialize_database(connection: &rusqlite::Connection) -> Result<(), String> {
-    connection
-        .execute_batch(
-            "CREATE TABLE IF NOT EXISTS node_experience (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                node_id TEXT NOT NULL,
-                workflow_id TEXT NOT NULL,
-                role TEXT,
-                model TEXT,
-                effort TEXT,
-                failure_class TEXT,
-                stop_reason TEXT,
-                outcome TEXT NOT NULL,
-                attempt_count INTEGER NOT NULL DEFAULT 0,
-                total_tokens INTEGER NOT NULL DEFAULT 0,
-                latency_ms INTEGER,
-                observed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE INDEX IF NOT EXISTS idx_node_experience_lookup ON node_experience(workflow_id, node_id, role, model, effort);"
-        )
-        .map_err(|error| error.to_string())
-}
-
-pub(crate) fn delete_node_experience_for_workflow(
-    connection: &rusqlite::Connection,
-    workflow_id: &str,
-) -> Result<usize, String> {
-    connection
-        .execute(
-            "DELETE FROM node_experience WHERE workflow_id=?1",
-            params![workflow_id],
-        )
-        .map_err(|error| error.to_string())
-}
-
-pub(crate) fn prune_node_experience(
-    connection: &rusqlite::Connection,
-    days: u32,
-) -> Result<usize, String> {
-    if days == 0 {
-        return Ok(0);
-    }
-    let table_exists: bool = connection
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='node_experience'",
-            [],
-            |_| Ok(()),
-        )
-        .is_ok();
-    if !table_exists {
-        return Ok(0);
-    }
-    let age = format!("-{} days", days);
-    connection
-        .execute(
-            "DELETE FROM node_experience WHERE observed_at < datetime('now', ?1)",
-            params![age],
-        )
-        .map_err(|error| error.to_string())
 }
 
 fn load_node_token_totals(
@@ -958,127 +674,6 @@ fn emit_event(
     }
     if let Some(app) = &context.app {
         let _ = app.emit("workflow-run-event", event);
-    }
-}
-
-fn parse_graph(raw: &str) -> Result<RuntimeGraph, String> {
-    let graph: RuntimeGraph = serde_json::from_str(raw).map_err(|error| error.to_string())?;
-    if graph.nodes.iter().all(|node| node.data.kind != "input") {
-        return Err("workflow requires an input node".into());
-    }
-    if graph.nodes.iter().all(|node| node.data.kind != "output") {
-        return Err("workflow requires an output node".into());
-    }
-    let ids: HashSet<_> = graph.nodes.iter().map(|node| node.id.as_str()).collect();
-    for edge in &graph.edges {
-        if !ids.contains(edge.source.as_str()) || !ids.contains(edge.target.as_str()) {
-            return Err(format!("edge {} references a missing node", edge.id));
-        }
-    }
-    for node in graph
-        .nodes
-        .iter()
-        .filter(|node| node.data.kind == "condition")
-    {
-        validate_condition_rule(node.data.condition_rule.as_ref())?;
-        let inbound: Vec<_> = graph
-            .edges
-            .iter()
-            .filter(|edge| {
-                edge.target == node.id
-                    && edge.data.as_ref().map(|data| data.edge_type.as_str()) != Some("revision")
-            })
-            .collect();
-        if inbound.len() > 1
-            && node
-                .data
-                .condition_rule
-                .as_ref()
-                .and_then(|rule| rule.source_node_id.as_ref())
-                .is_none()
-        {
-            return Err(format!(
-                "condition {} must select an explicit upstream source",
-                node.data.label
-            ));
-        }
-        if let Some(source) = node
-            .data
-            .condition_rule
-            .as_ref()
-            .and_then(|rule| rule.source_node_id.as_ref())
-        {
-            if !inbound.iter().any(|edge| &edge.source == source) {
-                return Err(format!(
-                    "condition {} source must be a direct upstream node",
-                    node.data.label
-                ));
-            }
-        }
-    }
-    Ok(graph)
-}
-
-fn validate_condition_rule(rule: Option<&ConditionRule>) -> Result<(), String> {
-    let rule = rule.ok_or("legacy static condition must be configured before running")?;
-    if !rule.path.starts_with("$.")
-        || !rule
-            .path
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "$._-".contains(character))
-    {
-        return Err("condition path is invalid".into());
-    }
-    if !matches!(
-        rule.operator.as_str(),
-        "==" | "!=" | ">" | ">=" | "<" | "<=" | "contains" | "exists"
-    ) {
-        return Err("condition operator is not allowed".into());
-    }
-    if rule.true_branch.trim().is_empty()
-        || rule.false_branch.trim().is_empty()
-        || rule.true_branch == rule.false_branch
-    {
-        return Err("condition branches must be non-empty and distinct".into());
-    }
-    if rule.operator != "exists" && rule.value.is_none() {
-        return Err("condition comparison value is required".into());
-    }
-    Ok(())
-}
-
-fn read_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
-    path.strip_prefix("$.")?
-        .split('.')
-        .try_fold(value, |current, segment| current.get(segment))
-}
-
-fn evaluate_condition(rule: &ConditionRule, source: &Value) -> bool {
-    let actual = read_path(source, &rule.path);
-    match rule.operator.as_str() {
-        "exists" => actual.is_some_and(|value| !value.is_null()),
-        "==" => actual == rule.value.as_ref(),
-        "!=" => actual != rule.value.as_ref(),
-        ">" | ">=" | "<" | "<=" => {
-            let Some(left) = actual.and_then(Value::as_f64) else {
-                return false;
-            };
-            let Some(right) = rule.value.as_ref().and_then(Value::as_f64) else {
-                return false;
-            };
-            match rule.operator.as_str() {
-                ">" => left > right,
-                ">=" => left >= right,
-                "<" => left < right,
-                _ => left <= right,
-            }
-        }
-        "contains" => match (actual, rule.value.as_ref()) {
-            (Some(Value::String(text)), Some(Value::String(needle))) => text.contains(needle),
-            (Some(Value::Array(items)), Some(needle)) => items.contains(needle),
-            _ => false,
-        },
-        _ => false,
     }
 }
 
@@ -3009,261 +2604,6 @@ async fn execute_specialist_with_revision(
     ))
 }
 
-async fn await_operator_approval(
-    context: &RunContext,
-    node: &RuntimeNode,
-    gate: &str,
-    detail: &str,
-) -> Result<String, String> {
-    let request_id = format!("{}::{}::{gate}", context.run_id, node.id);
-    let (sender, receiver) = mpsc::channel();
-    poison_aware_lock(
-        &context.run_approvals.0,
-        "run approval broker",
-        Some(&context.run_id),
-    )
-    .insert(request_id.clone(), sender);
-    if let Some(app) = &context.app {
-        let _ = app.emit(
-            "workflow-run-approval",
-            RunApprovalEvent {
-                run_id: context.run_id.clone(),
-                request_id: request_id.clone(),
-                node_id: node.id.clone(),
-                title: node.data.label.clone(),
-                detail: detail.into(),
-            },
-        );
-    } else {
-        // Headless / MCP: no UI event bus — surface requestId for operators and tools.
-        eprintln!(
-            "[codex-corp] run approval pending requestId={} runId={} nodeId={} (list_pending_run_approvals / respond_run_approval)",
-            request_id, context.run_id, node.id
-        );
-    }
-    emit_event(
-        context,
-        "approval.requested",
-        "warning",
-        Some(&node.id),
-        None,
-        format!("{} is waiting for operator approval", node.data.label),
-        json!({"requestId":request_id}),
-    );
-    update_run_status(
-        &context.database,
-        &context.run_id,
-        "waiting_approval",
-        None,
-        true,
-    );
-    {
-        let connection = database_guard(context);
-        let _ = connection.execute(
-            "INSERT OR REPLACE INTO approvals(id,run_id,node_id,request_json,decision) VALUES(?1,?2,?3,?4,NULL)",
-            params![request_id,context.run_id,node.id,json!({"title":node.data.label,"detail":detail,"gate":gate}).to_string()],
-        );
-    }
-    let stop = context.stop.clone();
-    let approval_timeout = operator_approval_timeout(gate, context.app.is_none());
-    let wait_result = tauri::async_runtime::spawn_blocking(move || {
-        wait_for_approval(
-            &receiver,
-            &stop,
-            approval_timeout,
-            Duration::from_millis(250),
-        )
-    })
-    .await
-    .map_err(|error| error.to_string());
-    // Always remove the broker entry, including timeout, cancellation, and
-    // sender-disconnect paths. Stale approvals must never be actionable.
-    {
-        let mut pending = poison_aware_lock(
-            &*context.run_approvals.0,
-            "run approval broker",
-            Some(&context.run_id),
-        );
-        pending.remove(&request_id);
-    }
-    update_run_status(&context.database, &context.run_id, "running", None, true);
-    let decision_result = match wait_result {
-        Ok(result) => result,
-        Err(error) => {
-            let error = error.to_string();
-            {
-                let connection = database_guard(context);
-                let _ = connection.execute(
-                    "UPDATE approvals SET decision=?2 WHERE id=?1",
-                    params![request_id, error],
-                );
-            }
-            emit_event(
-                context,
-                "approval.expired",
-                "error",
-                Some(&node.id),
-                None,
-                format!("{} approval wait failed: {error}", node.data.label),
-                json!({"requestId":request_id,"error":error}),
-            );
-            return Err(error);
-        }
-    };
-    let decision = match decision_result {
-        Ok(decision) => decision,
-        Err(error) => {
-            {
-                let connection = database_guard(context);
-                let _ = connection.execute(
-                    "UPDATE approvals SET decision=?2 WHERE id=?1",
-                    params![request_id, error],
-                );
-            }
-            emit_event(
-                context,
-                "approval.expired",
-                "error",
-                Some(&node.id),
-                None,
-                format!("{} approval wait ended: {error}", node.data.label),
-                json!({"requestId":request_id,"error":error}),
-            );
-            return Err(error);
-        }
-    };
-    if !decision {
-        {
-            let connection = database_guard(context);
-            let _ = connection.execute(
-                "UPDATE approvals SET decision='declined' WHERE id=?1",
-                params![request_id],
-            );
-        }
-        emit_event(
-            context,
-            "approval.declined",
-            "warning",
-            Some(&node.id),
-            None,
-            format!("{} was declined", node.data.label),
-            json!({"requestId":request_id,"decision":"declined"}),
-        );
-        return Err("operator declined the approval gate".into());
-    }
-    {
-        let connection = database_guard(context);
-        let _ = connection.execute(
-            "UPDATE approvals SET decision='approved' WHERE id=?1",
-            params![request_id],
-        );
-    }
-    emit_event(
-        context,
-        "approval.approved",
-        "info",
-        Some(&node.id),
-        None,
-        format!("{} was approved", node.data.label),
-        json!({"requestId":request_id,"decision":"approved"}),
-    );
-    Ok(request_id)
-}
-
-async fn approval_node(context: &RunContext, node: &RuntimeNode) -> Result<RuntimeOutput, String> {
-    let request_id = await_operator_approval(
-        context,
-        node,
-        "approval",
-        "Review the completed required work before authorizing the verified release bundle.",
-    )
-    .await?;
-    // Freeze approved artifact (key,hash) pairs onto approval output only.
-    // Cannot re-derive from artifacts table after revision DELETE+reinsert.
-    let outputs_snapshot = poison_aware_lock(&context.outputs, "outputs", Some(&context.run_id));
-    let mut kind_artifacts: HashMap<String, (String, Vec<Value>)> = HashMap::new();
-    for node_ref in &context.graph.nodes {
-        if let Some(out) = outputs_snapshot.get(&node_ref.id) {
-            kind_artifacts.insert(
-                node_ref.id.clone(),
-                (node_ref.data.kind.clone(), out.artifacts.clone()),
-            );
-        }
-    }
-    let refs = collect_upstream_artifacts(&kind_artifacts);
-    let approved_at = chrono_like_now_iso();
-    let freeze = freeze_approval_snapshot(&request_id, &approved_at, &refs);
-    Ok(RuntimeOutput {
-        status: "success".into(),
-        summary: "Human release approval recorded.".into(),
-        data: freeze,
-        artifacts: Vec::new(),
-        thread_id: None,
-        turn_id: None,
-        tokens: 0,
-    })
-}
-
-/// Headless `needs_human` gate deadline (P1). In headless / CI there is no
-/// operator watching the broker, so a capability/specification gate must fail
-/// closed within a short configurable window instead of stalling a batch run
-/// for the interactive 30-minute default.
-const DEFAULT_NEEDS_HUMAN_TIMEOUT_SECS: u64 = 30;
-const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 30 * 60;
-
-/// Gate-scoped operator approval delay. `needs_human` uses the short headless
-/// window (`CODEX_CORP_NEEDS_HUMAN_TIMEOUT_SECS`, default 30s); interactive
-/// approval gates keep the long operator window.
-fn operator_approval_timeout(gate: &str, headless: bool) -> Duration {
-    if gate == "needs_human" && headless {
-        Duration::from_secs(parse_needs_human_timeout(
-            std::env::var("CODEX_CORP_NEEDS_HUMAN_TIMEOUT_SECS")
-                .ok()
-                .as_deref(),
-        ))
-    } else {
-        Duration::from_secs(DEFAULT_APPROVAL_TIMEOUT_SECS)
-    }
-}
-
-/// Parse `CODEX_CORP_NEEDS_HUMAN_TIMEOUT_SECS` (seconds). Unset/invalid → the
-/// conservative 30s default; values clamp to [1, 3600] so a batch run can
-/// never hang for an hour but always grants the gate at least 1s to resolve.
-fn parse_needs_human_timeout(raw: Option<&str>) -> u64 {
-    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
-        return DEFAULT_NEEDS_HUMAN_TIMEOUT_SECS;
-    };
-    match raw.parse::<u64>() {
-        Ok(secs) => secs.clamp(1, 3600),
-        Err(_) => DEFAULT_NEEDS_HUMAN_TIMEOUT_SECS,
-    }
-}
-
-fn wait_for_approval(
-    receiver: &mpsc::Receiver<bool>,
-    stop: &AtomicBool,
-    timeout: Duration,
-    poll_interval: Duration,
-) -> Result<bool, String> {
-    let started = Instant::now();
-    loop {
-        if stop.load(Ordering::SeqCst) {
-            return Err("run interrupted while waiting for operator approval".into());
-        }
-        let remaining = timeout.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            return Err("operator approval timed out".into());
-        }
-        match receiver.recv_timeout(remaining.min(poll_interval)) {
-            Ok(decision) => return Ok(decision),
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("operator approval channel disconnected".into())
-            }
-        }
-    }
-}
-
 fn chrono_like_now_iso() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4430,196 +3770,6 @@ pub(crate) async fn resume_run(
     Ok(record)
 }
 
-#[derive(Debug, Clone)]
-struct DueSchedule {
-    workflow_id: String,
-    node_id: String,
-    minute_key: String,
-    workspace_path: Option<String>,
-}
-
-fn cron_field_matches(value: u32, field: &str, min: u32, max: u32) -> bool {
-    field.split(',').any(|part| {
-        let mut stepped = part.split('/');
-        let base = stepped.next().unwrap_or_default();
-        let step = stepped
-            .next()
-            .and_then(|raw| raw.parse::<u32>().ok())
-            .unwrap_or(1);
-        if step == 0 || stepped.next().is_some() {
-            return false;
-        }
-        let (start, end) = if base == "*" {
-            (min, max)
-        } else {
-            let mut range = base.split('-');
-            let Some(start) = range.next().and_then(|raw| raw.parse::<u32>().ok()) else {
-                return false;
-            };
-            let end = match range.next() {
-                Some(raw) => match raw.parse::<u32>() {
-                    Ok(value) => value,
-                    Err(_) => return false,
-                },
-                None => start,
-            };
-            if range.next().is_some() {
-                return false;
-            }
-            (start, end)
-        };
-        start >= min
-            && end <= max
-            && start <= end
-            && value >= start
-            && value <= end
-            && (value - start).is_multiple_of(step)
-    })
-}
-
-fn cron_matches_at(expression: &str, timezone: &str, now: chrono::DateTime<Utc>) -> Option<String> {
-    let timezone: Tz = timezone.parse().ok()?;
-    let local = now.with_timezone(&timezone);
-    let fields: Vec<_> = expression.split_whitespace().collect();
-    if fields.len() != 5 {
-        return None;
-    }
-    let values = [
-        local.minute(),
-        local.hour(),
-        local.day(),
-        local.month(),
-        local.weekday().num_days_from_sunday(),
-    ];
-    let limits = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 6)];
-    fields
-        .iter()
-        .enumerate()
-        .all(|(index, field)| {
-            let (min, max) = limits[index];
-            cron_field_matches(values[index], field, min, max)
-        })
-        .then(|| local.format("%Y-%m-%dT%H:%M%:z").to_string())
-}
-
-fn due_schedules(app: &tauri::AppHandle) -> Result<Vec<DueSchedule>, String> {
-    let workflows = {
-        let database = app.state::<Database>();
-        let connection = database_guard_for(&database);
-        let mut statement = connection
-            .prepare("SELECT id,graph_json,workspace_path FROM workflows ORDER BY id")
-            .map_err(|error| error.to_string())?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            })
-            .map_err(|error| error.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?
-    };
-    let now = Utc::now();
-    let mut due = Vec::new();
-    for (workflow_id, graph_json, workspace_path) in workflows {
-        let Ok(graph) = serde_json::from_str::<RuntimeGraph>(&graph_json) else {
-            continue;
-        };
-        for node in graph
-            .nodes
-            .iter()
-            .filter(|node| node.data.kind == "cron" && node.data.cron_enabled)
-        {
-            let expression = node.data.cron_expression.as_deref().unwrap_or_default();
-            let timezone = node.data.cron_timezone.as_deref().unwrap_or("UTC");
-            if let Some(minute_key) = cron_matches_at(expression, timezone, now) {
-                due.push(DueSchedule {
-                    workflow_id: workflow_id.clone(),
-                    node_id: node.id.clone(),
-                    minute_key,
-                    workspace_path: workspace_path.clone(),
-                });
-            }
-        }
-    }
-    Ok(due)
-}
-
-fn reserve_schedule_firing(app: &tauri::AppHandle, schedule: &DueSchedule) -> Result<bool, String> {
-    let database = app.state::<Database>();
-    let connection = database_guard_for(&database);
-    connection
-        .execute(
-            "INSERT OR IGNORE INTO schedule_firings(workflow_id,node_id,minute_key) VALUES(?1,?2,?3)",
-            params![schedule.workflow_id, schedule.node_id, schedule.minute_key],
-        )
-        .map(|changed| changed == 1)
-        .map_err(|error| error.to_string())
-}
-
-fn release_schedule_firing(app: &tauri::AppHandle, schedule: &DueSchedule) {
-    let database = app.state::<Database>();
-    let connection = database_guard_for(&database);
-    let _ = connection.execute(
-        "DELETE FROM schedule_firings WHERE workflow_id=?1 AND node_id=?2 AND minute_key=?3",
-        params![schedule.workflow_id, schedule.node_id, schedule.minute_key],
-    );
-}
-
-fn workflow_is_active(app: &tauri::AppHandle, workflow_id: &str) -> bool {
-    let runtime = app.state::<WorkflowRuntime>();
-    let active = poison_aware_lock(&runtime.active, "runtime active", None);
-    active.values().any(|run| run.workflow_id == workflow_id)
-}
-
-fn scheduler_tick(app: &tauri::AppHandle) {
-    let Ok(schedules) = due_schedules(app) else {
-        return;
-    };
-    for schedule in schedules {
-        if workflow_is_active(app, &schedule.workflow_id) {
-            continue;
-        }
-        if !reserve_schedule_firing(app, &schedule).unwrap_or(false) {
-            continue;
-        }
-        let result = tauri::async_runtime::block_on(start_run(
-            schedule.workflow_id.clone(),
-            Some(schedule.node_id.clone()),
-            schedule.workspace_path.clone(),
-            app.clone(),
-            app.state::<WorkflowRuntime>(),
-            app.state::<RunApprovalBroker>(),
-            app.state::<ApprovalBroker>(),
-            app.state::<ProcessBroker>(),
-            app.state::<TurnStdinBroker>(),
-            app.state::<Database>(),
-        ));
-        if let Err(error) = result {
-            release_schedule_firing(app, &schedule);
-            let _ = app.emit(
-                "workflow-schedule-error",
-                json!({
-                    "workflowId": schedule.workflow_id,
-                    "nodeId": schedule.node_id,
-                    "message": error,
-                }),
-            );
-        }
-    }
-}
-
-fn start_scheduler(app: tauri::AppHandle) {
-    let _ = std::thread::Builder::new()
-        .name("codex-corp-scheduler".into())
-        .spawn(move || loop {
-            scheduler_tick(&app);
-            std::thread::sleep(Duration::from_secs(15));
-        });
-}
-
 /// Mark in-flight runs as interrupted and apply retention cleanup.
 /// Shared by desktop `initialize` and headless `McpHost::headless` (no cron).
 pub(crate) fn recover_interrupted_runs(database: &Database) -> Result<(), String> {
@@ -4650,7 +3800,7 @@ pub(crate) fn initialize(app: &tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{TimeZone, Utc};
 
     #[test]
     fn native_cron_matching_honors_timezone_and_minute_key() {

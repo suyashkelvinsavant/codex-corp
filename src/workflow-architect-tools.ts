@@ -1,7 +1,7 @@
 import { MarkerType } from "@xyflow/react";
 import { defaultPlatformCriteria } from "./completion-criteria";
 import { DEFAULT_NODE_EFFORT, DEFAULT_NODE_MODEL_ID } from "./codex-models";
-import { validateWorkflow } from "./graph";
+import { validateWorkflow } from "./graph-validation";
 import { kindPopColor } from "./kind-colors";
 import type { AgentData, FlowEdge, FlowNode, Kind } from "./model";
 import { isSpecialistKind } from "./model";
@@ -26,7 +26,7 @@ import {
 import type {
   DynamicToolSpecJson,
   ToolExecResult,
-} from "./company-mediator-tools";
+} from "./tool-helpers";
 
 export const WORKFLOW_ARCHITECT_SYSTEM_PROMPT = `You are Byte, the top-level Codex Corp companion. You own the company workflow catalog, not a single company run.
 

@@ -1,4 +1,5 @@
-import { invoke, isTauri } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
+import { native } from "./native-adapter";
 
 export type NodeExperienceRecord = {
   failureClass: string | null;
@@ -25,7 +26,7 @@ export type NodeExperienceQuery = {
 export async function listNodeExperience(
   query: NodeExperienceQuery,
 ): Promise<NodeExperienceRecord[]> {
-  if (!isTauri()) return [];
+  if (!native.isNative) return [];
   const rows = (await invoke<unknown[]>("list_node_experience", query)) ?? [];
   return rows.map((row) => {
     const r = row as Record<string, unknown>;

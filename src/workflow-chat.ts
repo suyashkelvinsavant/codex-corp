@@ -7,7 +7,8 @@
  */
 
 import type { RunEvent } from "./model";
-import { invoke, isTauri } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
+import { native as nativeAdapter } from "./native-adapter";
 import { isLifecycleRunEvent, progressLineFromRunEvent } from "./mediator-ui";
 import { notifyPersistenceError } from "./persistence-events";
 
@@ -312,7 +313,7 @@ function loadBrowserChatStore(workflowId: string): WorkflowChatStore {
 export async function hydrateChatStore(
   workflowId: string,
 ): Promise<WorkflowChatStore> {
-  if (!isTauri()) return loadBrowserChatStore(workflowId);
+  if (!nativeAdapter.isNative) return loadBrowserChatStore(workflowId);
   if (hydratedDesktopStores.has(workflowId)) {
     return desktopChatStores.get(workflowId) ?? emptyStore();
   }
@@ -356,7 +357,7 @@ export async function hydrateChatStore(
 }
 
 export function loadChatStore(workflowId: string): WorkflowChatStore {
-  if (isTauri() && hydratedDesktopStores.has(workflowId)) {
+  if (nativeAdapter.isNative && hydratedDesktopStores.has(workflowId)) {
     return desktopChatStores.get(workflowId) ?? emptyStore();
   }
   return loadBrowserChatStore(workflowId);
@@ -444,7 +445,7 @@ export function saveChatStore(
   store: WorkflowChatStore,
 ): void {
   const trimmed = trimChatStore(store);
-  if (isTauri()) {
+  if (nativeAdapter.isNative) {
     if (hydratedDesktopStores.has(workflowId)) {
       desktopChatStores.set(workflowId, trimmed);
       enqueueDesktopChatSave(workflowId, trimmed);

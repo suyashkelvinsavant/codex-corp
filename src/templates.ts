@@ -1,6 +1,7 @@
 import type { FlowEdge, FlowNode } from "./model";
-import { invoke, isTauri } from "@tauri-apps/api/core";
-import { autoLayout } from "./graph";
+import { invoke } from "@tauri-apps/api/core";
+import { native as nativeAdapter } from "./native-adapter";
+import { autoLayout } from "./graph-layout";
 import { notifyPersistenceError } from "./persistence-events";
 import { builtinWorkflowTemplates } from "./node-packs/template-factory";
 
@@ -85,7 +86,7 @@ function readCustomWorkflows(): WorkflowTemplate[] {
 }
 
 export async function hydrateWorkflowCatalog(): Promise<void> {
-  if (!isTauri()) return;
+  if (!nativeAdapter.isNative) return;
   const serialized = await invoke<string[]>("list_workflow_catalog");
   const native = serialized.flatMap((raw) => {
     try {

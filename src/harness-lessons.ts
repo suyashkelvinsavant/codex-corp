@@ -1,4 +1,5 @@
-import { invoke, isTauri } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
+import { native } from "./native-adapter";
 
 /**
  * Harness lessons — durable, versioned, reviewable supplemental guidance.
@@ -97,7 +98,7 @@ function coerceSnapshot(row: unknown): LessonSnapshot {
 export async function listHarnessLessons(
   query: LessonQuery = {},
 ): Promise<HarnessLesson[]> {
-  if (!isTauri()) return [];
+  if (!native.isNative) return [];
   const rows =
     (await invoke<unknown[]>("list_harness_lessons", {
       role: query.role ?? null,
@@ -127,7 +128,7 @@ export async function createHarnessLesson(input: {
   evidence?: Record<string, unknown>;
   source?: "refine" | "manual";
 }): Promise<number> {
-  if (!isTauri()) return 0;
+  if (!native.isNative) return 0;
   return invoke<number>("create_harness_lesson", {
     role: input.role,
     model: input.model,
@@ -145,7 +146,7 @@ export async function updateHarnessLesson(
   body: string,
   evidence: Record<string, unknown>,
 ): Promise<number> {
-  if (!isTauri()) return 0;
+  if (!native.isNative) return 0;
   return invoke<number>("update_harness_lesson", { id, body, evidence });
 }
 
@@ -154,13 +155,13 @@ export async function rollbackHarnessLesson(
   id: number,
   toVersion: number,
 ): Promise<number> {
-  if (!isTauri()) return 0;
+  if (!native.isNative) return 0;
   return invoke<number>("rollback_harness_lesson", { id, toVersion });
 }
 
 /** Delete a lesson and its snapshots. */
 export async function deleteHarnessLesson(id: number): Promise<void> {
-  if (!isTauri()) return;
+  if (!native.isNative) return;
   await invoke<void>("delete_harness_lesson", { id });
 }
 
@@ -168,7 +169,7 @@ export async function deleteHarnessLesson(id: number): Promise<void> {
 export async function listHarnessLessonSnapshots(
   lessonId: number,
 ): Promise<LessonSnapshot[]> {
-  if (!isTauri()) return [];
+  if (!native.isNative) return [];
   const rows =
     (await invoke<unknown[]>("list_harness_lesson_snapshots", {
       lessonId,
@@ -184,7 +185,7 @@ export async function listHarnessLessonSnapshots(
 export async function refineHarnessLessons(
   workflowId?: string,
 ): Promise<RefineResult> {
-  if (!isTauri())
+  if (!native.isNative)
     return { actions: [], summary: { created: 0, updated: 0, skipped: 0 } };
   const result = await invoke<unknown>("refine_harness_lessons_cmd", {
     workflowId: workflowId ?? null,

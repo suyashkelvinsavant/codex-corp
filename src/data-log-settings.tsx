@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { invoke, isTauri } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
+import { native } from "./native-adapter";
 import { AlertTriangle, Database, Download, Save, Trash2 } from "lucide-react";
 import {
   flushDesktopCatalogWrites,
@@ -42,7 +43,7 @@ const formatBytes = (bytes: number) => {
 };
 
 export function DataLogSettings() {
-  const desktop = isTauri();
+  const desktop = native.isNative;
   const [settings, setSettings] = useState<AppSettings>(defaults);
   const [saved, setSaved] = useState<AppSettings>(defaults);
   const [preview, setPreview] = useState<RetentionPreview | null>(null);

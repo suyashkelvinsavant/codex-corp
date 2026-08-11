@@ -1242,7 +1242,7 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
     let _ = connection.execute("ALTER TABLE artifacts ADD COLUMN byte_length INTEGER", []);
     let _ = connection.execute("ALTER TABLE artifacts ADD COLUMN storage_path TEXT", []);
     app_settings::initialize(connection)?;
-    workflow_runtime::initialize_database(connection)?;
+    workflow_runtime::initialize_node_experience_database(connection)?;
     harness_lessons::initialize(connection)?;
     business_data::initialize(connection)?;
     chat_data::initialize(connection)?;

@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useState } from "react";
 import type React from "react";
-import { isTauri as tauriIsTauri, invoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
+import { isTauri } from "./native-adapter";
 import {
   Braces,
   Check,
@@ -72,7 +73,20 @@ import {
   constraintsToTextarea,
 } from "./mission-context";
 import { defaultOutputSchemaJson as defaultOutputSchema } from "./agent-output-schema";
-import { defaultInputSchema } from "./editor-defaults";
+
+const defaultInputSchema = JSON.stringify(
+  {
+    type: "object",
+    properties: {
+      workflowInput: { type: "string" },
+      upstreamOutputs: { type: "array" },
+      revisionFeedback: { type: "array" },
+    },
+    required: ["workflowInput", "upstreamOutputs"],
+  },
+  null,
+  2,
+);
 import type {
   AgentData,
   Artifact,
@@ -104,16 +118,6 @@ const ConnectorRuntimePanel = lazy(() =>
 
 const NOTE_BODY_MAX = 400;
 const NOTE_TITLE_MAX = 80;
-
-function isTauri(): boolean {
-  if (tauriIsTauri()) return true;
-  const global = globalThis as typeof globalThis & {
-    isTauri?: boolean;
-    __TAURI_INTERNALS__?: unknown;
-    __TAURI__?: unknown;
-  };
-  return !!(global.isTauri || global.__TAURI_INTERNALS__ || global.__TAURI__);
-}
 
 type PolicyFields = Pick<AgentData, "sandboxProfile" | "approvalPolicy" | "workspacePolicy">;
 

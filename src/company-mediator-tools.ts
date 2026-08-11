@@ -15,12 +15,11 @@ import { composeAuthorizedMission } from "./mission-context";
 import type { MediatorQuestion, MediatorQuestionAnswer } from "./mediator-ui";
 import type { LocalTestSession } from "./local-test";
 import type { AppProjectMode, AppWorkspaceSelection } from "./workflow-chat";
-import { listNodeExperience, formatExperienceDigest } from "./node-experience";
-import {
-  listHarnessLessons,
-  refineHarnessLessons,
-  formatLessonDigest,
-} from "./harness-lessons";
+import { ok, fail, trunc, type DynamicToolSpecJson, type ToolExecResult } from "./tool-helpers";
+import { executeNodeHandler, resolveNode } from "./company-node-handlers";
+
+// Re-export shared types for backward compatibility.
+export type { DynamicToolSpecJson, ToolExecResult };
 
 export const COMPANY_MEDIATOR_SYSTEM_PROMPT = `You are Byte for Codex Corp — the human-facing companion for a multi-specialist company graph (not a graph node yourself).
 
@@ -77,13 +76,6 @@ export type MediatorHostContext = {
       suggestedMode: AppProjectMode,
     ) => Promise<AppWorkspaceSelection | null>;
   };
-};
-
-export type DynamicToolSpecJson = {
-  type: "function";
-  name: string;
-  description: string;
-  inputSchema: Record<string, unknown>;
 };
 
 export function companyMediatorDynamicTools(): DynamicToolSpecJson[] {
@@ -319,49 +311,6 @@ export function companyMediatorDynamicTools(): DynamicToolSpecJson[] {
   ];
 }
 
-function trunc(s: string, max = 1200): string {
-  if (s.length <= max) return s;
-  return `${s.slice(0, max)}…`;
-}
-
-function resolveNode(
-  ctx: MediatorHostContext,
-  args: { nodeId?: string; label?: string },
-): {
-  node?: FlowNode;
-  error?: string;
-  candidates?: Array<{ id: string; label: string }>;
-} {
-  const id = args.nodeId?.trim();
-  if (id) {
-    const byId = ctx.nodes.find((n) => n.id === id);
-    if (byId) return { node: byId };
-  }
-  const q = (args.label ?? args.nodeId ?? "").trim().toLowerCase();
-  if (!q) return { error: "Provide nodeId or label" };
-  const matches = ctx.nodes.filter((n) => {
-    const label = n.data.label.toLowerCase();
-    const role = n.data.role.toLowerCase();
-    return (
-      n.id.toLowerCase() === q ||
-      label === q ||
-      role === q ||
-      label.includes(q) ||
-      role.includes(q)
-    );
-  });
-  if (matches.length === 1) return { node: matches[0] };
-  if (matches.length > 1) {
-    return {
-      error: "Ambiguous node match",
-      candidates: matches.map((n) => ({ id: n.id, label: n.data.label })),
-    };
-  }
-  return { error: `No node matched “${q}”` };
-}
-
-export type ToolExecResult = { success: boolean; text: string };
-
 export async function executeCompanyMediatorTool(
   name: string,
   rawArgs: unknown,
@@ -580,160 +529,9 @@ export async function executeCompanyMediatorTool(
       case "node_refine_lessons":
       case "node_list_lessons":
       case "node_focus": {
-        const resolved = resolveNode(ctx, {
-          nodeId: str("nodeId"),
-          label: str("label"),
-        });
-        if (resolved.error) {
-          return fail(
-            resolved.candidates
-              ? `${resolved.error}: ${JSON.stringify(resolved.candidates)}`
-              : resolved.error,
-          );
-        }
-        const node = resolved.node!;
-        if (name === "node_focus") {
-          ctx.actions?.focusNode?.(node.id);
-          return ok({ focused: node.id, label: node.data.label });
-        }
-        if (name === "node_get") {
-          return ok({
-            id: node.id,
-            label: node.data.label,
-            role: node.data.role,
-            kind: node.data.kind,
-            status: node.data.status,
-            model: node.data.model,
-            effort: node.data.effort,
-            sandbox: node.data.sandboxProfile,
-            tools: node.data.tools,
-            promptExcerpt: trunc(node.data.prompt ?? "", 800),
-            revisions: node.data.revisions ?? 0,
-            retries: node.data.retries ?? 0,
-            threadId: node.data.threadId,
-            duration: node.data.duration,
-            tokens: node.data.tokens,
-          });
-        }
-        if (name === "node_get_output") {
-          const arts = (node.data.artifacts ?? []).map((a) => ({
-            name: a.name,
-            kind: a.kind,
-            preview: a.content ? trunc(a.content, 200) : undefined,
-          }));
-          return ok({
-            id: node.id,
-            status: node.data.status,
-            summary: node.data.output ?? null,
-            structuredOutput: trunc(
-              JSON.stringify(node.data.structuredOutput ?? {}),
-              1500,
-            ),
-            artifacts: arts,
-          });
-        }
-        if (name === "node_get_trace") {
-          const limit = Math.min(num("limit") ?? 20, 50);
-          return ok({
-            id: node.id,
-            trace: (node.data.trace ?? []).slice(-limit),
-          });
-        }
-        if (name === "node_get_criteria") {
-          return ok({
-            id: node.id,
-            criteria: ensureCompletionCriteria(node.data.completionCriteria),
-            evaluation: node.data.criteriaEvaluation ?? [],
-          });
-        }
-        if (name === "node_get_events") {
-          const limit = Math.min(num("limit") ?? 20, 50);
-          const ev = ctx.events
-            .filter((e) => e.nodeId === node.id)
-            .slice(-limit)
-            .map((e) => ({
-              type: e.type,
-              message: e.message,
-              level: e.level,
-              at: e.at,
-            }));
-          return ok({ id: node.id, events: ev });
-        }
-        if (name === "node_get_experience") {
-          const records = await listNodeExperience({
-            workflowId: ctx.workflowId,
-            nodeId: node.id,
-            role: node.data.role,
-            model: node.data.model,
-            effort: node.data.effort,
-          });
-          return ok({
-            id: node.id,
-            role: node.data.role,
-            model: node.data.model,
-            effort: node.data.effort,
-            digest: formatExperienceDigest(records),
-            records: records.slice(0, 20),
-          });
-        }
-        if (name === "node_refine_lessons") {
-          const result = await refineHarnessLessons(ctx.workflowId);
-          return ok({ workflowId: ctx.workflowId, ...result });
-        }
-        if (name === "node_list_lessons") {
-          const lessons = await listHarnessLessons({
-            role: node.data.role,
-            model: node.data.model,
-            effort: node.data.effort,
-          });
-          return ok({
-            id: node.id,
-            role: node.data.role,
-            model: node.data.model,
-            effort: node.data.effort,
-            digest: formatLessonDigest(lessons),
-            lessons,
-          });
-        }
-        // node_task_progress
-        {
-          const criteria = ensureCompletionCriteria(
-            node.data.completionCriteria,
-          );
-          const evals = node.data.criteriaEvaluation ?? [];
-          const enabled = criteria.filter((c) => c.enabled);
-          const passed = evals.filter((e) => e.status === "pass").length;
-          const failed = evals.filter((e) => e.status === "fail").length;
-          const lastErr = [...ctx.events]
-            .reverse()
-            .find(
-              (e) =>
-                e.nodeId === node.id &&
-                (e.level === "error" ||
-                  /fail/i.test(e.type) ||
-                  /fail/i.test(e.message)),
-            );
-          return ok({
-            id: node.id,
-            label: node.data.label,
-            role: node.data.role,
-            status: node.data.status,
-            allottedTaskExcerpt: trunc(node.data.prompt ?? "", 600),
-            hasOutput: Boolean(node.data.output?.trim()),
-            outputSummary: node.data.output
-              ? trunc(node.data.output, 400)
-              : null,
-            criteriaEnabled: enabled.length,
-            criteriaPassed: passed,
-            criteriaFailed: failed,
-            criteriaPending: enabled.length - passed - failed,
-            revisions: node.data.revisions ?? 0,
-            lastError: lastErr
-              ? { type: lastErr.type, message: lastErr.message, at: lastErr.at }
-              : null,
-            artifactCount: node.data.artifacts?.length ?? 0,
-          });
-        }
+        const result = await executeNodeHandler(name, args, ctx);
+        if (result) return result;
+        return fail(`Unhandled node tool: ${name}`);
       }
       default:
         return fail(`Unknown tool: ${name}`);
@@ -741,13 +539,6 @@ export async function executeCompanyMediatorTool(
   } catch (e) {
     return fail(String(e));
   }
-}
-
-function ok(data: unknown): ToolExecResult {
-  return { success: true, text: JSON.stringify(data, null, 2) };
-}
-function fail(message: string): ToolExecResult {
-  return { success: false, text: JSON.stringify({ error: message }) };
 }
 
 /** Context digest text packed into the mediator user turn. */

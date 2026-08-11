@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { autoLayout } from "./graph-layout";
 import {
-  autoLayout,
   readyNodeIds,
   standardCycle,
   upstreamLineage,
   validateWorkflow,
-} from "./graph";
+} from "./graph-validation";
 import { AgentOutputSchema } from "./model";
 import type { CriterionKind } from "./completion-criteria";
 import type { EdgeKind, FlowEdge, FlowNode, Kind } from "./model";

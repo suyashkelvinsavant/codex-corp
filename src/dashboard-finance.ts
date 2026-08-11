@@ -4,7 +4,8 @@
  */
 
 import type { RunRecord } from "./model";
-import { invoke, isTauri } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
+import { native } from "./native-adapter";
 import { listWorkflows } from "./templates";
 import { tokensFromRunRecord } from "./token-usage";
 import { notifyPersistenceError } from "./persistence-events";
@@ -118,7 +119,7 @@ function buildFinanceEntry(input: {
 }
 
 export async function listFinanceEntriesPersisted(): Promise<FinanceEntry[]> {
-  if (!isTauri()) return listFinanceEntries();
+  if (!native.isNative) return listFinanceEntries();
   await migrateBrowserDashboardData();
   return invoke<FinanceEntry[]>("list_finance_entries");
 }
@@ -127,13 +128,13 @@ export async function createFinanceEntryPersisted(
   input: Parameters<typeof buildFinanceEntry>[0],
 ): Promise<FinanceEntry> {
   const entry = buildFinanceEntry(input);
-  if (isTauri()) await invoke("save_finance_entry", { entry });
+  if (native.isNative) await invoke("save_finance_entry", { entry });
   else saveFinanceEntry(entry);
   return entry;
 }
 
 export async function deleteFinanceEntryPersisted(id: string): Promise<void> {
-  if (isTauri()) await invoke("delete_finance_entry", { id });
+  if (native.isNative) await invoke("delete_finance_entry", { id });
   else deleteFinanceEntry(id);
 }
 
@@ -372,13 +373,13 @@ export function publishDashboardFeedback(
 export async function listDashboardFeedbackPersisted(): Promise<
   DashboardFeedback[]
 > {
-  if (!isTauri()) return listDashboardFeedback();
+  if (!native.isNative) return listDashboardFeedback();
   await migrateBrowserDashboardData();
   return invoke<DashboardFeedback[]>("list_dashboard_feedback");
 }
 
 async function migrateBrowserDashboardData(): Promise<void> {
-  if (!isTauri()) return;
+  if (!native.isNative) return;
   if (desktopMigration) return desktopMigration;
   desktopMigration = (async () => {
     const [nativeFinance, nativeFeedback] = await Promise.all([
@@ -424,7 +425,7 @@ export async function publishDashboardFeedbackPersisted(
     createdAt: new Date().toISOString(),
     ...composed,
   };
-  if (isTauri()) await invoke("save_dashboard_feedback", { item });
+  if (native.isNative) await invoke("save_dashboard_feedback", { item });
   else saveDashboardFeedback(item);
   return item;
 }
