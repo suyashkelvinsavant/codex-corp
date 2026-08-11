@@ -18,6 +18,11 @@ import {
 } from "./specialist-defaults";
 import { latestArchitectDashboardDigestPersisted } from "./dashboard-finance";
 import { listNodeExperience, formatExperienceDigest } from "./node-experience";
+import {
+  listHarnessLessons,
+  refineHarnessLessons,
+  formatLessonDigest,
+} from "./harness-lessons";
 import type {
   DynamicToolSpecJson,
   ToolExecResult,
@@ -34,7 +39,7 @@ You are responsible for every agent and creative node working at its best. For e
 - Set a clear role label and description so operators understand the node.
 - Prefer ≥120 characters of substantive prompt text; validation rejects weak placeholders.
 
-If a DASHBOARD_FEEDBACK digest is present in context, use it to prefer lower-burn graphs, tighten high-cost specialists, and align designs with profitable workflows. Before creating or patching a specialist node, call workflow_node_experience to ground the change in that node's historical run outcomes (recurring failure classes, token burn, latency).
+If a DASHBOARD_FEEDBACK digest is present in context, use it to prefer lower-burn graphs, tighten high-cost specialists, and align designs with profitable workflows. Before creating or patching a specialist node, call workflow_node_experience to ground the change in that node's historical run outcomes (recurring failure classes, token burn, latency). After a run with recurring failures, call workflow_refine_lessons to produce durable, reviewable harness lessons that are prepended to the specialist's developer instructions on future runs; call workflow_list_lessons to inspect the active lessons for a node's pattern before adjusting its prompt.
 
 You have CRUD access to unlocked workflows. A locked workflow is programmatically read-only: never attempt to update, patch, repair, add/remove nodes or edges, or delete it. You may inspect, validate, open, or duplicate a locked workflow and edit the duplicate. If the operator insists on changing the original, ask them to disable its Byte lock in the workflow editor; never ask for or claim an override. For destructive deletion, explain the target and ask for explicit confirmation first. Prefer focused specialist nodes with precise prompts, least-privilege tools/skills, typed handoffs, human gates for irreversible actions, and a final output node. After every mutation sequence, call workflow_validate. Do not describe a workflow as ready while validation errors remain. Summarize exactly what changed and flag remaining risks. Do not run company workflows or implement product code.`;
 
@@ -324,6 +329,26 @@ export function workflowArchitectDynamicTools(): DynamicToolSpecJson[] {
         ["id", "nodeId"],
       ),
     },
+    {
+      type: "function",
+      name: "workflow_refine_lessons",
+      description:
+        "Run a deliberate refinement pass over this workflow's node experience. Reviews recurring failures and produces or updates durable, versioned harness lessons (with snapshot history) that are prepended to matching specialists' developer instructions on future runs. Returns a summary of created/updated/skipped lessons. Call after a run with recurring failures to capture evidence-backed guidance that transfers across workflows sharing the same role/model/effort pattern.",
+      inputSchema: object({ id: { type: "string" } }, ["id"]),
+    },
+    {
+      type: "function",
+      name: "workflow_list_lessons",
+      description:
+        "List active harness lessons for a specialist node's pattern (role/model/effort). Use before adjusting a specialist prompt to see the durable, reviewable guidance already applied at run time. Each lesson is versioned with snapshot rollback history.",
+      inputSchema: object(
+        {
+          id: { type: "string" },
+          nodeId: { type: "string" },
+        },
+        ["id", "nodeId"],
+      ),
+    },
   ];
 }
 
@@ -604,6 +629,8 @@ export async function executeWorkflowArchitectTool(
       "workflow_open_editor",
       "workflow_duplicate",
       "workflow_node_experience",
+      "workflow_refine_lessons",
+      "workflow_list_lessons",
     ]);
     if (exists.locked && !nonMutating.has(name))
       return fail(
@@ -849,6 +876,28 @@ export async function executeWorkflowArchitectTool(
         effort: node.data.effort,
         digest: formatExperienceDigest(records),
         records: records.slice(0, 20),
+      });
+    }
+    if (name === "workflow_refine_lessons") {
+      const result = await refineHarnessLessons(id);
+      return ok({ workflowId: id, ...result });
+    }
+    if (name === "workflow_list_lessons") {
+      const node = exists.nodes.find((n) => n.id === String(args.nodeId));
+      if (!node) return fail(`Node ${args.nodeId} not found in workflow ${id}`);
+      const lessons = await listHarnessLessons({
+        role: node.data.role,
+        model: node.data.model,
+        effort: node.data.effort,
+      });
+      return ok({
+        workflowId: id,
+        nodeId: node.id,
+        role: node.data.role,
+        model: node.data.model,
+        effort: node.data.effort,
+        digest: formatLessonDigest(lessons),
+        lessons,
       });
     }
     return fail(`Unknown tool: ${name}`);

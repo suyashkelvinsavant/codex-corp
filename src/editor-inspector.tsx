@@ -85,6 +85,16 @@ import { findPackForRole, getPack } from "./node-packs/packs";
 import { Metric } from "./metric";
 import { CONTROL_KINDS, controlKindLabel, statusText } from "./node-display";
 import { composeSpecialistInputPreview } from "./specialist-input";
+import {
+  listHarnessLessons,
+  listHarnessLessonSnapshots,
+  updateHarnessLesson,
+  rollbackHarnessLesson,
+  deleteHarnessLesson,
+  refineHarnessLessons,
+  type HarnessLesson,
+  type LessonSnapshot,
+} from "./harness-lessons";
 
 const ConnectorRuntimePanel = lazy(() =>
   import("./connector-runtime-panel").then((module) => ({
@@ -387,6 +397,7 @@ export function NodeInspector({
     "trace",
     "config",
     "threads",
+    "lessons",
   ];
   const resetConfiguration = () =>
     update({
@@ -1057,6 +1068,13 @@ export function NodeInspector({
               ))
             )}
           </div>
+        )}
+        {tab === "lessons" && (
+          <HarnessLessonsPanel
+            role={d.role}
+            model={d.model}
+            effort={d.effort}
+          />
         )}
       </div>
       <div className="inspector-actions">
@@ -2931,6 +2949,268 @@ function Section({
       <h3>{title}</h3>
       {children}
     </section>
+  );
+}
+
+/**
+ * Harness lessons panel — inspect, edit, roll back, and refine durable,
+ * versioned supplemental guidance for a specialist pattern (role/model/effort).
+ * Lessons are prepended to the specialist's developer instructions at run time
+ * and transfer across workflows sharing the same pattern.
+ */
+function HarnessLessonsPanel({
+  role,
+  model,
+  effort,
+}: {
+  role: string;
+  model: string;
+  effort: string;
+}) {
+  const [lessons, setLessons] = useState<HarnessLesson[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [editBody, setEditBody] = useState("");
+  const [snapshots, setSnapshots] = useState<LessonSnapshot[]>([]);
+  const [snapshotsFor, setSnapshotsFor] = useState<number | null>(null);
+  const [refineStatus, setRefineStatus] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const reload = async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const rows = await listHarnessLessons({ role, model, effort });
+      setLessons(rows);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [role, model, effort]);
+
+  const startEdit = (lesson: HarnessLesson) => {
+    setEditingId(lesson.id);
+    setEditBody(lesson.body);
+  };
+
+  const saveEdit = async () => {
+    if (editingId == null) return;
+    setBusy(true);
+    try {
+      const lesson = lessons.find((l) => l.id === editingId);
+      await updateHarnessLesson(editingId, editBody, lesson?.evidence ?? {});
+      await reload();
+      setEditingId(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doRollback = async (lessonId: number, toVersion: number) => {
+    setBusy(true);
+    try {
+      await rollbackHarnessLesson(lessonId, toVersion);
+      await reload();
+      setSnapshotsFor(null);
+      setSnapshots([]);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doDelete = async (lessonId: number) => {
+    if (
+      !confirm(
+        "Deactivate this harness lesson? It will stop applying at run time and be removed from the list, but its history is retained for audit and later pruning.",
+      )
+    )
+      return;
+    setBusy(true);
+    try {
+      await deleteHarnessLesson(lessonId);
+      await reload();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const showSnapshots = async (lessonId: number) => {
+    if (snapshotsFor === lessonId) {
+      setSnapshotsFor(null);
+      setSnapshots([]);
+      return;
+    }
+    try {
+      const rows = await listHarnessLessonSnapshots(lessonId);
+      setSnapshots(rows);
+      setSnapshotsFor(lessonId);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const doRefine = async () => {
+    setBusy(true);
+    setRefineStatus("");
+    try {
+      const result = await refineHarnessLessons();
+      setRefineStatus(
+        `Refine complete: ${result.summary.created} created, ${result.summary.updated} updated, ${result.summary.skipped} skipped.`,
+      );
+      await reload();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (loading) return <p className="helper">Loading harness lessons…</p>;
+  return (
+    <>
+      <Section title="Harness lessons">
+        <p className="helper">
+          Durable, versioned supplemental guidance for the{" "}
+          <code>{role}/{model}/{effort}</code> pattern. Active lessons are
+          prepended to this specialist's developer instructions at run time and
+          transfer across workflows sharing the same pattern.
+        </p>
+        <div className="lesson-actions">
+          <button
+            type="button"
+            onClick={doRefine}
+            disabled={busy}
+            title="Review node experience and produce/update lessons"
+          >
+            <Sparkles size={14} />
+            Refine from experience
+          </button>
+          <button type="button" onClick={reload} disabled={busy}>
+            Refresh
+          </button>
+        </div>
+        {refineStatus && <p className="helper">{refineStatus}</p>}
+        {error && <p className="helper warning-text">{error}</p>}
+        {lessons.length === 0 ? (
+          <p className="helper">
+            No active lessons. Run a workflow with recurring failures, then
+            click "Refine from experience" to produce evidence-backed guidance.
+          </p>
+        ) : (
+          <div className="lesson-list">
+            {lessons.map((lesson) => (
+              <div key={lesson.id} className="lesson-card">
+                <div className="lesson-card-header">
+                  <strong>
+                    #{lesson.id} {lesson.title}
+                  </strong>
+                  <span className="lesson-meta">
+                    {lesson.source} · v{lesson.currentVersion} · {lesson.status}
+                  </span>
+                </div>
+                {editingId === lesson.id ? (
+                  <div className="lesson-edit">
+                    <textarea
+                      className="tall"
+                      value={editBody}
+                      onChange={(e) => setEditBody(e.target.value)}
+                      rows={5}
+                    />
+                    <div className="lesson-edit-actions">
+                      <button
+                        type="button"
+                        onClick={saveEdit}
+                        disabled={busy}
+                      >
+                        Save
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setEditingId(null)}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <p className="lesson-body">{lesson.body}</p>
+                )}
+                <div className="lesson-evidence">
+                  <small>
+                    Evidence:{" "}
+                    {JSON.stringify(lesson.evidence).slice(0, 200)}
+                  </small>
+                </div>
+                <div className="lesson-card-actions">
+                  <button
+                    type="button"
+                    onClick={() => startEdit(lesson)}
+                    disabled={busy || editingId !== null}
+                  >
+                    Edit
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => showSnapshots(lesson.id)}
+                    disabled={busy}
+                  >
+                    {snapshotsFor === lesson.id ? "Hide history" : "History"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => doDelete(lesson.id)}
+                    disabled={busy}
+                  >
+                    Delete
+                  </button>
+                </div>
+                {snapshotsFor === lesson.id && (
+                  <div className="lesson-snapshots">
+                    <h4>Snapshots (newest first)</h4>
+                    {snapshots.map((snap) => (
+                      <div key={snap.id} className="snapshot-row">
+                        <span className="snapshot-version">
+                          v{snap.version} · {snap.snapshotReason}
+                        </span>
+                        <span className="snapshot-date">
+                          {snap.createdAt}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            doRollback(lesson.id, snap.version)
+                          }
+                          disabled={
+                            busy || snap.version === lesson.currentVersion
+                          }
+                          title="Roll back to this version"
+                        >
+                          Roll back
+                        </button>
+                        <pre className="snapshot-body">{snap.body}</pre>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </Section>
+    </>
   );
 }
 function ConnectorSkillPicker({

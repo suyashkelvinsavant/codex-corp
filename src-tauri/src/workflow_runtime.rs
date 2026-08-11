@@ -2463,6 +2463,44 @@ async fn specialist_with_retries(
             json!({"guidance": guidance}),
         );
     }
+    // Apply durable harness lessons for this specialist pattern. Unlike the
+    // ephemeral experience guidance above, lessons are persistent, reviewable
+    // artifacts (created by `/refine` or manually) that survive across runs and
+    // transfer between workflows sharing the same role/model/effort pattern.
+    {
+        let connection = database_guard(context);
+        match crate::harness_lessons::lesson_guidance(
+            &connection,
+            &node.data.role,
+            &node.data.model,
+            &node.data.effort,
+        ) {
+            Ok(Some(lesson_text)) => {
+                effective_extra = format!("{lesson_text}\n\n{effective_extra}");
+                emit_event(
+                    context,
+                    "node.harness.lessons_applied",
+                    "info",
+                    Some(&node.id),
+                    None,
+                    "Applied durable harness lessons to specialist prompt",
+                    json!({"pattern": format!("{}|{}|{}", node.data.role, node.data.model, node.data.effort)}),
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                emit_event(
+                    context,
+                    "node.harness.lessons_load_failed",
+                    "warning",
+                    Some(&node.id),
+                    None,
+                    format!("failed to load harness lessons: {error}"),
+                    json!({"error": error}),
+                );
+            }
+        }
+    }
     let mut stop_reason: Option<RetryStopReason> = None;
     let mut attempts_used: u32 = 0;
     let mut retry_limit = node.data.max_retries;

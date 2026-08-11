@@ -16,6 +16,11 @@ import type { MediatorQuestion, MediatorQuestionAnswer } from "./mediator-ui";
 import type { LocalTestSession } from "./local-test";
 import type { AppProjectMode, AppWorkspaceSelection } from "./workflow-chat";
 import { listNodeExperience, formatExperienceDigest } from "./node-experience";
+import {
+  listHarnessLessons,
+  refineHarnessLessons,
+  formatLessonDigest,
+} from "./harness-lessons";
 
 export const COMPANY_MEDIATOR_SYSTEM_PROMPT = `You are Byte for Codex Corp — the human-facing companion for a multi-specialist company graph (not a graph node yourself).
 
@@ -41,7 +46,7 @@ Steer the company with **tools** and talk to the operator. You do **not** implem
 - company_run / company_run_from / company_stop / company_set_mission / approval tools for control.
 - After a completed Release Bundle, report the local-test status from company_status. The operator must launch, test, and approve or give concrete feedback; never claim the app was tested without that evidence.
 - company_ask_operator for blocking structured questions when a decision is missing.
-- company_list_nodes + node_get / node_get_trace / node_get_events / node_get_experience / node_task_progress for inspection. Call node_get_experience when a node has repeated failures to see its historical outcomes and recurring failure classes.
+- company_list_nodes + node_get / node_get_trace / node_get_events / node_get_experience / node_task_progress for inspection. Call node_get_experience when a node has repeated failures to see its historical outcomes and recurring failure classes. After a run with recurring failures, call node_refine_lessons to produce durable, versioned harness lessons that are prepended to the specialist's developer instructions on future runs; call node_list_lessons to inspect the active lessons for a node's pattern before advising prompt changes.
 
 ## Style
 Brief, accurate markdown. No marketing fluff. No assumed product (landing page, app type, stack) unless the operator stated it.`;
@@ -295,6 +300,20 @@ export function companyMediatorDynamicTools(): DynamicToolSpecJson[] {
       name: "node_get_experience",
       description:
         "Durable run experience for a node pattern (success/failure outcomes, failure classes, tokens, latency). Call this before giving advice about a repeated failure or before suggesting prompt/tool changes.",
+      inputSchema: nodeRef,
+    },
+    {
+      type: "function",
+      name: "node_refine_lessons",
+      description:
+        "Run a deliberate refinement pass over this workflow's node experience to produce or update durable, versioned harness lessons. The lessons are prepended to matching specialists' developer instructions on future runs and transfer across workflows sharing the same role/model/effort pattern. Call after a run with recurring failures to capture evidence-backed guidance.",
+      inputSchema: { ...nodeRef, properties: { ...nodeRef.properties } },
+    },
+    {
+      type: "function",
+      name: "node_list_lessons",
+      description:
+        "List active harness lessons for a node's specialist pattern (role/model/effort). Use before advising prompt changes to see the durable, reviewable guidance already applied at run time. Each lesson has snapshot rollback history.",
       inputSchema: nodeRef,
     },
   ];
@@ -558,6 +577,8 @@ export async function executeCompanyMediatorTool(
       case "node_get_events":
       case "node_task_progress":
       case "node_get_experience":
+      case "node_refine_lessons":
+      case "node_list_lessons":
       case "node_focus": {
         const resolved = resolveNode(ctx, {
           nodeId: str("nodeId"),
@@ -653,6 +674,25 @@ export async function executeCompanyMediatorTool(
             effort: node.data.effort,
             digest: formatExperienceDigest(records),
             records: records.slice(0, 20),
+          });
+        }
+        if (name === "node_refine_lessons") {
+          const result = await refineHarnessLessons(ctx.workflowId);
+          return ok({ workflowId: ctx.workflowId, ...result });
+        }
+        if (name === "node_list_lessons") {
+          const lessons = await listHarnessLessons({
+            role: node.data.role,
+            model: node.data.model,
+            effort: node.data.effort,
+          });
+          return ok({
+            id: node.id,
+            role: node.data.role,
+            model: node.data.model,
+            effort: node.data.effort,
+            digest: formatLessonDigest(lessons),
+            lessons,
           });
         }
         // node_task_progress

@@ -43,6 +43,8 @@ describe("workflow architect tools", () => {
         "workflow_repair",
         "workflow_open_editor",
         "workflow_node_experience",
+        "workflow_refine_lessons",
+        "workflow_list_lessons",
       ]),
     );
   });

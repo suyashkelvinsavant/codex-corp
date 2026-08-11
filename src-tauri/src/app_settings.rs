@@ -253,6 +253,8 @@ pub(crate) fn cleanup(
             .map_err(|error| error.to_string())?;
         crate::workflow_runtime::prune_node_experience(&transaction, settings.retention_days)
             .map_err(|error| format!("experience retention cleanup failed: {error}"))?;
+        crate::harness_lessons::prune_lessons(&transaction, settings.retention_days)
+            .map_err(|error| format!("harness lesson retention cleanup failed: {error}"))?;
     }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(ids.len())

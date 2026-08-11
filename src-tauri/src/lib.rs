@@ -26,6 +26,7 @@ mod business_data;
 mod chat_data;
 pub(crate) mod codex_turn;
 pub mod golden;
+mod harness_lessons;
 mod local_test;
 pub mod mcp_server;
 mod platform_process;
@@ -1242,6 +1243,7 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
     let _ = connection.execute("ALTER TABLE artifacts ADD COLUMN storage_path TEXT", []);
     app_settings::initialize(connection)?;
     workflow_runtime::initialize_database(connection)?;
+    harness_lessons::initialize(connection)?;
     business_data::initialize(connection)?;
     chat_data::initialize(connection)?;
     local_test::initialize(connection)?;
@@ -2449,6 +2451,8 @@ fn delete_workflow(id: String, database: tauri::State<'_, Database>) -> Result<(
         .execute("DELETE FROM workflows WHERE id=?1", params![id])
         .map_err(|error| error.to_string())?;
     crate::workflow_runtime::delete_node_experience_for_workflow(&transaction, &id)
+        .map_err(|error| error.to_string())?;
+    crate::harness_lessons::delete_lessons_for_workflow(&transaction, &id)
         .map_err(|error| error.to_string())?;
     transaction.commit().map_err(|error| error.to_string())
 }
@@ -7085,6 +7089,13 @@ pub fn run() {
             workflow_runtime::list_node_experience,
             workflow_runtime::analytics_verification_loops,
             workflow_runtime::respond_run_approval,
+            harness_lessons::list_harness_lessons,
+            harness_lessons::create_harness_lesson,
+            harness_lessons::update_harness_lesson,
+            harness_lessons::rollback_harness_lesson,
+            harness_lessons::delete_harness_lesson,
+            harness_lessons::list_harness_lesson_snapshots,
+            harness_lessons::refine_harness_lessons_cmd,
             list_codex_voices,
             start_codex_realtime,
             stop_codex_realtime,
