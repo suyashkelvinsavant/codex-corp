@@ -4,6 +4,7 @@ export type DrawerTab =
   | "timeline"
   | "runs"
   | "approvals"
+  | "stream"
   | "logs"
   | "problems"
   | "artifacts"

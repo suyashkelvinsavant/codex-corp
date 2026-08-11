@@ -226,6 +226,7 @@ import {
   createStreamBuffer,
   type ExecutionStreamBuffer,
 } from "./execution-stream";
+import { ExecutionStreamDisclosure } from "./execution-stream-disclosure";
 import {
   buildUserInputResponse,
   parseElicitationForm,
@@ -4932,6 +4933,7 @@ function App() {
                     "timeline",
                     "runs",
                     "approvals",
+                    "stream",
                     "logs",
                     "problems",
                     "artifacts",
@@ -5034,6 +5036,34 @@ function App() {
                       <span>{request.title}</span>
                     </button>
                   ))}
+                {drawerTab === "stream" && (
+                  <div className="drawer-stream-view">
+                    {nodes
+                      .filter(
+                        (node) =>
+                          node.data.streamBuffer &&
+                          node.data.streamBuffer.lines.length > 0,
+                      )
+                      .map((node) => (
+                        <ExecutionStreamDisclosure
+                          key={node.id}
+                          buffer={node.data.streamBuffer}
+                          expanded={activeStreamNodeId === node.id}
+                          onToggle={() =>
+                            setActiveStreamNodeId((current) =>
+                              current === node.id ? null : node.id,
+                            )
+                          }
+                          label={`${node.data.label} stream`}
+                        />
+                      ))}
+                    {nodes.every(
+                      (node) =>
+                        !node.data.streamBuffer ||
+                        node.data.streamBuffer.lines.length === 0,
+                    ) && <span>No active streams.</span>}
+                  </div>
+                )}
                 {drawerTab === "logs" &&
                   events
                     .slice()
