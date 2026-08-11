@@ -227,6 +227,7 @@ import {
   type ExecutionStreamBuffer,
 } from "./execution-stream";
 import { ExecutionStreamDisclosure } from "./execution-stream-disclosure";
+import { deriveDecisionCenterOpen } from "./decision-center-visibility";
 import {
   buildUserInputResponse,
   parseElicitationForm,
@@ -819,7 +820,7 @@ function App() {
   const [activeApproval, setActiveApproval] = useState<ApprovalRequest | null>(
     null,
   );
-  const [approvalCenterOpen, setApprovalCenterOpen] = useState(false);
+  const [manualDecisionCenterOpen, setManualDecisionCenterOpen] = useState(false);
   const [mediatorToasts, setMediatorToasts] = useState<MediatorNotification[]>(
     [],
   );
@@ -828,6 +829,13 @@ function App() {
   );
   const [activeConfirmation, setActiveConfirmation] =
     useState<MediatorConfirmation | null>(null);
+  const decisionCenterOpen = deriveDecisionCenterOpen({
+    approvals,
+    activeConfirmation,
+    activeQuestion,
+    localTest,
+    manualOpen: manualDecisionCenterOpen,
+  });
   const confirmationResolver = useRef<((approved: boolean) => void) | null>(
     null,
   );
@@ -842,16 +850,13 @@ function App() {
       confirmationResolver.current?.(false);
       confirmationResolver.current = resolve;
       setActiveConfirmation(confirmation);
-      setApprovalCenterOpen(true);
+      setManualDecisionCenterOpen(true);
     });
   const resolveOperatorConfirmation = (approved: boolean) => {
     const resolve = confirmationResolver.current;
     confirmationResolver.current = null;
     setActiveConfirmation(null);
-    setApprovalCenterOpen(
-      activeQuestion !== null ||
-        approvalsRef.current.some((item) => item.status === "pending"),
-    );
+    // Visibility is now derived from pending decisions; no manual open needed.
     resolve?.(approved);
   };
   const [runId, setRunId] = useState<string | null>(null);
@@ -1453,7 +1458,7 @@ function App() {
   const askMediatorQuestion = (question: MediatorQuestion) =>
     new Promise<MediatorQuestionAnswer | null>((resolve) => {
       setActiveQuestion(question);
-      setApprovalCenterOpen(true);
+      setManualDecisionCenterOpen(true);
       setQuestionFreeText("");
       setQuestionSelected([]);
       questionResolver.current = resolve;
@@ -1491,7 +1496,7 @@ function App() {
   const closeDecisionCenter = () => {
     if (activeConfirmation) resolveOperatorConfirmation(false);
     if (activeQuestion) resolveMediatorQuestion(true);
-    setApprovalCenterOpen(false);
+    setManualDecisionCenterOpen(false);
   };
   const inspectRun = (record: RunRecord) => {
     setRunId(record.id);
@@ -2649,7 +2654,7 @@ function App() {
         formatLocalTestPrompt(session),
         "test",
       );
-      setApprovalCenterOpen(true);
+      setManualDecisionCenterOpen(true);
       setDrawer(true);
       setDrawerTab("approvals");
       emit(
@@ -2706,10 +2711,7 @@ function App() {
       } else if (next.status === "launch_failed") {
         throw new Error(next.lastError || "local app launch failed");
       }
-      setApprovalCenterOpen(
-        activeQuestion !== null ||
-          approvalsRef.current.some((item) => item.status === "pending"),
-      );
+      // Visibility is now derived from pending decisions; no manual open needed.
     } catch (error) {
       appendMediatorMessageToStore(
         workflowId,
@@ -3354,7 +3356,7 @@ function App() {
             return;
           }
           if (session.status === "launch_pending") {
-            setApprovalCenterOpen(true);
+            setManualDecisionCenterOpen(true);
             setDrawer(true);
             setDrawerTab("approvals");
           }
@@ -3557,7 +3559,7 @@ function App() {
         approvalsRef.current = [...approvalsRef.current, request];
         setApprovals(approvalsRef.current);
         setActiveApproval(request);
-        setApprovalCenterOpen(true);
+        setManualDecisionCenterOpen(true);
         setDrawer(true);
         setDrawerTab("approvals");
         setNodes((ns) =>
@@ -3914,7 +3916,7 @@ function App() {
         approvalsRef.current = [...approvalsRef.current, request];
         setApprovals(approvalsRef.current);
         setActiveApproval(request);
-        setApprovalCenterOpen(true);
+        setManualDecisionCenterOpen(true);
         setDrawer(true);
         setDrawerTab("approvals");
       }),
@@ -3929,7 +3931,7 @@ function App() {
 
   const renderGlobalModals = () => (
     <>
-      {approvalCenterOpen && (
+      {decisionCenterOpen && (
         <Suspense fallback={null}>
           <DecisionCenterModal
             approvals={approvals}
@@ -4228,7 +4230,7 @@ function App() {
               (localTest?.status === "launch_pending" ? 1 : 0)
             }
             localTest={localTest}
-            onOpenApprovals={() => setApprovalCenterOpen(true)}
+            onOpenApprovals={() => setManualDecisionCenterOpen(true)}
             onSubmitLocalTestFeedback={submitLocalTestFeedback}
             onStopLocalTest={stopLocalTest}
             onBack={() => {
@@ -4342,7 +4344,7 @@ function App() {
           <button
             type="button"
             className="approval-center-trigger"
-            onClick={() => setApprovalCenterOpen(true)}
+            onClick={() => setManualDecisionCenterOpen(true)}
             aria-label="Open approvals and questions"
           >
             <Hand size={14} />
