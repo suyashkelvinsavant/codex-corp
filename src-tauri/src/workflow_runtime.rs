@@ -98,7 +98,7 @@ use scheduler::start_scheduler;
 #[cfg(test)]
 use scheduler::cron_matches_at;
 mod approval_gates;
-use approval_gates::{approval_node, await_operator_approval};
+use approval_gates::{approval_node, await_operator_approval, publish_approval_node, release_commit_node};
 #[cfg(test)]
 use approval_gates::{operator_approval_timeout, parse_needs_human_timeout, wait_for_approval};
 mod node_experience;
@@ -2687,9 +2687,21 @@ async fn execute_node(
             }
             Ok(output)
         }
-        "approval" => approval_node(context, node)
-            .await
-            .map_err(|error| NodeExecutionFailure::owned(&node.id, error)),
+        "approval" => {
+            if node.id == "release-commit" {
+                release_commit_node(context, node)
+                    .await
+                    .map_err(|error| NodeExecutionFailure::owned(&node.id, error))
+            } else if node.id == "publish-approval" {
+                publish_approval_node(context, node)
+                    .await
+                    .map_err(|error| NodeExecutionFailure::owned(&node.id, error))
+            } else {
+                approval_node(context, node)
+                    .await
+                    .map_err(|error| NodeExecutionFailure::owned(&node.id, error))
+            }
+        }
         "merge" => Ok(RuntimeOutput {
             status: "success".into(),
             summary: "Dependencies joined.".into(),

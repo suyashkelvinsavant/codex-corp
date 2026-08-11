@@ -211,6 +211,220 @@ pub(super) async fn approval_node(
     })
 }
 
+/// Release commit approval gate: asks the operator for a separate release
+/// decision, then creates an exact local Git commit tied to the frozen
+/// approved artifact hashes/revisions. Does NOT push to main.
+pub(super) async fn release_commit_node(
+    context: &RunContext,
+    node: &RuntimeNode,
+) -> Result<RuntimeOutput, String> {
+    let request_id = await_operator_approval(
+        context,
+        node,
+        "release-commit",
+        "Approve the creation of a local Git commit tied to the verified artifact snapshot. This does NOT push to main.",
+    )
+    .await?;
+    // Freeze approved artifact (key,hash) pairs.
+    let outputs_snapshot = poison_aware_lock(&context.outputs, "outputs", Some(&context.run_id));
+    let mut kind_artifacts: HashMap<String, (String, Vec<serde_json::Value>)> = HashMap::new();
+    for node_ref in &context.graph.nodes {
+        if let Some(out) = outputs_snapshot.get(&node_ref.id) {
+            kind_artifacts.insert(
+                node_ref.id.clone(),
+                (node_ref.data.kind.clone(), out.artifacts.clone()),
+            );
+        }
+    }
+    let refs = collect_upstream_artifacts(&kind_artifacts);
+    let approved_at = chrono_like_now_iso();
+    let freeze = freeze_approval_snapshot(&request_id, &approved_at, &refs);
+    // Create a local Git commit in the workspace if we have a workspace path.
+    let workspace_path = context
+        .target_workspace
+        .as_deref()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let commit_hash = if !workspace_path.is_empty() {
+        let commit_message = format!(
+            "release: verified artifact snapshot for run {} ({})",
+            context.run_id, approved_at
+        );
+        match create_release_commit(&workspace_path, &commit_message) {
+            Ok(hash) => Some(hash),
+            Err(error) => {
+                emit_event(
+                    context,
+                    "release.commit_failed",
+                    "warning",
+                    Some(&node.id),
+                    None,
+                    format!("Local release commit failed: {error}"),
+                    json!({"requestId":request_id,"error":error}),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    emit_event(
+        context,
+        "release.commit_created",
+        "info",
+        Some(&node.id),
+        None,
+        format!(
+            "Release commit created{}",
+            commit_hash
+                .as_ref()
+                .map(|h| format!(": {h}"))
+                .unwrap_or_default()
+        ),
+        json!({"requestId":request_id,"commitHash":commit_hash.clone()}),
+    );
+    let mut data = freeze;
+    if let Some(hash) = &commit_hash {
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert("commitHash".into(), json!(hash));
+        }
+    }
+    Ok(RuntimeOutput {
+        status: "success".into(),
+        summary: "Release commit approval recorded. Local Git commit created.".into(),
+        data,
+        artifacts: Vec::new(),
+        thread_id: None,
+        turn_id: None,
+        tokens: 0,
+    })
+}
+
+/// Publish approval gate: asks the operator for a separate publish decision.
+/// Only after approval does it push the exact commit to main. This is the
+/// only place in the workflow that performs a git push.
+pub(super) async fn publish_approval_node(
+    context: &RunContext,
+    node: &RuntimeNode,
+) -> Result<RuntimeOutput, String> {
+    let request_id = await_operator_approval(
+        context,
+        node,
+        "publish-approval",
+        "Approve pushing the verified release commit to main. This is the final publish step.",
+    )
+    .await?;
+    let workspace_path = context
+        .target_workspace
+        .as_deref()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let push_result = if !workspace_path.is_empty() {
+        match push_release_to_main(&workspace_path) {
+            Ok(output) => output,
+            Err(error) => {
+                emit_event(
+                    context,
+                    "release.publish_failed",
+                    "error",
+                    Some(&node.id),
+                    None,
+                    format!("Publish to main failed: {error}"),
+                    json!({"requestId":request_id,"error":error}),
+                );
+                return Err(format!("publish to main failed: {error}"));
+            }
+        }
+    } else {
+        "no workspace path; publish skipped".to_string()
+    };
+    emit_event(
+        context,
+        "release.published",
+        "info",
+        Some(&node.id),
+        None,
+        format!("Release published to main: {push_result}"),
+        json!({"requestId":request_id,"pushResult":push_result}),
+    );
+    Ok(RuntimeOutput {
+        status: "success".into(),
+        summary: "Publish approval recorded. Release pushed to main.".into(),
+        data: json!({"requestId":request_id,"pushResult":push_result}),
+        artifacts: Vec::new(),
+        thread_id: None,
+        turn_id: None,
+        tokens: 0,
+    })
+}
+
+/// Create a local Git commit in the workspace for the release.
+/// Stages all changes and creates a commit with the given message.
+/// Returns the commit hash on success.
+fn create_release_commit(workspace: &str, message: &str) -> Result<String, String> {
+    use std::process::Command;
+    let workspace_path = std::path::Path::new(workspace);
+    // Stage all changes.
+    let add_result = Command::new("git")
+        .args(["add", "--all"])
+        .current_dir(workspace_path)
+        .output()
+        .map_err(|e| format!("failed to run git add: {e}"))?;
+    if !add_result.status.success() {
+        let stderr = String::from_utf8_lossy(&add_result.stderr);
+        return Err(format!("git add failed: {stderr}"));
+    }
+    // Create the commit.
+    let commit_result = Command::new("git")
+        .args(["commit", "-m", message])
+        .current_dir(workspace_path)
+        .output()
+        .map_err(|e| format!("failed to run git commit: {e}"))?;
+    if !commit_result.status.success() {
+        let stderr = String::from_utf8_lossy(&commit_result.stderr);
+        // "nothing to commit" is not an error for a release commit.
+        if stderr.contains("nothing to commit") {
+            // Return the current HEAD hash.
+            let rev_parse = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(workspace_path)
+                .output()
+                .map_err(|e| format!("failed to run git rev-parse: {e}"))?;
+            return Ok(String::from_utf8_lossy(&rev_parse.stdout).trim().to_string());
+        }
+        return Err(format!("git commit failed: {stderr}"));
+    }
+    // Get the commit hash.
+    let rev_parse = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(workspace_path)
+        .output()
+        .map_err(|e| format!("failed to run git rev-parse: {e}"))?;
+    if !rev_parse.status.success() {
+        let stderr = String::from_utf8_lossy(&rev_parse.stderr);
+        return Err(format!("git rev-parse HEAD failed: {stderr}"));
+    }
+    Ok(String::from_utf8_lossy(&rev_parse.stdout).trim().to_string())
+}
+
+/// Push the release commit to main. This is the only place in the workflow
+/// that performs a git push.
+fn push_release_to_main(workspace: &str) -> Result<String, String> {
+    use std::process::Command;
+    let workspace_path = std::path::Path::new(workspace);
+    let push_result = Command::new("git")
+        .args(["push", "origin", "main"])
+        .current_dir(workspace_path)
+        .output()
+        .map_err(|e| format!("failed to run git push: {e}"))?;
+    if !push_result.status.success() {
+        let stderr = String::from_utf8_lossy(&push_result.stderr);
+        return Err(format!("git push origin main failed: {stderr}"));
+    }
+    let stdout = String::from_utf8_lossy(&push_result.stdout);
+    Ok(stdout.trim().to_string())
+}
+
 /// Headless `needs_human` gate deadline (P1). In headless / CI there is no
 /// operator watching the broker, so a capability/specification gate must fail
 /// closed within a short configurable window instead of stalling a batch run
