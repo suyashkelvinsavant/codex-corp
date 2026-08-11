@@ -1,4 +1,5 @@
 import type { TraceRecord } from "./model";
+import type { ExecutionStreamKind } from "./execution-stream";
 
 const MAX_STREAM_PREVIEW_CHARS = 900;
 
@@ -36,8 +37,43 @@ export function appendStreamPreview(
   return next.length > maxChars ? next.slice(-maxChars) : next;
 }
 
+const AGENT_MESSAGE_DELTA_TYPES = new Set([
+  "item/agentMessage/delta",
+  "agent.message.delta",
+]);
+
 export function isAgentMessageDelta(eventType: string): boolean {
-  return eventType === "item/agentMessage/delta";
+  return AGENT_MESSAGE_DELTA_TYPES.has(eventType);
+}
+
+export function normalizeStreamEventType(rawType: string): string {
+  if (rawType === "agent.message.delta") return "item/agentMessage/delta";
+  return rawType;
+}
+
+export function classifyStreamKind(eventType: string): ExecutionStreamKind | null {
+  switch (eventType) {
+    case "item/reasoning/summaryTextDelta":
+    case "item/reasoning/textDelta":
+      return "reasoning-summary";
+    case "item/plan/delta":
+    case "turn/plan/updated":
+      return "plan";
+    case "item/commandExecution/outputDelta":
+    case "process/outputDelta":
+      return "console";
+    case "turn/diff/updated":
+      return "diff";
+    case "item/fileChange/patchUpdated":
+      return "file-change";
+    case "warning":
+    case "guardianWarning":
+    case "configWarning":
+    case "deprecationNotice":
+      return "warning";
+    default:
+      return null;
+  }
 }
 
 const STREAMING_EVENT_TYPES = new Set([
