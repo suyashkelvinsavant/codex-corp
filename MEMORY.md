@@ -1,5 +1,34 @@
 # Codex Corp durable incident notes
 
+## 2026-08-12 — Stream visibility, decision-center lifecycle, staged release, and Byte workspace shell
+
+### Context
+Four cohesive workflow/chat problems were fixed in a single plan (`docs/superpowers/plans/2026-08-12-stream-approval-release-plan.md`): invisible live reasoning streams, stale approval popups after run completion, missing two-stage demo/release/publish flow, and Byte's lack of direct workspace shell access. The work was implemented across 13 tasks (commits `282dcce`–`3001e8a`) and verified via the full suite in Task 14.
+
+### Changes
+- **Unified streamed execution context (Tasks 1–6):** A single `ExecutionStreamEvent` contract flows from the native adapter through `main.tsx` into a shared `ExecutionStreamDisclosure` UI used by both the execution drawer and workflow chat. `src/execution-stream.ts` owns a bounded stream buffer (`MAX_STREAM_LINES = 16`) with line coalescing — deltas merge into lines, never one row per token. `src/stream-display.ts` normalizes `agent.message.delta` → `item/agentMessage/delta` and classifies canonical event types into `ExecutionStreamKind` (reasoning-summary, plan, console, diff, file-change, warning, lifecycle). Per-node `streamBuffer` on `AgentData` and `ChatMessage` is wired in `main.tsx`; the execution drawer has a Stream tab with auto-collapse (only the active node's stream is expanded); workflow chat renders a per-message disclosure for Byte's reasoning.
+- **Decision-center lifecycle (Tasks 7–8):** `deriveDecisionCenterOpen` replaces independent `approvalCenterOpen` state — visibility is now derived from the actual pending-decision set (pending native approvals, active mediator confirmation/question, pending local-test launch, manual open). `clearRunApprovals` in `src/approval-lifecycle.ts` removes run-scoped pending approvals on run completion/termination, so the modal no longer lingers on stale popups.
+- **Byte direct workspace shell (Tasks 9–10):** The mediator turn was upgraded from `read-only`/`never` to `workspace-write`/`on-request` via the extracted `mediator_turn_params` helper in `src-tauri/src/lib.rs`. A `requestApproval` handler routes through the approval broker. `is_publish_operation` guards the mediator shell: `git push`, `git commit`, and `git reset --hard` are auto-declined with a typed error directing the operator to the dedicated publish-approval node — publish operations cannot bypass the staged release graph.
+- **Staged release graph (Tasks 11–13):** The Software Company template gained a staged Release Coordinator → demo → release-commit → publish-approval → output graph. `src/release-candidate.ts` owns the `ReleaseCandidate` type and a `transitionPublishState` state machine (pending → approved/declined/failed → pushed/failed). `src-tauri/src/workflow_runtime/approval_gates.rs` implements native `release-commit` (fails closed for non-Git workspaces and dirty working trees, records commit hash) and `publish-approval` (rejects non-`main` branches and detached HEAD, runs `git push origin main`, redacts embedded credentials in push output). `src/persistence.ts` migrates old `approval`+`output` Software Company snapshots to the new staged graph shape.
+
+### Verification (Task 14)
+- `npm test` — 431 passed across 58 files.
+- `npm run build` — passed (only the pre-existing chunk-size warning).
+- `cargo test --manifest-path src-tauri/Cargo.toml` — 269 passed, 0 failed, 1 ignored (live Luna test); 8 integration tests passed.
+- `npm run desktop:build` — produced `release/Codex-Corp.exe` (release profile, `custom-protocol` feature enabled).
+- **Manual launch:** Launched `release/Codex-Corp.exe`. Process running from the exact release path, `Responding=True`, valid window handle with title "Codex Corp - Agent Operating System". WebView2 child processes active with significant memory (485–490 MB), confirming real content rendered (not blank, not `ERR_CONNECTION_REFUSED`, not `127.0.0.1`). The `custom-protocol` feature ensures the WebView loads the bundled frontend, not the Vite devUrl. Stopped the instance after verification.
+
+### Trust boundaries
+- Stream rendering is supplemental to chain-of-thought protection: only protocol-provided reasoning summaries/plans/tool output are rendered; chain-of-thought remains `"not-exposed"`.
+- Publish operations are fail-closed at the native approval boundary — the mediator shell cannot `git push`/`git commit`/`git reset --hard`, including through `sh -c`/`bash -c` wrappers and path-qualified git binaries; only the dedicated publish-approval node can push, and only to `main`. The guard parses the git subcommand token, so benign commands like `git log --grep=push` are not false-positively blocked.
+- Decision-center visibility is derived from actual pending decisions, not independent UI state, so stale popups cannot persist after a run completes.
+- Release-commit fails closed for non-Git workspaces, on dirty working trees (uncommitted unrelated changes), and on commit creation failure. It never returns a success output without a real commit hash.
+- Publish-approval fails closed when there is no workspace path, when the current branch is not `main` (including detached HEAD), or when `git push` fails. Push output is credential-redacted before being emitted in events or persisted in node output data.
+
+### Notes for operators
+- The Software Company template now has a longer tail (Release Coordinator, demo, release-commit, publish-approval, output). Old snapshots are migrated automatically on load.
+- Byte (mediator) now operates in `workspace-write`/`on-request` and will request approval for shell operations that need it, except publish operations which are blocked outright.
+
 ## 2026-01-15 — Harness lessons: durable, versioned, reviewable supplemental guidance (Continual Harness)
 
 ### Context

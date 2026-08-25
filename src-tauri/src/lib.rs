@@ -3038,12 +3038,149 @@ fn mediator_turn_params(
 
 /// Detect Git publish operations that must be routed through the dedicated
 /// publish-approval node, not ordinary Byte shell access.
+///
+/// Recognizes both direct invocations (`git push`, `git commit`) and shell-
+/// wrapper invocations (`sh -c "git push origin main"`,
+/// `bash -c 'git reset --hard'`). Parses the git subcommand token rather than
+/// substring-matching the whole string, so benign commands like
+/// `git log --grep=push` or `git show <hash>` are not false-positively blocked.
+///
+/// Blocked subcommands: `push`, `commit`, `reset --hard`. `reset` without
+/// `--hard` is allowed (soft/mixed resets are recoverable).
 fn is_publish_operation(command: &str) -> bool {
-    let lower = command.trim().to_lowercase();
-    if !lower.starts_with("git ") {
-        return false;
+    let git_args = match extract_git_subcommand_args(command) {
+        Some(args) => args,
+        None => return false,
+    };
+    // git_args[0] is the subcommand (push/commit/reset/...). The rest are its
+    // arguments. We match on the subcommand and, for `reset`, require `--hard`.
+    let subcommand = git_args.first().map(|s| s.as_str()).unwrap_or("");
+    match subcommand {
+        "push" | "commit" => true,
+        "reset" => git_args.iter().any(|arg| arg == "--hard"),
+        _ => false,
     }
-    lower.contains("push") || lower.contains("commit") || lower.contains("reset --hard")
+}
+
+/// Extract the git subcommand and its arguments from a command string,
+/// unwrapping a single layer of shell wrapper (`sh -c "..."` / `bash -c '...'`)
+/// if present. Returns `None` when the command is not a git invocation.
+///
+/// Tokenization is intentionally simple: split on whitespace, then strip
+/// surrounding quotes from each token. This is sufficient for the publish
+/// guard because we only inspect the subcommand and look for `--hard`; we do
+/// not evaluate the command. A command that obscures the git invocation
+/// behind variable expansion or nested shells is not something the model
+/// should be crafting to bypass a publish gate — and such a command would
+/// itself warrant operator scrutiny via the normal approval flow.
+fn extract_git_subcommand_args(command: &str) -> Option<Vec<String>> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Tokenize the outer command.
+    let mut tokens = tokenize_shell_like(trimmed);
+    if tokens.is_empty() {
+        return None;
+    }
+    let first = tokens[0].to_ascii_lowercase();
+    // Unwrap one layer of shell wrapper: sh/bash/zsh/dash -c "<script>".
+    if matches!(
+        first.as_str(),
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "ash" | "fish"
+    ) {
+        // Find the -c flag and use its argument as the script.
+        let mut iter = tokens.iter().skip(1);
+        while let Some(flag) = iter.next() {
+            if flag == "-c" {
+                if let Some(script) = iter.next() {
+                    tokens = tokenize_shell_like(script);
+                    break;
+                }
+                return None;
+            }
+        }
+        if tokens.is_empty() {
+            return None;
+        }
+    }
+    // Now expect the first token to be `git` (possibly with a path like
+    // `/usr/bin/git` or `git.exe` on Windows).
+    let git_token = tokens[0].to_ascii_lowercase();
+    let is_git = git_token == "git"
+        || git_token.ends_with("/git")
+        || git_token.ends_with("\\git")
+        || git_token == "git.exe"
+        || git_token.ends_with("/git.exe")
+        || git_token.ends_with("\\git.exe");
+    if !is_git {
+        return None;
+    }
+    // Skip git's own global flags (-C <path>, --git-dir, etc.) to reach the
+    // subcommand. We only skip flags that take a value; --no-pager etc. are
+    // boolean and skipped as standalone tokens.
+    let mut idx = 1;
+    while idx < tokens.len() {
+        let tok = tokens[idx].as_str();
+        if tok == "-C" || tok == "--git-dir" || tok == "--work-tree" || tok == "-c" {
+            // Flag with a value: skip two tokens.
+            idx += 2;
+            continue;
+        }
+        if tok.starts_with('-') {
+            // Boolean flag or `--key=value` form: skip one token.
+            idx += 1;
+            continue;
+        }
+        break;
+    }
+    if idx >= tokens.len() {
+        return None;
+    }
+    Some(tokens[idx..].to_vec())
+}
+
+/// Tokenize a command string the way a simple shell would: split on
+/// whitespace, but treat single- and double-quoted segments as a single
+/// token with the surrounding quotes stripped. This is sufficient for the
+/// publish guard because we only need to unwrap `sh -c "git push ..."` to
+/// reach the inner git subcommand. Does not handle escape sequences inside
+/// quotes — the guard inspects the subcommand token, which is never escaped
+/// in practice.
+fn tokenize_shell_like(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    for ch in input.chars() {
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+            } else {
+                current.push(ch);
+            }
+        } else if in_double {
+            if ch == '"' {
+                in_double = false;
+            } else {
+                current.push(ch);
+            }
+        } else if ch == '\'' {
+            in_single = true;
+        } else if ch == '"' {
+            in_double = true;
+        } else if ch.is_whitespace() {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
 }
 
 /// Company chat mediator: Live Codex turn with dynamicTools + streaming deltas.
@@ -7310,14 +7447,35 @@ mod tests {
 
     #[test]
     fn is_publish_operation_detects_git_publish_commands() {
+        // Direct git invocations.
         assert!(is_publish_operation("git push origin main"));
         assert!(is_publish_operation("git commit -m \"release\""));
         assert!(is_publish_operation("git push --force origin main"));
         assert!(is_publish_operation("git reset --hard origin/main"));
+        // Benign git commands are NOT publish operations.
         assert!(!is_publish_operation("git status"));
         assert!(!is_publish_operation("git diff"));
         assert!(!is_publish_operation("git log"));
+        assert!(!is_publish_operation("git log --grep=push"));
+        assert!(!is_publish_operation("git show abcdefpush123"));
+        assert!(!is_publish_operation("git reset --soft HEAD~1"));
+        assert!(!is_publish_operation("git reset --mixed HEAD~1"));
         assert!(!is_publish_operation("npm run build"));
+        // Shell-wrapper invocations are detected.
+        assert!(is_publish_operation("sh -c \"git push origin main\""));
+        assert!(is_publish_operation("bash -c 'git commit -m release'"));
+        assert!(is_publish_operation("sh -c \"git reset --hard origin/main\""));
+        assert!(!is_publish_operation("sh -c \"git status\""));
+        // git with global flags (-C <path>) still resolves the subcommand.
+        assert!(is_publish_operation("git -C /tmp/ws push origin main"));
+        assert!(is_publish_operation("git -C /tmp/ws commit -m release"));
+        assert!(!is_publish_operation("git -C /tmp/ws status"));
+        // Path-qualified git binaries are recognized.
+        assert!(is_publish_operation("/usr/bin/git push origin main"));
+        assert!(is_publish_operation("git.exe push origin main"));
+        // Non-git commands through a shell wrapper are not publish operations.
+        assert!(!is_publish_operation("sh -c \"npm run build\""));
+        assert!(!is_publish_operation("bash -c 'echo hello'"));
     }
 
     #[test]
